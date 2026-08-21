@@ -1,0 +1,51 @@
+# Secrets and local environment files
+**/.env
+**/.env.*
+!**/.env.example
+
+# macOS and editor files
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+
+# Python caches and local environments
+**/__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+
+# Logs and temporary runtime files
+*.log
+backend/storage/
+backend/app/storage/
+
+# Locally uploaded or test documents
+backend/*.pdf
+backend/*.doc
+backend/*.docx
+backend/*.xls
+backend/*.xlsx
+backend/*.ppt
+backend/*.pptx
+
+# Large local archives and instructional media
+backend/nltk_data/**/*.zip
+*.mp4
+wsl启动rag项目/
+
+# Machine-learning model artifacts (keep locally, do not publish)
+*.onnx
+*.trie
+*.model
+*.pt
+*.pth
+*.ckpt
+*.safetensors

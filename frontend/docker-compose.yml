@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  # 开发环境服务
+  frontend-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: development
+    container_name: swxy_frontend_dev
+    hostname: swxy_frontend_dev
+    ports:
+      - "5181:5181"
+    volumes:
+      - .:/app
+      - /app/node_modules  # 避免覆盖容器内的 node_modules
+    environment:
+      - NODE_ENV=development
+      - CHOKIDAR_USEPOLLING=true  # 支持热重载
+    restart: unless-stopped
+    networks:
+      - swxy_network
+    profiles:
+      - dev  # 使用 profile 来控制启动哪个服务
+
+  # 生产环境服务
+  frontend-prod:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: swxy_frontend_prod
+    hostname: swxy_frontend_prod
+    ports:
+      - "80:80"
+    environment:
+      - NODE_ENV=production
+    restart: unless-stopped
+    networks:
+      - swxy_network
+    profiles:
+      - prod
+
+networks:
+  swxy_network:
+    driver: bridge
