@@ -1,33 +1,70 @@
-# 后端启动
+# RAGSys
 
+RAGSys is a full-stack document question-answering system powered by Retrieval-Augmented Generation (RAG). Users can upload documents, organize a personal knowledge base, and receive streaming answers grounded in the content of those documents.
+
+## Features
+
+- User registration and authentication
+- Document upload, parsing, search, and deletion
+- RAG-based question answering with streaming responses
+- Conversation sessions and message history
+- Support for common document formats, including PDF, DOCX, TXT, Excel, PowerPoint, HTML, and Markdown
+
+## Tech Stack
+
+- **Frontend:** React, TypeScript, Vite, and Ant Design
+- **Backend:** FastAPI and Python
+- **Data services:** PostgreSQL, Elasticsearch, and Redis
+- **LLM service:** Alibaba Cloud DashScope
+
+## Getting Started
+
+### Prerequisites
+
+- Docker and Docker Compose
+- Node.js and npm
+- A DashScope API key
+
+### 1. Start the backend
+
+```bash
 cd backend
+cp .env.example .env
+```
 
+Open `backend/.env`, add your DashScope API key, and replace the example passwords and JWT secret with secure values:
 
-## 步骤1：修改.env文件中 DASHSCOPE_API_KEY
+```env
+DASHSCOPE_API_KEY="your-api-key"
+```
 
-## 启动后端服务
+Then start the API and its supporting services:
+
+```bash
 docker compose up -d --build
+```
 
-查看后端日志：docker logs -f swxy_api
+The API documentation will be available at [http://localhost:8000/docs](http://localhost:8000/docs).
 
+### 2. Start the frontend
 
-# 前端启动
+In a separate terminal:
 
+```bash
 cd frontend
-
-## 删除旧文件
-rm -rf node_modules package-lock.json
-
-## 重新安装依赖
 npm install
-
-## 启动开发服务器
 npm run dev
+```
 
-# 访问服务
-http://localhost:5181/
+Open [http://localhost:5181](http://localhost:5181) in your browser.
 
+## Useful Commands
 
+```bash
+# View backend logs
+docker logs -f swxy_api
 
-
-
+# Stop all backend services
+cd backend
+docker compose down
+```
