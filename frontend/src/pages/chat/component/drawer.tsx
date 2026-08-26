@@ -7,9 +7,10 @@ import styles from './drawer.module.scss'
 export default function Drawer(
   props: PropsWithChildren<{
     title?: string
+    onClose?: () => void
   }>,
 ) {
-  const { title, children } = props
+  const { title, children, onClose } = props
 
   return (
     <div className={styles['drawer']}>
@@ -23,6 +24,9 @@ export default function Drawer(
           shape="circle"
           color="default"
           size="small"
+          aria-label="折叠右侧栏"
+          title="折叠右侧栏"
+          onClick={onClose}
         >
           <CloseOutlined />
         </Button>

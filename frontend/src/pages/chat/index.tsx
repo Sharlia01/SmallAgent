@@ -334,6 +334,7 @@ export default function Index() {
   }, [list[0]])
 
   const [read, setRead] = useState<API.Reference | null>(null)
+  const [rightCollapsed, setRightCollapsed] = useState(false)
 
   return (
     <ComPageLayout
@@ -344,18 +345,23 @@ export default function Index() {
             loading={loading}
             sessionId={id}
             onSend={send}
-            onContract={() => setCurrentChatItem(null)}
+            onContract={() => {
+              setCurrentChatItem(null)
+              setRightCollapsed(false)
+            }}
           />
         </>
       }
+      rightCollapsed={rightCollapsed}
+      onRightCollapsedChange={setRightCollapsed}
       right={
         <>
           {currentChatItem && currentChatItem.reference?.length ? (
-            <ChatDrawer title="引文">
+            <ChatDrawer title="引文" onClose={() => setRightCollapsed(true)}>
               <Citations list={currentChatItem.reference} />
             </ChatDrawer>
           ) : (
-            <ChatDrawer title="文档">
+            <ChatDrawer title="文档" onClose={() => setRightCollapsed(true)}>
               <Contracts list={documents} />
             </ChatDrawer>
           )}
@@ -373,7 +379,10 @@ export default function Index() {
         <ChatMessage
           list={list}
           onSend={send}
-          onOpenCiations={setCurrentChatItem}
+          onOpenCiations={(item) => {
+            setCurrentChatItem(item)
+            setRightCollapsed(false)
+          }}
           onRefrence={setRead}
         />
 

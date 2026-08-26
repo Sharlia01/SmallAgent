@@ -1,63 +1,45 @@
 #!/usr/bin/env python3
-"""
-Alembic迁移运行脚本
-用于在Docker环境中运行数据库迁移
-"""
+"""Run the application's Alembic migrations."""
 
 import os
 import sys
-from alembic.config import Config
+from pathlib import Path
+
 from alembic import command
+from alembic.config import Config
 from dotenv import load_dotenv
 
-# 加载环境变量
+
 load_dotenv()
 
-def run_migration():
-    """运行数据库迁移"""
-    
-    # 检查数据库连接环境变量
-    database_url = os.getenv("DATABASE_URL")
-    if not database_url:
-        print("错误: 未找到DATABASE_URL环境变量")
-        sys.exit(1)
-    
-    print(f"数据库连接: {database_url}")
-    
-    # Alembic配置
-    alembic_cfg = Config("alembic.ini")
-    
-    try:
-        # 检查当前版本
-        print("检查当前数据库版本...")
-        command.current(alembic_cfg, verbose=True)
-        
-        # 运行迁移
-        print("开始运行数据库迁移...")
-        command.upgrade(alembic_cfg, "head")
-        
-        print("数据库迁移完成!")
-        
-    except Exception as e:
-        print(f"迁移失败: {str(e)}")
-        sys.exit(1)
+APP_DIRECTORY = Path(__file__).resolve().parent
 
-def stamp_baseline():
-    """标记baseline版本（首次运行时使用）"""
-    
-    alembic_cfg = Config("alembic.ini")
-    
+
+def get_alembic_config() -> Config:
+    return Config(str(APP_DIRECTORY / "alembic.ini"))
+
+
+def run_migration() -> int:
+    """Upgrade the configured database to the latest revision."""
+    if not os.getenv("DATABASE_URL"):
+        print("错误: 未找到 DATABASE_URL 环境变量")
+        return 1
+
+    alembic_config = get_alembic_config()
+
     try:
-        print("标记baseline版本...")
-        command.stamp(alembic_cfg, "980b32f130df")  # baseline revision ID
-        print("Baseline标记完成!")
-        
-    except Exception as e:
-        print(f"标记baseline失败: {str(e)}")
-        sys.exit(1)
+        print("检查当前数据库版本...")
+        command.current(alembic_config, verbose=True)
+
+        print("开始运行数据库迁移...")
+        command.upgrade(alembic_config, "head")
+
+        print("数据库迁移完成!")
+        return 0
+    except Exception as error:
+        print(f"迁移失败: {error}")
+        return 1
+
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "stamp":
-        stamp_baseline()
-    else:
-        run_migration() 
+    sys.exit(run_migration())

@@ -4,6 +4,7 @@ import json
 import redis
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
+from service.session_access import DEFAULT_SESSION_NAME
 from utils.database import get_db
 from fastapi import HTTPException
 from utils import logger
@@ -246,34 +247,39 @@ def update_session_name(session_id: str, question: str, user_id: str):
     try:
         # 查询 sessions 表中是否存在该 session_id
         query_result = db.execute(
-            text("SELECT session_name FROM sessions WHERE session_id = :session_id"),
-            {"session_id": session_id}
+            text(
+                """
+                SELECT session_name
+                FROM sessions
+                WHERE session_id = :session_id AND user_id = :user_id
+                """
+            ),
+            {"session_id": session_id, "user_id": user_id}
         ).fetchone()
 
         if query_result:
-            # 如果查到了，直接跳过
-            logger.info(f"Session {session_id} already exists, skipping.")
-        else:
-            if question:
+            if query_result.session_name == DEFAULT_SESSION_NAME and question:
                 session_name = generate_session_name(question)
                 db.execute(
                     text(
                         """
-                        INSERT INTO sessions (session_id, user_id, session_name)
-                        VALUES (:session_id, :user_id, :session_name)
+                        UPDATE sessions
+                        SET session_name = :session_name, updated_at = CURRENT_TIMESTAMP
+                        WHERE session_id = :session_id AND user_id = :user_id
                         """
                     ),
                     {
                         "session_id": session_id,
                         "user_id": user_id,
-                        "session_name": session_name
-                    }
+                        "session_name": session_name,
+                    },
                 )
                 db.commit()
-                logger.info("会话数据插入成功。。。")
-                print(f"New session {session_id} inserted with name: {session_name}")
+                logger.info(f"Session {session_id} name updated.")
             else:
-                print(f"Failed to retrieve question for session {session_id}, skipping insertion.")
+                logger.info(f"Session {session_id} already has a name, skipping.")
+        else:
+            raise HTTPException(status_code=404, detail="Session not found")
     except SQLAlchemyError as e:
         db.rollback()
         raise HTTPException(

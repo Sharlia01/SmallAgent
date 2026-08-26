@@ -15,10 +15,16 @@ from utils import logger
 from database.knowledgebase_operations import insert_knowledgebase, verify_user_knowledgebase
 from sqlalchemy.orm import Session
 from sqlalchemy import select
-from models.message import KnowledgeBase
+from models.knowledgebase import KnowledgeBase
+from models.session import Session as ChatSession
 from utils.database import get_db
 from service.quick_parse_service import quick_parse_service
 from service.document_upload_service import DocumentUploadService
+from service.session_access import (
+    DEFAULT_SESSION_NAME,
+    get_authenticated_user_id,
+    require_owned_session,
+)
 from schemas.document_upload import DocumentUploadResponse, SessionDocumentsResponse, SessionDocumentSummary
 
 # 加载 .env 文件
@@ -37,22 +43,33 @@ router = APIRouter()
 @router.post("/create_session", response_model=SessionResponse)
 async def create_session(
     credentials: JwtAuthorizationCredentials = Security(access_security),
+    db: Session = Depends(get_db),
 ):
     try:
-        user_id = credentials.subject.get("user_id")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        user_id = get_authenticated_user_id(credentials)
 
         # 生成会话Id, 这里会生成一个随机字符串，用于区分不同聊天会话
         session_id = str(uuid.uuid4()).replace("-", "")[:16]
 
-        # 这里没有立即把会话写入数据库，通常要等用户第一次真正提问时，chat.py才会创建会话记录
+        # 创建时立即登记归属。之后所有会话级接口都能可靠校验所有者。
+        db.add(
+            ChatSession(
+                session_id=session_id,
+                session_name=DEFAULT_SESSION_NAME,
+                user_id=user_id,
+            )
+        )
+        db.commit()
+
         return {
             "session_id": session_id,
             "status": "success",
             "message": "Session created successfully"
         }
+    except HTTPException:
+        raise
     except Exception as e:
+        db.rollback()
         raise HTTPException(
             status_code=500,
             detail=str(e)
@@ -77,9 +94,8 @@ async def quick_parse_document(
     - 解析结果存储到Redis，保存时间为2小时
     """
     try:
-        user_id = str(credentials.subject.get("user_id"))
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        user_id = get_authenticated_user_id(credentials)
+        require_owned_session(db, session_id, user_id)
 
         # 读取文件内容
         file_content = await file.read()
@@ -131,14 +147,14 @@ async def quick_parse_document(
 async def get_parsed_content(
     session_id: str = Query(..., description="会话ID"),
     credentials: JwtAuthorizationCredentials = Security(access_security),
+    db: Session = Depends(get_db),
 ):
     """
     获取已解析的文档内容
     """
     try:
-        user_id = str(credentials.subject.get("user_id"))
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        user_id = get_authenticated_user_id(credentials)
+        require_owned_session(db, session_id, user_id)
 
         # 调用服务层获取内容
         result = quick_parse_service.get_parsed_content(session_id)
@@ -163,11 +179,11 @@ async def chat_on_docs(
     session_id: str = Query(...),
     request: ChatRequest = Body(..., description="User message"),
     credentials: JwtAuthorizationCredentials = Security(access_security),
+    db: Session = Depends(get_db),
 ):
     try:
-        user_id = str(credentials.subject.get("user_id"))
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        user_id = get_authenticated_user_id(credentials)
+        require_owned_session(db, session_id, user_id)
         
         logger.info(f"开始处理用户 {user_id} 的请求")
         logger.info(f"问题内容: {request.message}")
@@ -419,10 +435,10 @@ async def upload_files(
     try:
         # 必须先判断原值，再转换成字符串。
         # 否则 str(None) 会得到字符串 "None"，它在 if 判断中反而算 True。
-        raw_user_id = credentials.subject.get("user_id")
-        if not raw_user_id:
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
-        user_id = str(raw_user_id)
+        user_id = get_authenticated_user_id(credentials)
+
+        if session_id is not None:
+            require_owned_session(db, session_id, user_id)
 
         # 没有传 session_id 时，会使用 user_id 作为知识库索引名称。
         effective_session_id = session_id or user_id
@@ -488,9 +504,8 @@ async def get_session_documents(
     获取指定会话的所有文档上传记录
     """
     try:
-        user_id = str(credentials.subject.get("user_id"))
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        user_id = get_authenticated_user_id(credentials)
+        require_owned_session(db, session_id, user_id)
 
         # 获取会话的所有文档记录
         documents = DocumentUploadService.get_session_documents(db, session_id)
@@ -523,9 +538,8 @@ async def get_session_document_summary(
     获取指定会话的文档上传摘要信息
     """
     try:
-        user_id = str(credentials.subject.get("user_id"))
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        user_id = get_authenticated_user_id(credentials)
+        require_owned_session(db, session_id, user_id)
 
         # 检查是否有上传的文档
         has_documents = DocumentUploadService.has_uploaded_documents(db, session_id)

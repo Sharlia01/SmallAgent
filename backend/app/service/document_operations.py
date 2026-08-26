@@ -1,6 +1,6 @@
 from sqlalchemy.orm import Session
 from sqlalchemy import and_
-from models.message import KnowledgeBase
+from models.knowledgebase import KnowledgeBase
 from service.core.rag.utils.es_conn import ESConnection
 import os
 import logging
@@ -156,4 +156,4 @@ def delete_document(user_id: str, file_name: str, db: Session) -> dict:
     except Exception as e:
         db.rollback()
         logger.error(f"Error deleting document: {str(e)}")
-        return {"status": "error", "message": f"Failed to delete document: {str(e)}"} 
+        return {"status": "error", "message": f"Failed to delete document: {str(e)}"}

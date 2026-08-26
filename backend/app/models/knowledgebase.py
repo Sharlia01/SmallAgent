@@ -1,12 +1,18 @@
-from sqlalchemy import Column, Integer, String, DateTime
+from sqlalchemy import Column, Index, Integer, String, TIMESTAMP
 from sqlalchemy.sql import func
-from app.models.base import Base
+
+from models.base import Base
+
 
 class KnowledgeBase(Base):
-    __tablename__ = "knowledgebase"
+    __tablename__ = "knowledgebases"
+    __table_args__ = (
+        Index("idx_knowledgebases_user_id", "user_id"),
+        Index("idx_knowledgebases_created_at", "created_at"),
+    )
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String, index=True)
-    file_name = Column(String)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now()) 
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    user_id = Column(String(255), nullable=False)
+    file_name = Column(String(255), nullable=False)
+    created_at = Column(TIMESTAMP, nullable=False, server_default=func.now())
+    updated_at = Column(TIMESTAMP, nullable=False, server_default=func.now())

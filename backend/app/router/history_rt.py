@@ -1,10 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, Query, Security
+from fastapi import APIRouter, Depends, HTTPException, Security
 from sqlalchemy.orm import Session
 from utils.database import get_db
-from models.message import KnowledgeBase  
+from models.knowledgebase import KnowledgeBase
 from schemas.message import FilestResponse , SessionListResponse, SessionResponse
 from fastapi_jwt import JwtAuthorizationCredentials
 from service.auth import access_security
+from service.session_access import get_authenticated_user_id, require_owned_session
 from typing import List
 from sqlalchemy import text ,select 
 from urllib.parse import unquote
@@ -25,10 +26,7 @@ async def get_documents_by_user_id(
     获取用户上传的文档列表，需要用户认证
     """
     try:
-        # 从 token 中获取用户 ID
-        user_id = str(credentials.subject.get("user_id"))
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        user_id = get_authenticated_user_id(credentials)
 
         # 构建查询语句
         stmt = select(KnowledgeBase).where(KnowledgeBase.user_id == user_id)
@@ -75,9 +73,7 @@ async def delete_document_endpoint(
         # URL 解码文件名
         decoded_file_name = unquote(file_name)
         
-        user_id = str(credentials.subject.get("user_id"))
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        user_id = get_authenticated_user_id(credentials)
 
         # 调用 service 层的删除方法
         result = delete_document(user_id, decoded_file_name, db)
@@ -99,9 +95,8 @@ async def get_messages_by_session_id(
     db: Session = Depends(get_db)
 ):
     try:
-        user_id = str(credentials.subject.get("user_id"))
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        user_id = get_authenticated_user_id(credentials)
+        require_owned_session(db, session_id, user_id)
 
         # 查询 messages 表中对应 session_id 的消息
         messages_data = db.execute(
@@ -127,6 +122,8 @@ async def get_messages_by_session_id(
 
         return messages
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -139,9 +136,7 @@ async def get_sessions_by_user_id(
     db: Session = Depends(get_db)
 ):
     try:
-        user_id = str(credentials.subject.get("user_id"))
-        if not user_id:
-            raise HTTPException(status_code=401, detail="Invalid authentication credentials")
+        user_id = get_authenticated_user_id(credentials)
 
 
         # 查询 sessions 表中对应 user_id 的所有会话

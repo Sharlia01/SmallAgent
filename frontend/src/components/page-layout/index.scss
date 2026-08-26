@@ -1,5 +1,6 @@
 .com-page-layout {
   display: flex;
+  position: relative;
 
   .com-page-layout__main {
     flex-grow: 1;
@@ -24,5 +25,59 @@
   .com-page-layout__right {
     flex-shrink: 0;
     width: 408px;
+    overflow: hidden;
+    transition:
+      width 0.25s ease,
+      opacity 0.2s ease;
+  }
+
+  .com-page-layout__right-inner {
+    width: 408px;
+    height: 100%;
+  }
+
+  .com-page-layout__right-toggle {
+    position: fixed;
+    z-index: 1001;
+    top: 50%;
+    right: 392px;
+    width: 32px;
+    height: 52px;
+    padding: 0;
+    border: 1px solid #d9e2ef;
+    border-radius: 16px 0 0 16px;
+    background: rgba(white, 0.95);
+    box-shadow: -2px 2px 8px rgba(31, 112, 254, 0.12);
+    color: #65758b;
+    cursor: pointer;
+    font-size: 24px;
+    line-height: 48px;
+    transform: translateY(-50%);
+    transition:
+      right 0.25s ease,
+      color 0.2s ease,
+      box-shadow 0.2s ease;
+
+    &:hover {
+      color: var(--ant-color-primary);
+      box-shadow: -3px 3px 10px rgba(31, 112, 254, 0.22);
+    }
+
+    &:focus-visible {
+      outline: 2px solid var(--ant-color-primary);
+      outline-offset: 2px;
+    }
+  }
+
+  &.com-page-layout--right-collapsed {
+    .com-page-layout__right {
+      width: 0;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .com-page-layout__right-toggle {
+      right: 0;
+    }
   }
 }
