@@ -31,9 +31,15 @@ RUN pip install --upgrade pip setuptools wheel
 # 设置工作目录
 WORKDIR /app
 
-# 拷贝依赖文件并安装
-COPY requirements.txt /app/
-RUN pip install --no-cache-dir --retries 10 --timeout 120 -r requirements.txt
+# 普通构建只安装项目运行依赖
+# 测试构建传入INSTALL_TEST_DEPS=true 时才安装 Pytest。
+COPY requirements*.txt /app/
+ARG INSTALL_TEST_DEPS=false
+RUN pip install --no-cache-dir --retries 10 --timeout 120 -r requirements.txt && \
+    if [ "$INSTALL_TEST_DEPS" = "true" ]; then \
+        pip install --no-cache-dir --retries 10 --timeout 120 -r requirements-test.txt; \
+    fi
+
 
 # 拷贝代码
 COPY . /app

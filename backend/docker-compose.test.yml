@@ -1,0 +1,54 @@
+services:
+  test_runner:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+      args:
+        INSTALL_TEST_DEPS: "true"
+    working_dir: /app
+    entrypoint: []
+    command: ["pytest"]
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@gsk_pg_test:5432/gsk_test
+      JWT_SECRET_KEY: test-only-jwt-secret-key
+      PYTHONDONTWRITEBYTECODE: "1"
+      
+      ELASTIC_USERNAME: elastic
+      ELASTIC_PASSWORD: test-only-elasticsearch-password
+      ES_HOST: http://unused-elasticsearch:9200
+
+      DASHSCOPE_API_KEY: test-only-dashscope-key
+      DASHSCOPE_BASE_URL: http://unused-dashscope
+
+      REDIS_HOST: unused-redis
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+
+      ROOT_PATH: ""
+    volumes:
+      - ./app:/app
+    depends_on:
+      gsk_pg_test:
+        condition: service_healthy
+    networks:
+      - gsk_test_network
+
+  gsk_pg_test:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: gsk_test
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d gsk_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    networks:
+      - gsk_test_network
+
+networks:
+  gsk_test_network:
+    driver: bridge
