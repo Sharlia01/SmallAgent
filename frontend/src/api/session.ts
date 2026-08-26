@@ -75,7 +75,7 @@ export function quickParse(
     session_id: string
     file: File
   },
-  options?: AxiosRequestConfig,
+  options?: AxiosRequestConfig<FormData, { session_id: string }>,
 ) {
   const { file, ..._params } = params
   const formData = new FormData()
