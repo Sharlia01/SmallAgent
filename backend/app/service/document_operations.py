@@ -7,7 +7,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-def delete_document(user_id: str, file_name: str, db: Session) -> dict:
+def delete_document(user_id: int, file_name: str, db: Session) -> dict:
     """
     删除文档及其相关数据
     
@@ -32,7 +32,7 @@ def delete_document(user_id: str, file_name: str, db: Session) -> dict:
             return {"status": "error", "message": "Document not found"}
             
         # 获取 user_id 作为 ES 索引名（因为 KnowledgeBase 没有 session_id 字段）
-        index_name = user_id
+        index_name = str(user_id)
         
         # 2. 从 Elasticsearch 中删除数据
         es_connection = ESConnection()
@@ -72,13 +72,7 @@ def delete_document(user_id: str, file_name: str, db: Session) -> dict:
         deleted_count = 0
         
         # 准备两种可能的 kb_id 值
-        kb_id_candidates = [user_id]  # 字符串类型
-        try:
-            kb_id_int = int(user_id)
-            if kb_id_int != user_id:  # 避免重复
-                kb_id_candidates.append(kb_id_int)  # 数字类型
-        except ValueError:
-            pass
+        kb_id_candidates = [str(user_id), user_id]
         
         print(f"尝试的 kb_id 候选值: {kb_id_candidates}")
         

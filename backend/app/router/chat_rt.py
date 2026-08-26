@@ -194,7 +194,7 @@ async def chat_on_docs(
         references = []
         try:
             logger.info("开始检索相关内容...")
-            references = retrieve_content(user_id, question)
+            references = retrieve_content(str(user_id), question)
             logger.info(f"检索到 {len(references)} 条相关内容")
         except Exception as e:
             logger.info(f"用户 {user_id} 没有知识库或检索失败: {str(e)}，将不使用知识库内容")
@@ -260,7 +260,7 @@ def _prepare_upload_directory(session_id: str) -> str:
 
 def _find_duplicate_file_names(
     db: Session,
-    user_id: str,
+    user_id: int,
     file_names: List[str],
 ) -> List[str]:
     """找出数据库中已有、或本次请求中重复出现的文件名。"""
@@ -332,7 +332,7 @@ async def _process_single_upload(
     file_name: str,
     session_dir: str,
     session_id: str,
-    user_id: str,
+    user_id: int,
 ) -> Optional[str]:
     """
     处理一个上传文件。
@@ -441,7 +441,7 @@ async def upload_files(
             require_owned_session(db, session_id, user_id)
 
         # 没有传 session_id 时，会使用 user_id 作为知识库索引名称。
-        effective_session_id = session_id or user_id
+        effective_session_id = session_id or str(user_id)
         file_names = [_get_safe_upload_file_name(file) for file in files]
 
         # 检查数据库中是否已有同名文件，或本次请求中是否有重复文件名。

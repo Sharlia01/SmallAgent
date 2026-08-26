@@ -19,7 +19,7 @@ class MessageResponse(BaseModel):
 
 # 定义返回的文档模型
 class FilestResponse(BaseModel):
-    user_id: str
+    user_id: int
     file_name: str
     created_at: str
     updated_at: str
@@ -28,11 +28,11 @@ class FilestResponse(BaseModel):
 class SessionResponse(BaseModel):
     session_id: str
     session_name: str
-    user_id: str
+    user_id: int
     created_at: str
     updated_at: str
 
 # 会话列表的响应模型
 class SessionListResponse(BaseModel):
-    user_id: str
+    user_id: int
     sessions: List[SessionResponse]

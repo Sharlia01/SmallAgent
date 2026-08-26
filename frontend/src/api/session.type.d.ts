@@ -4,7 +4,7 @@ declare namespace API {
     session_id: string
     session_name: string
     updated_at: string
-    // user_id: string
+    user_id: number
   }
 
   interface ChatItem {

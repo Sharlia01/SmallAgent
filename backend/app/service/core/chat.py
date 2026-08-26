@@ -236,7 +236,7 @@ def write_chat_to_db(session_id: str, user_question: str, model_answer: str, ret
     finally:
         db.close()
 
-def update_session_name(session_id: str, question: str, user_id: str):
+def update_session_name(session_id: str, question: str, user_id: int):
     """
     根据 session_id 查数据库的表 sessions，有的话直接跳过，没有的话先生成 session_name，再插入。
 
@@ -458,7 +458,7 @@ def _generate_recommended_questions_safely(question, retrieved_content, session_
         return []
 
 
-def get_chat_completion(session_id, question, retrieved_content, user_id):
+def get_chat_completion(session_id, question, retrieved_content, user_id: int):
     """
     流式生成聊天回答，并把结果包装成 SSE 事件交给前端。
 

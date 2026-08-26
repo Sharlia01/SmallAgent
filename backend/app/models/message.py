@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Index, String, Text, TIMESTAMP, text
+from sqlalchemy import Column, ForeignKey, Index, String, Text, TIMESTAMP, text
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.sql import func
 
@@ -17,7 +17,15 @@ class Message(Base):
         primary_key=True,
         server_default=text("gen_random_uuid()"),
     )
-    session_id = Column(String(16), nullable=False)
+    session_id = Column(
+        String(16),
+        ForeignKey(
+            "sessions.session_id",
+            name="fk_messages_session_id_sessions",
+            ondelete="CASCADE",
+        ),
+        nullable=False,
+    )
     user_question = Column(Text, nullable=False)
     model_answer = Column(Text, nullable=False)
     documents = Column(Text)

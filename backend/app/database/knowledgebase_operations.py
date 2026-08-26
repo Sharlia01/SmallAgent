@@ -3,7 +3,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from utils.database import get_db  # 根据实际模块名称导入
 from fastapi import HTTPException
 
-def insert_knowledgebase(user_id: str, file_name: str):
+def insert_knowledgebase(user_id: int, file_name: str):
     """
     将知识库信息插入到 knowledgebases 表中。
 
@@ -31,7 +31,7 @@ def insert_knowledgebase(user_id: str, file_name: str):
     finally:
         db.close()
 
-def verify_user_knowledgebase(user_id: str):
+def verify_user_knowledgebase(user_id: int):
     """
     验证用户是否有自己的知识库。
 

@@ -7,7 +7,7 @@ class SessionService:
     def __init__(self, db: Session):
         self.db = db
 
-    def create_session(self, user_id: str):
+    def create_session(self, user_id: int):
         try:
             session_id = str(uuid.uuid4()).replace("-", "")[:16]
             start_time = datetime.now()

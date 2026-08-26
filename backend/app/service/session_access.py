@@ -11,23 +11,37 @@ DEFAULT_SESSION_NAME = "新对话"
 
 def get_authenticated_user_id(
     credentials: JwtAuthorizationCredentials,
-) -> str:
+) -> int:
     """Return the authenticated user id without accepting missing token claims."""
     subject = credentials.subject
     raw_user_id = subject.get("user_id") if isinstance(subject, dict) else None
-    if raw_user_id is None or raw_user_id == "":
+    if isinstance(raw_user_id, bool) or not isinstance(raw_user_id, (int, str)):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials",
         )
 
-    return str(raw_user_id)
+    if isinstance(raw_user_id, str) and not raw_user_id.isdecimal():
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+        )
+
+    user_id = int(raw_user_id)
+
+    if user_id <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid authentication credentials",
+        )
+
+    return user_id
 
 
 def require_owned_session(
     db: DatabaseSession,
     session_id: str,
-    user_id: str,
+    user_id: int,
 ) -> ChatSession:
     """Return a session only when it belongs to the authenticated user."""
     chat_session = db.execute(

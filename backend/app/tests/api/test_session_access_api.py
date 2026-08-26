@@ -43,6 +43,7 @@ def test_create_session_immediately_registers_owner(client):
 
     sessions_response = client.get("/get_sessions", headers=headers)
     assert sessions_response.status_code == 200
+    assert isinstance(sessions_response.json()["user_id"], int)
     assert sessions_response.json()["sessions"] == [
         {
             "session_id": session_id,
@@ -136,6 +137,26 @@ def test_other_user_cannot_access_session(client, method, path, kwargs):
 def test_missing_user_id_claim_is_rejected(client):
     token = access_security.create_access_token(
         subject={"user_name": "claim_without_user_id"}
+    )
+
+    response = client.get(
+        "/get_sessions",
+        headers=authorization_header(token),
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Invalid authentication credentials"
+
+
+# 用例功能：验证 JWT 的 user_id 不是整数时不能通过认证。
+# 执行步骤：
+# 1. 创建一个包含非整数 user_id 的已签名访问令牌。
+# 2. 使用该令牌请求用户会话列表。
+# 3. 验证接口返回 401，避免非法 ID 进入整数外键查询。
+@pytest.mark.api
+def test_non_integer_user_id_claim_is_rejected(client):
+    token = access_security.create_access_token(
+        subject={"user_id": "not-an-integer", "user_name": "invalid_claim"}
     )
 
     response = client.get(

@@ -3,6 +3,6 @@ declare namespace API {
     created_at: string
     file_name: string
     updated_at: string
-    user_id: string
+    user_id: number
   }
 }
