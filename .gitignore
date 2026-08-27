@@ -26,6 +26,7 @@ frontend/dist/
 *.log
 backend/storage/
 backend/app/storage/
+backend/evals/results/
 
 # Locally uploaded or test documents
 backend/*.pdf
@@ -40,6 +41,7 @@ backend/*.pptx
 backend/nltk_data/**/*.zip
 *.mp4
 wsl启动rag项目/
+.vscode/
 
 # Machine-learning model artifacts (keep locally, do not publish)
 *.onnx

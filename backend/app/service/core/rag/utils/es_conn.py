@@ -21,7 +21,7 @@ import os
 import json
 
 import copy
-from elasticsearch import Elasticsearch
+from elasticsearch import BadRequestError, Elasticsearch
 from elasticsearch_dsl import UpdateByQuery, Q, Search, Index
 from service.core.rag.utils import singleton
 from service.core.api.utils.file_utils import get_project_base_directory
@@ -137,6 +137,22 @@ class ESConnection:
     """
     Database operations
     """
+    def _ensure_index(self, index_name: str) -> None:
+        """Create a missing index with the configured dynamic templates."""
+        if self.es.indices.exists(index=index_name):
+            return
+
+        try:
+            self.es.indices.create(
+                index=index_name,
+                settings=self.mapping.get("settings", {}),
+                mappings=self.mapping.get("mappings", {}),
+            )
+        except BadRequestError as error:
+            # Another upload may create the same user index after exists().
+            if "resource_already_exists_exception" not in str(error):
+                raise
+
     def insert(self, documents: list[dict], indexName: str, knowledgebaseId: str = None) -> list[str]:
         # Refers to https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-bulk.html
         operations = []
@@ -153,6 +169,7 @@ class ESConnection:
         for _ in range(ATTEMPT_TIME):
             try:
                 res = []
+                self._ensure_index(indexName)
                 r = self.es.bulk(index=(indexName), operations=operations,
                                  refresh=False, timeout="60s")
                 if re.search(r"False", str(r["errors"]), re.IGNORECASE):

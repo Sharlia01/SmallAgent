@@ -15,7 +15,8 @@ RAGSys is a full-stack document question-answering system powered by Retrieval-A
 - **Frontend:** React, TypeScript, Vite, and Ant Design
 - **Backend:** FastAPI and Python
 - **Data services:** PostgreSQL, Elasticsearch, and Redis
-- **LLM service:** Alibaba Cloud DashScope
+- **Embedding:** Local `bge-small-zh-v1.5`
+- **LLM and rerank service:** Alibaba Cloud DashScope
 
 ## Getting Started
 
@@ -23,6 +24,7 @@ RAGSys is a full-stack document question-answering system powered by Retrieval-A
 
 - Docker and Docker Compose
 - Node.js and npm
+- A local `bge-small-zh-v1.5` model directory
 - A DashScope API key
 
 ### 1. Start the backend
@@ -36,7 +38,11 @@ Open `backend/.env`, add your DashScope API key, and replace the example passwor
 
 ```env
 DASHSCOPE_API_KEY="your-api-key"
+BGE_MODEL_HOST_PATH=../../models/bge-small-zh-v1.5
 ```
+
+`BGE_MODEL_HOST_PATH` is resolved relative to `backend/docker-compose.yml`.
+The default matches a model stored at `Projects/models/bge-small-zh-v1.5`.
 
 Then start the API and its supporting services:
 

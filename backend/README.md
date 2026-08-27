@@ -9,6 +9,7 @@
 - Docker 和 Docker Compose
 - 至少 4GB 可用内存
 - 10GB 可用磁盘空间
+- 本地 `bge-small-zh-v1.5` 模型目录
 
 ### 启动步骤
 
@@ -20,7 +21,11 @@ cd swxy-p1
 2. **.env 配置文件**
 ```bash
 DASHSCOPE_API_KEY="your-api-key"
+BGE_MODEL_HOST_PATH=../../models/bge-small-zh-v1.5
 ```
+
+Embedding 使用本地 BGE；DashScope Key 仍用于聊天模型和 `gte-rerank`。
+`BGE_MODEL_HOST_PATH` 相对于本目录的 `docker-compose.yml`。
 
 
 3. **启动所有服务**

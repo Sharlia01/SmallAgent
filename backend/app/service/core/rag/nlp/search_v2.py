@@ -14,7 +14,6 @@
 #  limitations under the License.
 #
 import logging
-import re
 #数据类，类似于其他语言中的结构体
 from dataclasses import dataclass, field
 
@@ -23,7 +22,11 @@ from service.core.rag.utils import rmSpace
 from service.core.rag.nlp import rag_tokenizer, query
 import numpy as np
 from service.core.rag.utils.doc_store_conn import DocStoreConnection, MatchDenseExpr, FusionExpr, OrderByExpr
-from service.core.rag.nlp.model import generate_embedding, rerank_similarity
+from service.core.rag.nlp.model import (
+    EMBEDDING_VECTOR_FIELD,
+    generate_embedding,
+    rerank_similarity,
+)
 
 def index_name(uid): return f"{uid}"
 
@@ -82,17 +85,22 @@ class Dealer:
             default_factory=lambda: {PAGERANK_FLD: 10}
         )
         kb_ids: list[str] | None = None
-        embd_mdl: object | None = None
 
-    def get_vector(self, txt, emb_mdl, topk=10, similarity=0.1):
+    def get_vector(self, txt, topk=10, similarity=0.1):
         qv = generate_embedding(txt)
         shape = np.array(qv).shape
         if len(shape) > 1:
             raise Exception(
                 f"Dealer.get_vector returned array's shape {shape} doesn't match expectation(exact one dimension).")
         embedding_data = [float(v) for v in qv]
-        vector_column_name = f"q_{len(embedding_data)}_vec"
-        return MatchDenseExpr(vector_column_name, embedding_data, 'float', 'cosine', topk, {"similarity": similarity})
+        return MatchDenseExpr(
+            EMBEDDING_VECTOR_FIELD,
+            embedding_data,
+            "float",
+            "cosine",
+            topk,
+            {"similarity": similarity},
+        )
 
     def get_filters(self, req):
         condition = dict()
@@ -176,7 +184,7 @@ class Dealer:
 
     def _search_with_question(
         self, req, context, question, idx_names, kb_ids,
-        emb_mdl, highlight, rank_feature,
+        highlight, rank_feature,
     ):
         """
         根据用户问题执行一次“关键词 + 向量”的混合搜索。
@@ -195,15 +203,14 @@ class Dealer:
 
         # match_dense表示向量搜索参数，里面有问题对应的向量和向量比较方法
         match_dense = self.get_vector(
-            question, emb_mdl, context.topk, req.get("similarity", 0.1),
+            question, context.topk, req.get("similarity", 0.1),
         )
 
         # 问题对应的向量，例如 [0.12, -0.08, ...]。
         query_vector = match_dense.embedding_data
 
-        # 不同向量模型产生的向量维度可能不同，例如 768 维或 1024 维。
-        # 文档向量保存在类似 q_1024_vec 的字段中，所以这里要把对应字段加入返回列表。
-        context.source_fields.append(f"q_{len(query_vector)}_vec")
+        # 返回 BGE 向量，供后续检索结果诊断使用。
+        context.source_fields.append(EMBEDDING_VECTOR_FIELD)
 
         # 混合搜索参数，表示把关键词和向量的得分按 5%/95% 的比例加权。
         fusion = FusionExpr(
@@ -265,7 +272,7 @@ class Dealer:
         )
 
     def search(self, req, idx_names: str | list[str],
-               kb_ids: list[str], emb_mdl=None, highlight=False,
+               kb_ids: list[str], highlight=False,
                rank_feature: dict | None = None):
         """从 Elasticsearch 初步召回候选 chunk，供 retrieval() 重排。"""
         context = self._build_search_context(req)
@@ -274,7 +281,7 @@ class Dealer:
         if question:
             execution = self._search_with_question(
                 req, context, question, idx_names, kb_ids,
-                emb_mdl, highlight, rank_feature,
+                highlight, rank_feature,
             )
         else:
             execution = self._search_without_question(
@@ -287,95 +294,6 @@ class Dealer:
     @staticmethod
     def trans2floats(txt):
         return [float(t) for t in txt.split("\t")]
-
-    def insert_citations(self, answer, chunks, chunk_v,
-                         embd_mdl, tkweight=0.1, vtweight=0.9):
-        assert len(chunks) == len(chunk_v)
-        if not chunks:
-            return answer, set([])
-        pieces = re.split(r"(```)", answer)
-        if len(pieces) >= 3:
-            i = 0
-            pieces_ = []
-            while i < len(pieces):
-                if pieces[i] == "```":
-                    st = i
-                    i += 1
-                    while i < len(pieces) and pieces[i] != "```":
-                        i += 1
-                    if i < len(pieces):
-                        i += 1
-                    pieces_.append("".join(pieces[st: i]) + "\n")
-                else:
-                    pieces_.extend(
-                        re.split(
-                            r"([^\|][；。？!！\n]|[a-z][.?;!][ \n])",
-                            pieces[i]))
-                    i += 1
-            pieces = pieces_
-        else:
-            pieces = re.split(r"([^\|][；。？!！\n]|[a-z][.?;!][ \n])", answer)
-        for i in range(1, len(pieces)):
-            if re.match(r"([^\|][；。？!！\n]|[a-z][.?;!][ \n])", pieces[i]):
-                pieces[i - 1] += pieces[i][0]
-                pieces[i] = pieces[i][1:]
-        idx = []
-        pieces_ = []
-        for i, t in enumerate(pieces):
-            if len(t) < 5:
-                continue
-            idx.append(i)
-            pieces_.append(t)
-        logging.debug("{} => {}".format(answer, pieces_))
-        if not pieces_:
-            return answer, set([])
-
-        ans_v, _ = embd_mdl.encode(pieces_)
-        for i in range(len(chunk_v)):
-            if len(ans_v[0]) != len(chunk_v[i]):
-                chunk_v[i] = [0.0]*len(ans_v[0])
-                logging.warning("The dimension of query and chunk do not match: {} vs. {}".format(len(ans_v[0]), len(chunk_v[i])))
-
-        assert len(ans_v[0]) == len(chunk_v[0]), "The dimension of query and chunk do not match: {} vs. {}".format(
-            len(ans_v[0]), len(chunk_v[0]))
-
-        chunks_tks = [rag_tokenizer.tokenize(self.qryr.rmWWW(ck)).split()
-                      for ck in chunks]
-        cites = {}
-        thr = 0.63
-        while thr > 0.3 and len(cites.keys()) == 0 and pieces_ and chunks_tks:
-            for i, a in enumerate(pieces_):
-                sim, tksim, vtsim = self.qryr.hybrid_similarity(ans_v[i],
-                                                                chunk_v,
-                                                                rag_tokenizer.tokenize(
-                                                                    self.qryr.rmWWW(pieces_[i])).split(),
-                                                                chunks_tks,
-                                                                tkweight, vtweight)
-                mx = np.max(sim) * 0.99
-                logging.debug("{} SIM: {}".format(pieces_[i], mx))
-                if mx < thr:
-                    continue
-                cites[idx[i]] = list(
-                    set([str(ii) for ii in range(len(chunk_v)) if sim[ii] > mx]))[:4]
-            thr *= 0.8
-
-        res = ""
-        seted = set([])
-        for i, p in enumerate(pieces):
-            res += p
-            if i not in idx:
-                continue
-            if i not in cites:
-                continue
-            for c in cites[i]:
-                assert int(c) < len(chunk_v)
-            for c in cites[i]:
-                if c in seted:
-                    continue
-                res += f" ##{c}$$"
-                seted.add(c)
-
-        return res, seted
 
     def _rank_feature_scores(self, query_rfea, search_res):
         ## For rank feature(tag_fea) scores.
@@ -557,7 +475,6 @@ class Dealer:
         """过滤并组装最终的检索结果。"""
         indexes, final_scores, term_scores, vector_scores = ranked_results
         query_vector = search_result.query_vector or []
-        vector_column = f"q_{len(query_vector)}_vec"
         zero_vector = [0.0] * len(query_vector)
         chunks = []
 
@@ -575,7 +492,7 @@ class Dealer:
                 final_scores[result_index],
                 term_scores[result_index],
                 vector_scores[result_index],
-                vector_column,
+                EMBEDDING_VECTOR_FIELD,
                 zero_vector,
             )
             if options.highlight and search_result.highlight:
@@ -606,7 +523,6 @@ class Dealer:
             request,
             self._build_index_names(tenant_ids),
             options.kb_ids,
-            options.embd_mdl,
             options.highlight,
             rank_feature=options.rank_feature, #关键字参数，python可以只传一部分参数
         )

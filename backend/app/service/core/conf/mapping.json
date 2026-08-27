@@ -167,39 +167,6 @@
         }
       },
       {
-        "dense_vector": {
-          "match": "*_768_vec",
-          "mapping": {
-            "type": "dense_vector",
-            "index": true,
-            "similarity": "cosine",
-            "dims": 768
-          }
-        }
-      },
-      {
-        "dense_vector": {
-          "match": "*_1024_vec",
-          "mapping": {
-            "type": "dense_vector",
-            "index": true,
-            "similarity": "cosine",
-            "dims": 1024
-          }
-        }
-      },
-      {
-        "dense_vector": {
-          "match": "*_1536_vec",
-          "mapping": {
-            "type": "dense_vector",
-            "index": true,
-            "similarity": "cosine",
-            "dims": 1536
-          }
-        }
-      },
-      {
         "binary": {
           "match": "*_bin",
           "mapping": {

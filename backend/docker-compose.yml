@@ -13,6 +13,9 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - REDIS_DB=0
+      - EMBEDDING_MODEL_PATH=/models/bge-small-zh-v1.5
+      - EMBEDDING_DEVICE=${EMBEDDING_DEVICE:-cpu}
+      - EMBEDDING_BATCH_SIZE=${EMBEDDING_BATCH_SIZE:-32}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
@@ -21,7 +24,9 @@ services:
       - "8000:8000"  # 只保留应用服务的端口映射
     volumes:
       - ./app:/app/app
+      - ./evals:/app/evals
       - ./nltk_data:/usr/local/nltk_data
+      - "${BGE_MODEL_HOST_PATH:-../../models/bge-small-zh-v1.5}:/models/bge-small-zh-v1.5:ro"
     command: ["uvicorn", "app_main:app", "--host", "0.0.0.0", "--port", "8000"]
     restart: unless-stopped
     depends_on:

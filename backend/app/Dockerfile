@@ -40,6 +40,13 @@ RUN pip install --no-cache-dir --retries 10 --timeout 120 -r requirements.txt &&
         pip install --no-cache-dir --retries 10 --timeout 120 -r requirements-test.txt; \
     fi
 
+# Keep the local embedding runtime in its own layer so changing it does not
+# force Docker to reinstall the project's larger, stable dependency set.
+RUN pip install --no-cache-dir --retries 10 --resume-retries 30 --timeout 120 \
+    torch==2.2.2 \
+    transformers==4.48.3 \
+    sentence-transformers==3.4.1
+
 
 # 拷贝代码
 COPY . /app

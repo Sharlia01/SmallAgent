@@ -1,11 +1,65 @@
-from openai import OpenAI
-import dashscope
-import numpy as np
+import os
+from functools import lru_cache
+from pathlib import Path
 from typing import List
 
-import os
+import dashscope
+import numpy as np
 from dotenv import load_dotenv
+from openai import OpenAI
+
 load_dotenv()
+
+
+DEFAULT_EMBEDDING_MODEL_PATH = "/models/bge-small-zh-v1.5"
+DEFAULT_EMBEDDING_DEVICE = "cpu"
+DEFAULT_EMBEDDING_BATCH_SIZE = 32
+EMBEDDING_DIMENSION = 512
+EMBEDDING_VECTOR_FIELD = f"q_{EMBEDDING_DIMENSION}_vec"
+
+
+def _positive_int_environment(name: str, default: int) -> int:
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(f"{name} must be a positive integer") from error
+    if value <= 0:
+        raise RuntimeError(f"{name} must be a positive integer")
+    return value
+
+
+@lru_cache(maxsize=1)
+def get_embedding_model():
+    """Load the local Sentence Transformers model once per API process."""
+    model_path = Path(
+        os.getenv("EMBEDDING_MODEL_PATH", DEFAULT_EMBEDDING_MODEL_PATH)
+    ).expanduser()
+    if not model_path.is_dir():
+        raise RuntimeError(
+            "Local embedding model directory does not exist: "
+            f"{model_path}. Check BGE_MODEL_HOST_PATH and the Docker volume."
+        )
+
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as error:
+        raise RuntimeError(
+            "sentence-transformers is required for local BGE embeddings"
+        ) from error
+
+    device = os.getenv("EMBEDDING_DEVICE", DEFAULT_EMBEDDING_DEVICE)
+    try:
+        return SentenceTransformer(
+            str(model_path),
+            device=device,
+            local_files_only=True,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"Failed to load local embedding model from {model_path}: {error}"
+        ) from error
+
 
 def get_chat_completion_block(session_id, question, references):
     """
@@ -75,71 +129,60 @@ def rerank_similarity(query, texts):
 
 
 
-def generate_embedding(text: str | List[str], api_key: str = None, base_url: str = None, model_name: str = "text-embedding-v3", dimensions: int = 1024, encoding_format: str = "float", max_batch_size: int = 10):
-    """
-    生成文本的向量嵌入
-    
-    Args:
-        text: 单个文本或文本列表
-        api_key: API密钥
-        base_url: API基础URL
-        model_name: 模型名称
-        dimensions: 向量维度
-        encoding_format: 编码格式
-        max_batch_size: 最大批量大小，默认为10（阿里云DashScope限制）
-    
-    Returns:
-        单个文本时返回向量，文本列表时返回向量列表
-    """
-    api_key = os.getenv("DASHSCOPE_API_KEY")
-    base_url = os.getenv("DASHSCOPE_BASE_URL")    
+def generate_embedding(
+    text: str | List[str],
+    *,
+    batch_size: int | None = None,
+) -> list[float] | list[list[float]]:
+    """Generate normalized embeddings with the local BGE model.
 
-    # 初始化 OpenAI 客户端
-    client = OpenAI(
-        api_key=api_key,
-        base_url=base_url
-    )
-
-    # 如果是单个文本，直接处理
+    A single string returns one vector. A list returns vectors in the same
+    order. Raising on model or inference failures prevents uploads from being
+    recorded with missing embeddings.
+    """
     if isinstance(text, str):
-        try:
-            completion = client.embeddings.create(
-                model=model_name,
-                input=text,
-                dimensions=dimensions,
-                encoding_format=encoding_format
-            )
-            return completion.data[0].embedding
-        except Exception as e:
-            print(f"OpenAI API 请求失败: {e}")
-            return None
-    
-    # 如果是文本列表，需要分批处理
-    if isinstance(text, list):
-        all_embeddings = []
-        
-        # 分批处理
-        for i in range(0, len(text), max_batch_size):
-            batch = text[i:i + max_batch_size]
-            
-            try:
-                completion = client.embeddings.create(
-                    model=model_name,
-                    input=batch,
-                    dimensions=dimensions,
-                    encoding_format=encoding_format
-                )
-                
-                # 收集这一批的向量
-                batch_embeddings = [item.embedding for item in completion.data]
-                all_embeddings.extend(batch_embeddings)
-                
-            except Exception as e:
-                print(f"OpenAI API 批量请求失败 (batch {i//max_batch_size + 1}): {e}")
-                # 如果批量失败，为这一批添加空向量
-                all_embeddings.extend([None] * len(batch))
-        
-        return all_embeddings
+        texts = [text]
+        single_input = True
+    elif isinstance(text, list) and all(isinstance(item, str) for item in text):
+        if not text:
+            return []
+        texts = text
+        single_input = False
+    else:
+        raise TypeError("text must be a string or a list of strings")
+
+    resolved_batch_size = (
+        _positive_int_environment(
+            "EMBEDDING_BATCH_SIZE", DEFAULT_EMBEDDING_BATCH_SIZE
+        )
+        if batch_size is None
+        else batch_size
+    )
+    if resolved_batch_size <= 0:
+        raise ValueError("batch_size must be greater than 0")
+
+    model = get_embedding_model()
+    try:
+        embeddings = model.encode(
+            texts,
+            batch_size=resolved_batch_size,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+    except Exception as error:
+        raise RuntimeError(f"Local BGE embedding inference failed: {error}") from error
+
+    embedding_array = np.asarray(embeddings, dtype=np.float32)
+    expected_shape = (len(texts), EMBEDDING_DIMENSION)
+    if embedding_array.shape != expected_shape:
+        raise RuntimeError(
+            "Local BGE returned an unexpected embedding shape: "
+            f"{embedding_array.shape}, expected {expected_shape}"
+        )
+
+    serialized_embeddings = embedding_array.tolist()
+    return serialized_embeddings[0] if single_input else serialized_embeddings
 
 
 # 示例调用
