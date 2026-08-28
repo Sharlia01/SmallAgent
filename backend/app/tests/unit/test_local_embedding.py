@@ -14,12 +14,23 @@ class FakeSentenceTransformer:
         return np.ones((len(texts), self.dimension), dtype=np.float32)
 
 
+# 用例功能：验证本地 BGE Embedding 的维度和 ES 向量字段契约固定为 512 维。
+# 执行步骤：
+# 1. 读取 Embedding 维度常量。
+# 2. 读取 Elasticsearch 向量字段常量。
+# 3. 验证维度为 512，字段名为 q_512_vec。
 @pytest.mark.unit
 def test_bge_embedding_contract_is_fixed_to_512_dimensions():
     assert embedding_model.EMBEDDING_DIMENSION == 512
     assert embedding_model.EMBEDDING_VECTOR_FIELD == "q_512_vec"
 
 
+# 用例功能：验证本地 BGE 能按约定处理单条和批量文本，并传递正确的推理参数。
+# 执行步骤：
+# 1. 用可记录调用的伪 SentenceTransformer 替换真实模型。
+# 2. 通过环境变量设置默认批大小，并生成一条文本的向量。
+# 3. 使用显式批大小生成两条文本的向量。
+# 4. 验证返回数量、向量维度、批大小和归一化等参数。
 @pytest.mark.unit
 def test_generate_embedding_uses_local_model_for_single_and_batch(monkeypatch):
     fake_model = FakeSentenceTransformer()
@@ -45,6 +56,11 @@ def test_generate_embedding_uses_local_model_for_single_and_batch(monkeypatch):
     assert fake_model.calls[1][1]["batch_size"] == 3
 
 
+# 用例功能：验证 Embedding 推理结果不是 512 维时会立即报错。
+# 执行步骤：
+# 1. 用返回 1024 维向量的伪模型替换本地 BGE。
+# 2. 调用 Embedding 生成函数处理测试文本。
+# 3. 验证函数抛出 RuntimeError，且错误信息指出向量形状异常。
 @pytest.mark.unit
 def test_generate_embedding_rejects_unexpected_dimension(monkeypatch):
     monkeypatch.setattr(
@@ -57,6 +73,12 @@ def test_generate_embedding_rejects_unexpected_dimension(monkeypatch):
         embedding_model.generate_embedding("测试")
 
 
+# 用例功能：验证本地 BGE 模型目录缺失时会返回明确的配置错误。
+# 执行步骤：
+# 1. 清空模型加载缓存，并将模型路径指向不存在的临时目录。
+# 2. 调用本地模型加载函数。
+# 3. 验证函数抛出 RuntimeError，且错误信息提示模型目录不存在。
+# 4. 再次清空缓存，避免影响其他测试。
 @pytest.mark.unit
 def test_get_embedding_model_reports_missing_volume(monkeypatch, tmp_path):
     embedding_model.get_embedding_model.cache_clear()

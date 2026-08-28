@@ -106,7 +106,7 @@ def rerank_similarity(query, texts):
 
     # 直接调 DashScope rerank,用 result.index 回填到原序数组
     resp = dashscope.TextReRank.call(
-        model="gte-rerank",
+        model="gte-rerank-v2",
         top_n=len(texts),
         query=query,
         documents=texts,

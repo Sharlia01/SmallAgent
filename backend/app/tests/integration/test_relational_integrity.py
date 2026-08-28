@@ -8,6 +8,12 @@ from models.session import Session as ChatSession
 from models.user import User
 
 
+# 用例功能：验证删除用户时会级联删除其会话、消息、上传记录和知识库记录。
+# 执行步骤：
+# 1. 创建用户以及归属于该用户的会话。
+# 2. 为该会话创建消息、文档上传和知识库记录。
+# 3. 删除用户并 flush 数据库会话。
+# 4. 验证上述所有关联记录均已被级联删除。
 @pytest.mark.integration
 def test_deleting_user_cascades_to_owned_records(db_session):
     user = User(
@@ -54,6 +60,12 @@ def test_deleting_user_cascades_to_owned_records(db_session):
     assert db_session.query(KnowledgeBase).count() == 0
 
 
+# 用例功能：验证消息必须关联已存在的会话，不允许产生孤立消息。
+# 执行步骤：
+# 1. 构造一条指向不存在会话 ID 的消息。
+# 2. 在嵌套事务中写入该消息并 flush。
+# 3. 验证数据库触发外键约束并抛出 IntegrityError。
+# 4. 验证失败的消息没有留在数据库中。
 @pytest.mark.integration
 def test_message_requires_existing_session(db_session):
     with pytest.raises(IntegrityError):
