@@ -201,6 +201,214 @@ def test_multi_hop_case_computes_hit_recall_and_mrr():
     assert [match["matched_rank"] for match in result["evidence_matches"]] == [2, 1]
     assert "vector" not in result["retrieval"]["chunks"][0]
 
+# 用例功能：验证同一个证据要求可以由多个检索 chunk 联合满足。
+# 执行步骤：
+# 1. 使用 guodian-016 的真实盈利预测和估值数据构造评测样本。
+# 2. 将净利润放在排名第 2 的 chunk 中。
+# 3. 将 EPS 和 PE 放在排名第 5 的 chunk 中。
+# 4. 验证三个原子证据联合后，完整证据在第 5 名形成。
+# 5. 验证 Hit@5、Recall@5 和 MRR@5 按完整证据排名计算。
+@pytest.mark.unit
+def test_multi_chunk_requirement_uses_completion_rank():
+    sample = {
+        "id": "guodian-016",
+        "question": "研报觉得国电电力未来三年能赚多少钱，对应估值贵不贵？",
+        "reference_answer": (
+            "2025—2027年归母净利润分别为70.50、78.95和87.17亿元，"
+            "EPS分别为0.40、0.44和0.49元，PE分别为11.4、10.2和9.2倍。"
+        ),
+        "answerable": True,
+        "question_type": "paraphrase",
+        # 暂时保留旧字段，保证评测集结构向后兼容。
+        "relevant_evidence": [
+            {
+                "document_name": "国电电力.pdf",
+                "page": 1,
+                "text": (
+                    "预计2025-2027年公司归母净利润分别为"
+                    "70.50/78.95/87.17亿元；EPS分别为"
+                    "0.40/0.44/0.49元，当前股价对应PE为"
+                    "11.4/10.2/9.2x。"
+                ),
+            }
+        ],
+        # 新结构：外层 alternatives 是 OR，内层列表是 AND。
+        "evidence_requirements": [
+            {
+                "id": "profit_and_valuation",
+                "alternatives": [
+                    [
+                        {
+                            "type": "text",
+                            "document_name": "国电电力.pdf",
+                            "text": (
+                                "归属于母公司净利润 "
+                                "5609 9831 7050 7895 8717"
+                            ),
+                        },
+                        {
+                            "type": "text",
+                            "document_name": "国电电力.pdf",
+                            "text": (
+                                "每股收益 "
+                                "0.31 0.55 0.40 0.44 0.49"
+                            ),
+                        },
+                        {
+                            "type": "text",
+                            "document_name": "国电电力.pdf",
+                            "text": (
+                                "P/E 14.3 8.2 11.4 10.2 9.2"
+                            ),
+                        },
+                    ]
+                ],
+            }
+        ],
+        "metadata": {"source_modality": "text"},
+    }
+
+    raw_result = {
+        "total": 5,
+        "chunks": [
+            {
+                "chunk_id": "overview",
+                "docnm_kwd": "国电电力.pdf",
+                "content_with_weight": "2025年上半年经营情况。",
+            },
+            {
+                "chunk_id": "profit-table",
+                "docnm_kwd": "国电电力.pdf",
+                "content_with_weight": (
+                    "归属于母公司净利润 "
+                    "5609 9831 7050 7895 8717"
+                ),
+            },
+            {
+                "chunk_id": "disclosure",
+                "docnm_kwd": "国电电力.pdf",
+                "content_with_weight": "证券研究报告相关声明。",
+            },
+            {
+                "chunk_id": "rating",
+                "docnm_kwd": "国电电力.pdf",
+                "content_with_weight": "投资评级：优于大市。",
+            },
+            {
+                "chunk_id": "valuation-table",
+                "docnm_kwd": "国电电力.pdf",
+                "content_with_weight": (
+                    "每股收益 0.31 0.55 0.40 0.44 0.49；"
+                    "P/E 14.3 8.2 11.4 10.2 9.2"
+                ),
+            },
+        ],
+    }
+
+    result = evaluate_retrieval_case(
+        sample,
+        raw_result,
+        latency_ms=10,
+        top_k=5,
+        match_threshold=0.8,
+    )
+
+    assert result["metrics"]["hit_at_5"] is True
+    assert result["metrics"]["recall_at_5"] == 1.0
+    assert result["metrics"]["mrr_at_5"] == pytest.approx(0.2)
+    assert result["first_relevant_rank"] == 5
+
+# 用例功能：验证评测器能够按表格标题和完整数据行匹配 HTML 表格证据。
+# 执行步骤：
+# 1. 使用国电电力利润预测表中的真实财务费用数据构造标准证据。
+# 2. 构造包含表头、目标行和干扰行的 HTML 表格 chunk。
+# 3. 要求评测器匹配“财务预测与估值”表中的完整财务费用行。
+# 4. 验证该表格证据在排名第 1 的 chunk 中命中。
+@pytest.mark.unit
+def test_table_row_requirement_matches_html_table():
+    sample = {
+        "id": "guodian-022",
+        "question": "利润预测表中，国电电力2026E财务费用是多少？",
+        "reference_answer": "2026E财务费用为10049百万元。",
+        "answerable": True,
+        "question_type": "fact",
+        "relevant_evidence": [],
+        "evidence_requirements": [
+            {
+                "id": "financial_expense_row",
+                "alternatives": [
+                    [
+                        {
+                            "type": "table_row",
+                            "document_name": "国电电力.pdf",
+                            "caption": "财务预测与估值",
+                            "row_cells": [
+                                "财务费用",
+                                "6711",
+                                "6551",
+                                "8389",
+                                "10049",
+                                "10216",
+                            ],
+                        }
+                    ]
+                ],
+            }
+        ],
+        "metadata": {"source_modality": "table"},
+    }
+
+    raw_result = {
+        "total": 1,
+        "chunks": [
+            {
+                "chunk_id": "profit-table",
+                "docnm_kwd": "国电电力.pdf",
+                "content_with_weight": """
+                    <table>
+                      <caption>财务预测与估值</caption>
+                      <tr>
+                        <th>利润表（百万元）</th>
+                        <th>2023</th>
+                        <th>2024</th>
+                        <th>2025E</th>
+                        <th>2026E</th>
+                        <th>2027E</th>
+                      </tr>
+                      <tr>
+                        <td>研发费用</td>
+                        <td>741</td>
+                        <td>555</td>
+                        <td>548</td>
+                        <td>568</td>
+                        <td>570</td>
+                      </tr>
+                      <tr>
+                        <td>财务费用</td>
+                        <td>6711</td>
+                        <td>6551</td>
+                        <td>8389</td>
+                        <td>10049</td>
+                        <td>10216</td>
+                      </tr>
+                    </table>
+                """,
+            }
+        ],
+    }
+
+    result = evaluate_retrieval_case(
+        sample,
+        raw_result,
+        latency_ms=10,
+        top_k=5,
+        match_threshold=0.8,
+    )
+
+    assert result["metrics"]["hit_at_5"] is True
+    assert result["metrics"]["recall_at_5"] == 1.0
+    assert result["metrics"]["mrr_at_5"] == 1.0
+    assert result["first_relevant_rank"] == 1
 
 # 用例功能：验证不可回答问题不会被计入正向检索指标，但会计算空结果率。
 # 执行步骤：

@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import os
 import unicodedata
+from html.parser import HTMLParser
 from collections import Counter, defaultdict
 from typing import Any, Iterable
 
@@ -20,6 +21,95 @@ def normalize_document_name(name: Any) -> str:
     normalized = unicodedata.normalize("NFKC", str(name or ""))
     return os.path.basename(normalized.replace("\\", "/")).casefold()
 
+def normalize_table_cell(value: Any) -> str:
+    """Normalize table cells while preserving numeric signs and decimals."""
+    normalized = unicodedata.normalize(
+        "NFKC",
+        str(value or ""),
+    ).casefold().strip()
+
+    # 财务表格通常使用括号表示负数，例如 (23181)。
+    if (
+        len(normalized) >= 2
+        and normalized.startswith("(")
+        and normalized.endswith(")")
+    ):
+        normalized = f"-{normalized[1:-1]}"
+
+    # 千位分隔符不影响数值含义。
+    normalized = normalized.replace(",", "")
+
+    return "".join(
+        character
+        for character in normalized
+        if character.isalnum() or character in ".%+-"
+    )
+
+
+class _TableHTMLParser(HTMLParser):
+    """Extract captions and rows from the simple HTML tables stored in chunks."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.tables = []
+        self._table = None
+        self._caption_parts = None
+        self._row = None
+        self._cell_parts = None
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.casefold()
+
+        if tag == "table":
+            self._table = {
+                "caption": "",
+                "rows": [],
+            }
+        elif self._table is None:
+            return
+        elif tag == "caption":
+            self._caption_parts = []
+        elif tag == "tr":
+            self._row = []
+        elif tag in {"td", "th"} and self._row is not None:
+            self._cell_parts = []
+
+    def handle_data(self, data):
+        if self._cell_parts is not None:
+            self._cell_parts.append(data)
+        elif self._caption_parts is not None:
+            self._caption_parts.append(data)
+
+    def handle_endtag(self, tag):
+        tag = tag.casefold()
+
+        if tag in {"td", "th"} and self._cell_parts is not None:
+            if self._row is not None:
+                self._row.append("".join(self._cell_parts).strip())
+            self._cell_parts = None
+
+        elif tag == "tr" and self._row is not None:
+            if self._table is not None and self._row:
+                self._table["rows"].append(self._row)
+            self._row = None
+
+        elif tag == "caption" and self._caption_parts is not None:
+            if self._table is not None:
+                self._table["caption"] = "".join(
+                    self._caption_parts
+                ).strip()
+            self._caption_parts = None
+
+        elif tag == "table" and self._table is not None:
+            self.tables.append(self._table)
+            self._table = None
+
+
+def parse_html_tables(content: Any) -> list[dict[str, Any]]:
+    parser = _TableHTMLParser()
+    parser.feed(str(content or ""))
+    parser.close()
+    return parser.tables
 
 def evidence_text_match_score(reference: Any, candidate: Any) -> float:
     """Return how much of a gold evidence string is present in a chunk.
@@ -74,6 +164,190 @@ def evidence_chunk_match_score(
         _chunk_content(chunk),
     )
 
+def table_row_chunk_match_score(
+    evidence: dict[str, Any],
+    chunk: dict[str, Any],
+) -> float:
+    """Match a required row inside an HTML table from the same document."""
+    evidence_document = normalize_document_name(
+        evidence.get("document_name")
+    )
+    chunk_document = normalize_document_name(
+        _chunk_document_name(chunk)
+    )
+
+    if (
+        not evidence_document
+        or evidence_document != chunk_document
+    ):
+        return 0.0
+
+    expected_cells = [
+        normalize_table_cell(cell)
+        for cell in evidence.get("row_cells") or []
+    ]
+    if not expected_cells:
+        return 0.0
+
+    expected_caption = normalize_table_cell(
+        evidence.get("caption")
+    )
+
+    for table in parse_html_tables(_chunk_content(chunk)):
+        actual_caption = normalize_table_cell(
+            table.get("caption")
+        )
+
+        if (
+            expected_caption
+            and expected_caption not in actual_caption
+        ):
+            continue
+
+        for row in table.get("rows") or []:
+            actual_cells = [
+                normalize_table_cell(cell)
+                for cell in row
+            ]
+
+            # 完整行完全一致。
+            if actual_cells == expected_cells:
+                return 1.0
+
+            # 允许表格解析器在目标行前后产生额外单元格，
+            # 但目标单元格必须保持连续和顺序一致。
+            expected_length = len(expected_cells)
+            for start in range(
+                len(actual_cells) - expected_length + 1
+            ):
+                if (
+                    actual_cells[start:start + expected_length]
+                    == expected_cells
+                ):
+                    return 1.0
+
+    return 0.0
+
+def evaluate_evidence_requirement(
+    requirement: dict[str, Any],
+    chunks: list[dict[str, Any]],
+    match_threshold: float,
+) -> dict[str, Any]:
+    """Evaluate OR alternatives whose evidence atoms may match different chunks."""
+    successful_alternatives = []
+    best_coverage = 0.0
+
+    for alternative_index, alternative in enumerate(
+        requirement.get("alternatives") or [],
+        start=1,
+    ):
+        if not alternative:
+            continue
+
+        atom_matches = []
+
+        for atom_index, atom in enumerate(alternative, start=1):
+            match_type = atom.get("type", "text")
+
+            if match_type == "text":
+                score_function = evidence_chunk_match_score
+            elif match_type == "table_row":
+                score_function = table_row_chunk_match_score
+            else:
+                raise ValueError(
+                    f"Unsupported evidence match type: {match_type}"
+                )
+
+            scored_chunks = [
+                (
+                    rank,
+                    score_function(atom, chunk),
+                    str(chunk.get("chunk_id", "")),
+                )
+                for rank, chunk in enumerate(chunks, start=1)
+            ]
+
+            passing_matches = [
+                item
+                for item in scored_chunks
+                if item[1] >= match_threshold
+            ]
+            first_match = min(
+                passing_matches,
+                default=None,
+                key=lambda item: item[0],
+            )
+            best_score = max(
+                (item[1] for item in scored_chunks),
+                default=0.0,
+            )
+
+            atom_matches.append(
+                {
+                    "atom_index": atom_index,
+                    "matched": first_match is not None,
+                    "matched_rank": (
+                        first_match[0] if first_match else None
+                    ),
+                    "matched_chunk_id": (
+                        first_match[2] if first_match else None
+                    ),
+                    "best_match_score": round(best_score, 6),
+                }
+            )
+
+        matched_atom_count = sum(
+            1 for atom_match in atom_matches
+            if atom_match["matched"]
+        )
+        coverage = matched_atom_count / len(atom_matches)
+        best_coverage = max(best_coverage, coverage)
+
+        if matched_atom_count == len(atom_matches):
+            completion_rank = max(
+                atom_match["matched_rank"]
+                for atom_match in atom_matches
+            )
+            successful_alternatives.append(
+                {
+                    "alternative_index": alternative_index,
+                    "completion_rank": completion_rank,
+                    "atom_matches": atom_matches,
+                    "matched_chunk_ids": [
+                        atom_match["matched_chunk_id"]
+                        for atom_match in atom_matches
+                    ],
+                }
+            )
+
+    if not successful_alternatives:
+        return {
+            "requirement_id": requirement.get("id"),
+            "matched": False,
+            "matched_rank": None,
+            "matched_chunk_id": None,
+            "matched_chunk_ids": [],
+            "best_match_score": round(best_coverage, 6),
+            "alternative_index": None,
+            "atom_matches": [],
+        }
+
+    # 如果多个 OR 分支都成功，选择最早形成完整证据的分支。
+    best_alternative = min(
+        successful_alternatives,
+        key=lambda item: item["completion_rank"],
+    )
+
+    return {
+        "requirement_id": requirement.get("id"),
+        "matched": True,
+        "matched_rank": best_alternative["completion_rank"],
+        "matched_chunk_id": None,
+        "matched_chunk_ids": best_alternative["matched_chunk_ids"],
+        "best_match_score": 1.0,
+        "alternative_index": best_alternative["alternative_index"],
+        "atom_matches": best_alternative["atom_matches"],
+    }
 
 def _optional_float(value: Any) -> float | None:
     if value is None:
@@ -152,49 +426,95 @@ def evaluate_retrieval_case(
         serialize_retrieved_chunk(chunk, rank)
         for rank, chunk in enumerate(raw_chunks, start=1)
     ]
-    evidence_matches = []
-    relevant_ranks = set()
 
-    for evidence_index, evidence in enumerate(
-        sample.get("relevant_evidence") or [],
-        start=1,
-    ):
-        scored_chunks = [
-            (
-                rank,
-                evidence_chunk_match_score(evidence, chunk),
-                str(chunk.get("chunk_id", "")),
+    evidence_requirements = sample.get("evidence_requirements") or []
+
+    if evidence_requirements:
+        evidence_matches = [
+            evaluate_evidence_requirement(
+                requirement,
+                raw_chunks,
+                match_threshold,
             )
-            for rank, chunk in enumerate(raw_chunks, start=1)
+            for requirement in evidence_requirements
         ]
-        passing_matches = [
-            item for item in scored_chunks if item[1] >= match_threshold
-        ]
-        first_match = min(passing_matches, default=None, key=lambda item: item[0])
-        best_score = max((item[1] for item in scored_chunks), default=0.0)
-        matched_rank = first_match[0] if first_match else None
-        if matched_rank is not None:
-            relevant_ranks.add(matched_rank)
+    else:
+        evidence_matches = []
+        relevant_ranks = set()
 
-        evidence_matches.append(
-            {
-                "evidence_index": evidence_index,
-                "document_name": evidence.get("document_name"),
-                "page": evidence.get("page"),
-                "evidence_type": evidence.get("evidence_type", "text"),
-                "matched": first_match is not None,
-                "matched_rank": matched_rank,
-                "matched_chunk_id": first_match[2] if first_match else None,
-                "best_match_score": round(best_score, 6),
-            }
-        )
+        for evidence_index, evidence in enumerate(
+            sample.get("relevant_evidence") or [],
+            start=1,
+        ):
+            scored_chunks = [
+                (
+                    rank,
+                    evidence_chunk_match_score(evidence, chunk),
+                    str(chunk.get("chunk_id", "")),
+                )
+                for rank, chunk in enumerate(raw_chunks, start=1)
+            ]
+            passing_matches = [
+                item for item in scored_chunks
+                if item[1] >= match_threshold
+            ]
+            first_match = min(
+                passing_matches,
+                default=None,
+                key=lambda item: item[0],
+            )
+            best_score = max(
+                (item[1] for item in scored_chunks),
+                default=0.0,
+            )
+            matched_rank = first_match[0] if first_match else None
+
+            evidence_matches.append(
+                {
+                    "evidence_index": evidence_index,
+                    "document_name": evidence.get("document_name"),
+                    "page": evidence.get("page"),
+                    "evidence_type": evidence.get(
+                        "evidence_type",
+                        "text",
+                    ),
+                    "matched": first_match is not None,
+                    "matched_rank": matched_rank,
+                    "matched_chunk_id": (
+                        first_match[2] if first_match else None
+                    ),
+                    "best_match_score": round(best_score, 6),
+                }
+            )
 
     answerable = bool(sample.get("answerable"))
     gold_evidence_count = len(evidence_matches)
     matched_evidence_count = sum(
         1 for evidence in evidence_matches if evidence["matched"]
     )
-    first_relevant_rank = min(relevant_ranks) if relevant_ranks else None
+    matched_ranks = [
+        evidence["matched_rank"]
+        for evidence in evidence_matches
+        if evidence["matched_rank"] is not None
+    ]
+
+    if evidence_requirements:
+        all_requirements_matched = (
+            bool(evidence_matches)
+            and all(evidence["matched"] for evidence in evidence_matches)
+        )
+        first_relevant_rank = (
+            max(matched_ranks)
+            if all_requirements_matched
+            else None
+        )
+    else:
+        first_relevant_rank = (
+            min(matched_ranks)
+            if matched_ranks
+            else None
+        )
+
     metric_suffix = str(top_k)
 
     metrics = {
