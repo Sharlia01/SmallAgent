@@ -1,24 +1,75 @@
-# RAGSys
+# RAGSys Agent
 
-RAGSys is a full-stack document question-answering system powered by Retrieval-Augmented Generation (RAG). Users can upload documents, organize a personal knowledge base, and receive streaming answers grounded in the content of those documents.
+RAGSys Agent is a full-stack, agent-driven question-answering system for personal knowledge bases. It decides when to use tools, searches private documents or the live web, and produces streaming answers grounded in conversation history and retrieved evidence.
+
+Retrieval-Augmented Generation (RAG) is one of the Agent's core tools rather than the complete definition of the system.
 
 ## Features
 
-- User registration and authentication
-- Document upload, parsing, search, and deletion
-- RAG-based question answering with streaming responses
-- Conversation sessions and message history
-- Support for common document formats, including PDF, DOCX, TXT, Excel, PowerPoint, HTML, and Markdown
+- User registration, authentication, and session-level data isolation
+- Document upload, parsing, retrieval, and deletion
+- Agent-directed selection between private knowledge-base retrieval and live web search
+- Combined use of knowledge-base and web evidence in a single task
+- Streaming answers with traceable citations
+- Bounded multi-turn conversation context
+- Support for PDF, DOCX, TXT, Excel, PowerPoint, HTML, and Markdown
+- An offline RAG evaluation dataset and retrieval metrics
 
-## Tech Stack
+## Architecture
+
+```text
+User question + conversation history + session document
+                           │
+                           ▼
+                   Agent Planner / Router
+                           │
+                 ┌─────────┼─────────┐
+                 │         │         │
+                 ▼         ▼         ▼
+        Knowledge-base RAG  Web search  No tool
+                 │         │         │
+                 └─────────┴─────────┘
+                           │
+                           ▼
+                 Normalized evidence
+                           │
+                           ▼
+                     Answer model
+                           │
+                           ▼
+               Streaming answer + citations
+```
+
+The Agent is responsible for retrieval decisions and tool execution. A separate answer model synthesizes the final response. This planner-executor-synthesizer design allows a smaller model with reliable function calling to handle routing while a more capable model focuses on answer quality.
+
+## Model configuration
+
+| Responsibility | Configuration | Current default |
+| --- | --- | --- |
+| Agent routing and tool calls | `AGENT_MODEL` | `qwen3.7-flash-2026-07-15` |
+| Final answer generation | `CHAT_MODEL` | `deepseek-v4-pro` |
+| Live web search | `WEB_SEARCH_MODEL` | `qwen-plus` |
+| Suggested questions and session titles | Configured in code | `qwen3.7-flash-2026-07-15` |
+| Text embeddings | Local model directory | `bge-small-zh-v1.5` |
+| Retrieval reranking | DashScope | `qwen3-rerank` |
+
+Both `AGENT_MODEL` and `CHAT_MODEL` are currently set to `deepseek-v4-pro` in `.env.example`. To use a smaller model for routing and a larger model for answer synthesis, configure them separately in `backend/.env`:
+
+```env
+AGENT_MODEL=<function-calling router model>
+CHAT_MODEL=deepseek-v4-pro
+```
+
+## Technology stack
 
 - **Frontend:** React, TypeScript, Vite, and Ant Design
 - **Backend:** FastAPI and Python
 - **Data services:** PostgreSQL, Elasticsearch, and Redis
-- **Embedding:** Local `bge-small-zh-v1.5`
-- **LLM and rerank service:** Alibaba Cloud DashScope
+- **Agent:** An OpenAI-compatible function-calling loop
+- **Embeddings:** Local `bge-small-zh-v1.5`
+- **LLM and reranking:** Alibaba Cloud DashScope
 
-## Getting Started
+## Getting started
 
 ### Prerequisites
 
@@ -34,23 +85,25 @@ cd backend
 cp .env.example .env
 ```
 
-Open `backend/.env`, add your DashScope API key, and replace the example passwords and JWT secret with secure values:
+Edit `backend/.env`, add your DashScope API key, and replace the example PostgreSQL, Elasticsearch, and JWT secrets:
 
 ```env
 DASHSCOPE_API_KEY="your-api-key"
 BGE_MODEL_HOST_PATH=../../models/bge-small-zh-v1.5
+POSTGRES_PASSWORD="replace-with-a-strong-password"
+ELASTIC_PASSWORD="replace-with-a-strong-password"
+JWT_SECRET_KEY="replace-with-a-long-random-string"
 ```
 
-`BGE_MODEL_HOST_PATH` is resolved relative to `backend/docker-compose.yml`.
-The default matches a model stored at `Projects/models/bge-small-zh-v1.5`.
+`BGE_MODEL_HOST_PATH` is resolved relative to `backend/docker-compose.yml`. The default points to `Projects/models/bge-small-zh-v1.5`.
 
-Then start the API and its supporting services:
+Start the API and its supporting services:
 
 ```bash
 docker compose up -d --build
 ```
 
-The API documentation will be available at [http://localhost:8000/docs](http://localhost:8000/docs).
+API documentation: [http://localhost:8000/docs](http://localhost:8000/docs)
 
 ### 2. Start the frontend
 
@@ -62,15 +115,63 @@ npm install
 npm run dev
 ```
 
-Open [http://localhost:5181](http://localhost:5181) in your browser.
+Frontend: [http://localhost:5181](http://localhost:5181)
 
-## Useful Commands
+## Testing
+
+Backend tests run against an isolated PostgreSQL test container:
+
+```bash
+cd backend
+
+# Run the complete test suite
+./run-tests.sh
+
+# Run a specific test category
+./run-tests.sh unit
+./run-tests.sh api
+./run-tests.sh integration
+```
+
+Frontend checks:
+
+```bash
+cd frontend
+npm run lint
+npm run build
+```
+
+## Offline RAG evaluation
+
+The evaluation dataset and runner are located in `backend/evals`. Validate the dataset without accessing Elasticsearch or model services:
+
+```bash
+docker compose exec LS_api \
+  python /app/evals/run_retrieval_eval.py \
+  --validate-only
+```
+
+Run a retrieval baseline:
+
+```bash
+docker compose exec LS_api \
+  python /app/evals/run_retrieval_eval.py \
+  --index-name <user-id> \
+  --run-name retrieval_baseline
+```
+
+See [`backend/evals/README.md`](backend/evals/README.md) for dataset details, metrics, and additional commands.
+
+## Useful commands
 
 ```bash
 # View backend logs
-docker logs -f swxy_api
+docker logs -f LS_api
 
-# Stop all backend services
+# View service status
 cd backend
+docker compose ps
+
+# Stop backend services
 docker compose down
 ```

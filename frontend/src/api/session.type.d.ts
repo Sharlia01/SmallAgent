@@ -33,5 +33,19 @@ declare namespace API {
     document_name: string
     content_with_weight: string
     positions: number[][]
+    source_type?: 'knowledge_base' | 'web'
+    url?: string
+    web_sources?: {
+      source_type: 'web'
+      source_id: string
+      title: string
+      content: string
+      url?: string
+      metadata: {
+        site_name?: string
+        icon?: string
+        index?: number
+      }
+    }[]
   }
 }

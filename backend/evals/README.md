@@ -67,7 +67,7 @@ docker compose exec gsk_pg \
 ```
 
 建议先跑一条样本，确认 Elasticsearch、本地 BGE 和 DashScope
-`gte-rerank` 配置正常：
+`qwen3-rerank` 配置正常：
 
 ```bash
 docker compose exec swxy_api \

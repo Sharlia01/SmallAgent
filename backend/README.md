@@ -24,7 +24,7 @@ DASHSCOPE_API_KEY="your-api-key"
 BGE_MODEL_HOST_PATH=../../models/bge-small-zh-v1.5
 ```
 
-Embedding 使用本地 BGE；DashScope Key 仍用于聊天模型和 `gte-rerank`。
+Embedding 使用本地 BGE；DashScope Key 仍用于聊天模型和 `qwen3-rerank`。
 `BGE_MODEL_HOST_PATH` 相对于本目录的 `docker-compose.yml`。
 
 
@@ -37,7 +37,7 @@ docker compose up -d --build
 docker compose ps
 
 # 查看日志
-docker compose logs -f swxy_api
+docker compose logs -f LS_api
 ```
 
 4. **等待服务完全启动**
@@ -49,10 +49,10 @@ curl http://localhost:8000/docs
 ### 服务说明
 
 项目包含以下服务：
-- **swxy_api**: 主应用服务 (端口: 8000)
-- **gsk_pg**: PostgreSQL数据库
-- **es01**: Elasticsearch搜索引擎  
-- **redis**: Redis缓存
+- **LS_api**: 主应用服务 (端口: 8000)
+- **LS_pg**: PostgreSQL数据库
+- **LS-es-01**: Elasticsearch搜索引擎
+- **LS_redis**: Redis缓存
 
 ### 停止服务
 
@@ -72,22 +72,22 @@ docker compose down -v
 docker compose logs
 
 # 查看特定服务日志
-docker compose logs swxy_api
-docker compose logs gsk_pg
-docker compose logs es01
-docker compose logs redis
+docker compose logs LS_api
+docker compose logs LS_pg
+docker compose logs LS-es-01
+docker compose logs LS_redis
 
 # 实时跟踪日志
-docker compose logs -f swxy_api
+docker compose logs -f LS_api
 ```
 
 ### 进入容器调试
 ```bash
 # 进入主应用容器
-docker compose exec swxy_api bash
+docker compose exec LS_api bash
 
 # 进入数据库容器
-docker compose exec gsk_pg psql -U postgres -d gsk
+docker compose exec LS_pg psql -U postgres -d gsk
 ```
 
 ### 重新构建服务
@@ -96,8 +96,8 @@ docker compose exec gsk_pg psql -U postgres -d gsk
 docker compose up --build -d
 
 # 仅重新构建特定服务
-docker compose build swxy_api
-docker compose up -d swxy_api
+docker compose build LS_api
+docker compose up -d LS_api
 ```
 
 ## 📋 常见问题

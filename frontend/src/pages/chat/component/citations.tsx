@@ -46,7 +46,9 @@ function CitationsItem(props: {
 
       <div className={styles['footer']}>
         <div className={styles['footer-desc']}>
-          页码 {item.positions?.[0]?.[0] ?? '-'}
+          {item.source_type === 'web'
+            ? `网络来源 ${item.web_sources?.length ?? 0} 条`
+            : `页码 ${item.positions?.[0]?.[0] ?? '-'}`}
         </div>
         <Button
           className={styles['footer-button']}
@@ -54,7 +56,7 @@ function CitationsItem(props: {
           variant="solid"
           onClick={onRead}
         >
-          阅读
+          {item.source_type === 'web' ? '查看来源' : '阅读'}
         </Button>
       </div>
     </div>

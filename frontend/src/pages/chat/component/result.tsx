@@ -11,6 +11,27 @@ import { TokenizerAndRendererExtension } from 'marked'
 import { useCallback, useMemo } from 'react'
 import styles from './result.module.scss'
 
+const LEGACY_WEB_REFERENCE_PATTERN =
+  /##ref_\d+\$\$|\[ref_\d+\]|\bref_\d+\b/gi
+
+function normalizeLegacyWebReferences(
+  content: string | undefined,
+  references: API.Reference[] | undefined,
+) {
+  if (!content) return content
+
+  const webReferenceIndex = references?.findIndex(
+    (reference) => reference.source_type === 'web',
+  )
+  if (webReferenceIndex === undefined || webReferenceIndex < 0) return content
+
+  // Older answers can contain DashScope's internal ref_N marker. Point it at
+  // the aggregate web-search document used by this application's citations.
+  return content.replace(LEGACY_WEB_REFERENCE_PATTERN, () =>
+    `##${webReferenceIndex + 1}$$`,
+  )
+}
+
 export function Result(props: {
   item: API.ChatItem
   isEnd?: boolean
@@ -18,6 +39,14 @@ export function Result(props: {
   onRefrence?: (index: number) => void
 }) {
   const { item, isEnd, onSend, onRefrence } = props
+  const normalizedThink = normalizeLegacyWebReferences(
+    item.think,
+    item.reference,
+  )
+  const normalizedContent = normalizeLegacyWebReferences(
+    item.content,
+    item.reference,
+  )
 
   const shareMenu = useMemo(() => {
     return [
@@ -62,7 +91,9 @@ export function Result(props: {
         },
         renderer(token) {
           const index = this.parser.parseInline(token.index)
-          return `<span class="refrence-token" data-refrence-index="${index}">[${Number(index) + 1}]</span>`
+          const referenceNumber = Number(index)
+          const referenceIndex = Math.max(referenceNumber - 1, 0)
+          return `<span class="refrence-token" data-refrence-index="${referenceIndex}">[${referenceNumber}]</span>`
         },
       },
     ],
@@ -82,22 +113,22 @@ export function Result(props: {
 
   return (
     <div className={styles['chat-message-result']}>
-      {item.think ? (
+      {normalizedThink ? (
         <Markdown
           className={classNames(
             styles['chat-message-result__think'],
             styles['chat-message-result__md'],
           )}
-          value={item.think}
+          value={normalizedThink}
           extensions={extensions}
           onClick={handleClick}
         />
       ) : null}
 
-      {item.content ? (
+      {normalizedContent ? (
         <Markdown
           className={styles['chat-message-result__md']}
-          value={item.content}
+          value={normalizedContent}
           extensions={extensions}
           onClick={handleClick}
         />

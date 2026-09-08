@@ -8,7 +8,6 @@ from typing import List, Optional
 from service.core.file_parse import execute_insert_process
 from service.core.api.utils.file_utils import get_project_base_directory
 from fastapi_jwt import JwtAuthorizationCredentials
-from service.core.retrieval import retrieve_content
 from service.core.chat import get_chat_completion
 from service.auth import access_security
 from utils import logger
@@ -171,7 +170,7 @@ async def get_parsed_content(
         )
 
 ##################################
-# 基于ragflow知识库对话
+# Agent 智能问答
 ##################################
 
 @router.post("/chat_on_docs")
@@ -186,24 +185,13 @@ async def chat_on_docs(
         require_owned_session(db, session_id, user_id)
         
         logger.info(f"开始处理用户 {user_id} 的请求")
-        logger.info(f"问题内容: {request.message}")
         
         question = request.message
         
-        # 尝试从知识库检索内容，如果没有知识库也不报错
-        references = []
-        try:
-            logger.info("开始检索相关内容...")
-            references = retrieve_content(str(user_id), question)
-            logger.info(f"检索到 {len(references)} 条相关内容")
-        except Exception as e:
-            logger.info(f"用户 {user_id} 没有知识库或检索失败: {str(e)}，将不使用知识库内容")
-            references = []
-
-        logger.info("开始生成回答...")
+        logger.info("开始运行 Agent 并生成回答...")
         # 返回流式响应
         return StreamingResponse(
-            get_chat_completion(session_id, question, references, user_id),
+            get_chat_completion(session_id, question, user_id=user_id),
             media_type="text/event-stream"
         )
     

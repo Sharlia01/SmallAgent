@@ -81,9 +81,14 @@ def format_retrieved_chunk(chunk: dict[str, Any], rank: int) -> dict[str, Any]:
     }
 
 
-def retrieve_content(indexNames: str, question: str):
+def retrieve_content(
+    indexNames: str,
+    question: str,
+    *,
+    page_size: int = DEFAULT_PAGE_SIZE,
+) -> list[dict[str, Any]]:
     """Retrieve the top chunks for chat while retaining ranking metadata."""
-    results = retrieve_raw_results(indexNames, question)
+    results = retrieve_raw_results(indexNames, question, page_size=page_size)
     return [
         format_retrieved_chunk(chunk, rank)
         for rank, chunk in enumerate(results.get("chunks", []), start=1)

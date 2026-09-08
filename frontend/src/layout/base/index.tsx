@@ -1,7 +1,9 @@
 import iconNewchat from '@/assets/layout/newchat.svg'
+import { useResizablePanel } from '@/hooks/use-resizable-panel'
 import iconRepository from '@/assets/layout/repository.svg'
 import { deviceState } from '@/store/device'
-import { useState } from 'react'
+import classNames from 'classnames'
+import { CSSProperties, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useSnapshot } from 'valtio'
 import { Background } from './background'
@@ -15,10 +17,29 @@ export function BaseLayout({ children }: { children?: React.ReactNode }) {
   const navigate = useNavigate()
   const device = useSnapshot(deviceState)
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const {
+    size: sidebarWidth,
+    isResizing: isSidebarResizing,
+    handlePointerDown: handleSidebarPointerDown,
+    handleKeyDown: handleSidebarKeyDown,
+  } = useResizablePanel({
+    defaultSize: 206,
+    minSize: 160,
+    maxSize: 420,
+    resizeEdge: 'right',
+    storageKey: 'rag-system-left-sidebar-width',
+  })
+  const layoutStyle = {
+    '--base-layout-sidebar-width': `${sidebarWidth}px`,
+  } as CSSProperties
 
   return (
     <div
-      className={`base-layout${sidebarCollapsed ? ' base-layout--sidebar-collapsed' : ''}`}
+      className={classNames('base-layout', {
+        'base-layout--sidebar-collapsed': sidebarCollapsed,
+        'base-layout--sidebar-resizing': isSidebarResizing,
+      })}
+      style={layoutStyle}
     >
       <div className="base-layout__sidebar">
         <button
@@ -31,6 +52,20 @@ export function BaseLayout({ children }: { children?: React.ReactNode }) {
         >
           {sidebarCollapsed ? '›' : '‹'}
         </button>
+
+        <div
+          className="base-layout__sidebar-resizer"
+          role="separator"
+          aria-label="调整左侧栏宽度"
+          aria-orientation="vertical"
+          aria-valuemin={160}
+          aria-valuemax={420}
+          aria-valuenow={sidebarWidth}
+          tabIndex={sidebarCollapsed ? -1 : 0}
+          title="拖动以调整左侧栏宽度"
+          onPointerDown={handleSidebarPointerDown}
+          onKeyDown={handleSidebarKeyDown}
+        />
 
         <div className="base-layout__logo">
           <span className="title">{TITLE}</span>

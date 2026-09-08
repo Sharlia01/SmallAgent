@@ -28,7 +28,10 @@ def get_logger():
 
     # Logger instance
     logger = colorlog.getLogger(__name__)
-    logger.addHandler(handler)
+    if not logger.handlers:
+        logger.addHandler(handler)
+
+    logger.propagate = False
 
     # Logger level
     LOG_LEVEL_OPTION = {
