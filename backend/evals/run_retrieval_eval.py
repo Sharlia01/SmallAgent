@@ -29,6 +29,10 @@ from service.core.retrieval_evaluation import (  # noqa: E402
     build_summary,
     evaluate_retrieval_case,
 )
+from service.core.evidence_sufficiency import (  # noqa: E402
+    DEFAULT_EVIDENCE_SUFFICIENCY_MODEL,
+)
+from service.core.rag.nlp.model import RERANKER_MODEL  # noqa: E402
 
 
 REQUIRED_SAMPLE_FIELDS = {
@@ -42,6 +46,13 @@ REQUIRED_SAMPLE_FIELDS = {
     "relevant_evidence",
     "metadata",
 }
+
+
+def environment_flag(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().casefold() not in {"0", "false", "no", "off"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,7 +90,45 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--similarity-threshold", type=float, default=0.1)
-    parser.add_argument("--vector-weight", type=float, default=0.6)
+    parser.add_argument(
+        "--vector-weight",
+        type=float,
+        default=0.6,
+        help="Vector branch weight in weighted RRF (default: 0.6).",
+    )
+    parser.add_argument(
+        "--candidate-size",
+        type=int,
+        default=100,
+        help="Candidate count retrieved independently by each branch.",
+    )
+    parser.add_argument(
+        "--rerank-candidate-size",
+        type=int,
+        default=20,
+        help="Top RRF candidates sent to semantic reranking.",
+    )
+    parser.add_argument(
+        "--rrf-k",
+        type=int,
+        default=60,
+        help="RRF rank smoothing constant (default: 60).",
+    )
+    parser.add_argument(
+        "--final-reranker-weight",
+        type=float,
+        default=0.7,
+        help=(
+            "Semantic reranker weight in second-stage rank fusion "
+            "(default: 0.7)."
+        ),
+    )
+    parser.add_argument(
+        "--final-rrf-k",
+        type=int,
+        default=10,
+        help="Second-stage RRF rank smoothing constant (default: 10).",
+    )
     parser.add_argument(
         "--match-threshold",
         type=float,
@@ -121,6 +170,16 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--similarity-threshold must be between 0 and 1")
     if not 0 <= args.vector_weight <= 1:
         raise ValueError("--vector-weight must be between 0 and 1")
+    if args.candidate_size <= 0:
+        raise ValueError("--candidate-size must be greater than 0")
+    if args.rerank_candidate_size <= 0:
+        raise ValueError("--rerank-candidate-size must be greater than 0")
+    if args.rrf_k <= 0:
+        raise ValueError("--rrf-k must be greater than 0")
+    if not 0 <= args.final_reranker_weight <= 1:
+        raise ValueError("--final-reranker-weight must be between 0 and 1")
+    if args.final_rrf_k <= 0:
+        raise ValueError("--final-rrf-k must be greater than 0")
     if not 0 <= args.match_threshold <= 1:
         raise ValueError("--match-threshold must be between 0 and 1")
     if args.limit is not None and args.limit <= 0:
@@ -281,6 +340,7 @@ def main() -> int:
     args = parse_args()
     validate_args(args)
     dataset_path = args.dataset.resolve()
+    #加载数据集并筛选样本
     samples = load_dataset(dataset_path)
     samples = select_samples(samples, args.sample_id, args.limit)
 
@@ -310,6 +370,7 @@ def main() -> int:
     result_path = output_directory / f"{args.run_name}.jsonl"
     summary_path = output_directory / f"{args.run_name}_summary.json"
     existing_outputs = [path for path in (result_path, summary_path) if path.exists()]
+    #避免误刷历史结果
     if existing_outputs and not args.overwrite:
         paths = ", ".join(str(path) for path in existing_outputs)
         raise FileExistsError(
@@ -333,6 +394,11 @@ def main() -> int:
                 page_size=args.top_k,
                 similarity_threshold=args.similarity_threshold,
                 vector_similarity_weight=args.vector_weight,
+                candidate_size=args.candidate_size,
+                rerank_candidate_size=args.rerank_candidate_size,
+                rrf_k=args.rrf_k,
+                final_reranker_weight=args.final_reranker_weight,
+                final_rrf_k=args.final_rrf_k,
             )
             latency_ms = (time.perf_counter() - query_started) * 1000
             result = evaluate_retrieval_case(
@@ -390,8 +456,29 @@ def main() -> int:
             "index_names": index_names,
             "top_k": args.top_k,
             "similarity_threshold": args.similarity_threshold,
-            "vector_similarity_weight": args.vector_weight,
+            "vector_rrf_weight": args.vector_weight,
+            "candidate_size_per_branch": args.candidate_size,
+            "rerank_candidate_size": args.rerank_candidate_size,
+            "reranker_model": RERANKER_MODEL,
+            "rrf_k": args.rrf_k,
+            "final_reranker_weight": args.final_reranker_weight,
+            "final_retrieval_rrf_weight": (
+                1.0 - args.final_reranker_weight
+            ),
+            "final_rrf_k": args.final_rrf_k,
             "evidence_match_threshold": args.match_threshold,
+            "evidence_sufficiency_enabled": environment_flag(
+                "RAG_EVIDENCE_SUFFICIENCY_ENABLED",
+                True,
+            ),
+            "evidence_sufficiency_model": os.getenv(
+                "RAG_EVIDENCE_SUFFICIENCY_MODEL",
+                DEFAULT_EVIDENCE_SUFFICIENCY_MODEL,
+            ),
+            "evidence_sufficiency_fail_open": environment_flag(
+                "RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN",
+                True,
+            ),
         },
         "result_file": str(result_path),
         "metrics": metric_summary,

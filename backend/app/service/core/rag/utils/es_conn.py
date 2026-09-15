@@ -381,7 +381,15 @@ class ESConnection:
 
         # 保留原顺序：KNN 的 filter 构造完之后，再添加额外加分条件。
         self._apply_rank_features(bool_query, rank_feature)
-        search_query = search_query.query(bool_query)
+        dense_only = bool(match_expressions) and all(
+            isinstance(expression, MatchDenseExpr)
+            for expression in match_expressions
+        )
+        # A KNN-only branch already carries metadata constraints in knn.filter.
+        # Adding the same bool query at the top level would turn it into a
+        # disjunctive hybrid request and pollute the independent vector rank.
+        if not dense_only:
+            search_query = search_query.query(bool_query)
         search_query = self._apply_highlights_and_aggregations(
             search_query, highlight_fields, aggregation_fields
         )

@@ -47,11 +47,13 @@ The Agent is responsible for retrieval decisions and tool execution. A separate 
 | Responsibility | Configuration | Current default |
 | --- | --- | --- |
 | Agent routing and tool calls | `AGENT_MODEL` | `qwen3.7-flash-2026-07-15` |
+| Retrieval query normalization | `QUERY_REWRITE_MODEL` | `qwen3.7-flash-2026-07-15` |
+| Evidence sufficiency check | `RAG_EVIDENCE_SUFFICIENCY_MODEL` | `qwen3.7-flash-2026-07-15` |
 | Final answer generation | `CHAT_MODEL` | `deepseek-v4-pro` |
 | Live web search | `WEB_SEARCH_MODEL` | `qwen-plus` |
 | Suggested questions and session titles | Configured in code | `qwen3.7-flash-2026-07-15` |
 | Text embeddings | Local model directory | `bge-small-zh-v1.5` |
-| Retrieval reranking | DashScope | `qwen3-rerank` |
+| Retrieval reranking | DashScope | `qwen3.7-text-rerank` |
 
 Both `AGENT_MODEL` and `CHAT_MODEL` are currently set to `deepseek-v4-pro` in `.env.example`. To use a smaller model for routing and a larger model for answer synthesis, configure them separately in `backend/.env`:
 
@@ -67,7 +69,8 @@ CHAT_MODEL=deepseek-v4-pro
 - **Data services:** PostgreSQL, Elasticsearch, and Redis
 - **Agent:** An OpenAI-compatible function-calling loop
 - **Embeddings:** Local `bge-small-zh-v1.5`
-- **LLM and reranking:** Alibaba Cloud DashScope
+- **Reranking:** DashScope `qwen3.7-text-rerank`
+- **LLM:** Alibaba Cloud DashScope
 
 ## Getting started
 
@@ -96,6 +99,17 @@ JWT_SECRET_KEY="replace-with-a-long-random-string"
 ```
 
 `BGE_MODEL_HOST_PATH` is resolved relative to `backend/docker-compose.yml`. The default points to `Projects/models/bge-small-zh-v1.5`.
+
+Retrieval reranking calls DashScope `qwen3.7-text-rerank` with the same API key.
+Switching the reranker does not require rebuilding the existing 512-dimensional
+embedding index.
+
+After reranking, the final Top chunks are checked for complete evidence coverage.
+The checker requires every requested metric, time range, qualifier, and sub-question
+to be directly supported. Insufficient evidence is removed before answer generation.
+Set `RAG_EVIDENCE_SUFFICIENCY_ENABLED=false` to disable this gate. Provider failures
+preserve retrieval results by default; set `RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN=false`
+to fail closed instead.
 
 Start the API and its supporting services:
 

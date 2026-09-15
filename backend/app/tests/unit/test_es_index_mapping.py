@@ -3,6 +3,7 @@ from unittest.mock import Mock
 import pytest
 
 from service.core.rag.utils.es_conn import ESConnection
+from service.core.rag.utils.doc_store_conn import MatchDenseExpr, OrderByExpr
 
 
 # 用例功能：验证创建新 ES 索引时会应用仅包含 512 维 BGE 向量的 mapping。
@@ -61,3 +62,35 @@ def test_ensure_index_keeps_existing_index(monkeypatch):
     connection._ensure_index("1")
 
     fake_es.indices.create.assert_not_called()
+
+
+@pytest.mark.unit
+def test_knn_only_branch_uses_metadata_filter_without_top_level_query(
+    monkeypatch,
+):
+    monkeypatch.setenv("ELASTIC_PASSWORD", "test-only-password")
+    connection = ESConnection()
+    dense_expression = MatchDenseExpr(
+        "q_512_vec",
+        [0.1, 0.2],
+        "float",
+        "cosine",
+        10,
+        {"similarity": 0.1},
+    )
+
+    body = connection._build_search_body(
+        condition={"available_int": 1},
+        match_expressions=[dense_expression],
+        order_by=OrderByExpr(),
+        offset=0,
+        limit=10,
+        knowledgebase_ids=None,
+        highlight_fields=[],
+        aggregation_fields=[],
+        rank_feature=None,
+    )
+
+    assert "knn" in body
+    assert "filter" in body["knn"]
+    assert "query" not in body

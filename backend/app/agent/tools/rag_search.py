@@ -8,7 +8,7 @@ from utils import logger
 
 
 MAX_RAG_RESULTS = 20
-EMPTY_RESULT_MESSAGE = "未在当前用户的知识库中检索到相关内容。"
+EMPTY_RESULT_MESSAGE = "未在当前用户的知识库中找到足以完整回答问题的证据。"
 FAILED_RESULT_MESSAGE = "知识库检索暂时不可用。"
 
 
@@ -36,8 +36,13 @@ def _chunk_to_source(chunk: dict[str, Any], rank: int) -> ToolSource:
             "rank": source_rank,
             "document_id": chunk.get("document_id"),
             "chunk_id": chunk.get("chunk_id"),
+            "rerank_score": chunk.get("rerank_score"),
+            "rrf_score": chunk.get("rrf_score"),
             "vector_similarity": chunk.get("vector_similarity"),
             "term_similarity": chunk.get("term_similarity"),
+            "retrieval_ranks": chunk.get("retrieval_ranks") or {},
+            "retrieval_scores": chunk.get("retrieval_scores") or {},
+            "rrf_contributions": chunk.get("rrf_contributions") or {},
             "positions": chunk.get("positions") or [],
             "kb_id": chunk.get("kb_id"),
             "image_id": chunk.get("image_id"),

@@ -16,6 +16,7 @@ DEFAULT_EMBEDDING_DEVICE = "cpu"
 DEFAULT_EMBEDDING_BATCH_SIZE = 32
 EMBEDDING_DIMENSION = 512
 EMBEDDING_VECTOR_FIELD = f"q_{EMBEDDING_DIMENSION}_vec"
+RERANKER_MODEL = "qwen3.7-text-rerank"
 
 
 def _positive_int_environment(name: str, default: int) -> int:
@@ -94,39 +95,85 @@ def get_chat_completion_block(session_id, question, references):
     except Exception as e:
         return f"Error: {str(e)}"
 
+def _rerank_result_field(result, name):
+    if isinstance(result, dict):
+        return result.get(name)
+    return getattr(result, name, None)
+
+
 def rerank_similarity(query, texts):
-    api_key = os.getenv("DASHSCOPE_API_KEY")
+    """Rerank candidates with DashScope and preserve their input order."""
+    if not isinstance(query, str):
+        raise TypeError("query must be a string")
+    if isinstance(texts, str):
+        raise TypeError("texts must be an iterable of strings, not a string")
     texts = list(texts)
+    if not all(isinstance(text, str) for text in texts):
+        raise TypeError("texts must contain only strings")
+    if not texts:
+        return np.array([], dtype=float), None
 
-    # === 重排前：输入顺序（按 sres.ids 排序） ===
-    print(f"\n[rerank_similarity] query={query[:60]!r} n_texts={len(texts)}")
-    print(f"[rerank_similarity] 重排前（输入顺序）:")
-    for i, t in enumerate(texts):
-        print(f"  texts[{i}]: {t[:60]!r}")
+    api_key = os.getenv("DASHSCOPE_API_KEY")
+    if not api_key:
+        raise RuntimeError("DASHSCOPE_API_KEY is required for reranking")
 
-    # 直接调 DashScope rerank,用 result.index 回填到原序数组
-    resp = dashscope.TextReRank.call(
-        model="qwen3-rerank",
-        top_n=len(texts),
-        query=query,
-        documents=texts,
-        api_key=api_key,
-    )
+    native_base_url = os.getenv("DASHSCOPE_NATIVE_BASE_URL")
+    if native_base_url:
+        dashscope.base_http_api_url = native_base_url.rstrip("/")
 
-    scores = np.zeros(len(texts), dtype=float)
-    for r in resp.output.results:
-        scores[r.index] = r.relevance_score
+    try:
+        response = dashscope.TextReRank.call(
+            model=RERANKER_MODEL,
+            top_n=len(texts),
+            query=query,
+            documents=texts,
+            api_key=api_key,
+        )
+    except Exception as error:
+        raise RuntimeError(
+            f"DashScope {RERANKER_MODEL} request failed: {error}"
+        ) from error
 
-    # === 重排后：按 rerank 分数降序的新排名 ===
-    print(f"[rerank_similarity] 重排后（按 rerank 分数降序）:")
-    for rank, r in enumerate(resp.output.results):
-        snippet = texts[r.index][:60]
-        print(f"  rank {rank}: orig_idx={r.index}  score={r.relevance_score:.4f}  text={snippet!r}")
-    print(f"[rerank_similarity] 对齐后 scores（与 texts 同序）={np.round(scores, 4).tolist()}\n")
+    status_code = getattr(response, "status_code", None)
+    if status_code is not None and int(status_code) >= 400:
+        code = getattr(response, "code", "unknown")
+        message = getattr(response, "message", "unknown error")
+        raise RuntimeError(
+            f"DashScope {RERANKER_MODEL} returned {status_code}: "
+            f"{code}: {message}"
+        )
 
+    output = getattr(response, "output", None)
+    results = _rerank_result_field(output, "results")
+    if results is None:
+        raise RuntimeError(
+            f"DashScope {RERANKER_MODEL} response has no rerank results"
+        )
+
+    scores = np.full(len(texts), np.nan, dtype=float)
+    for result in results:
+        index = _rerank_result_field(result, "index")
+        relevance_score = _rerank_result_field(result, "relevance_score")
+        if not isinstance(index, (int, np.integer)) or not 0 <= index < len(texts):
+            raise RuntimeError(
+                f"DashScope {RERANKER_MODEL} returned an invalid result index"
+            )
+        if not np.isnan(scores[index]):
+            raise RuntimeError(
+                f"DashScope {RERANKER_MODEL} returned a duplicate result index"
+            )
+        try:
+            scores[index] = float(relevance_score)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(
+                f"DashScope {RERANKER_MODEL} returned an invalid relevance score"
+            ) from error
+
+    if not np.isfinite(scores).all():
+        raise RuntimeError(
+            f"DashScope {RERANKER_MODEL} did not score every candidate"
+        )
     return scores, None
-
-
 
 
 def generate_embedding(

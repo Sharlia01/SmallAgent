@@ -164,11 +164,8 @@ def evidence_chunk_match_score(
         _chunk_content(chunk),
     )
 
-def table_row_chunk_match_score(
-    evidence: dict[str, Any],
-    chunk: dict[str, Any],
-) -> float:
-    """Match a required row inside an HTML table from the same document."""
+def table_row_chunk_match_score(evidence, chunk):
+    # 1. 文档必须一致
     evidence_document = normalize_document_name(
         evidence.get("document_name")
     )
@@ -176,57 +173,100 @@ def table_row_chunk_match_score(
         _chunk_document_name(chunk)
     )
 
-    if (
-        not evidence_document
-        or evidence_document != chunk_document
-    ):
+    if not evidence_document or evidence_document != chunk_document:
         return 0.0
 
     expected_cells = [
         normalize_table_cell(cell)
         for cell in evidence.get("row_cells") or []
     ]
-    if not expected_cells:
-        return 0.0
+    expected_text = evidence.get("text")
+    best_score = 0.0
+    content = _chunk_content(chunk)
+    tables = parse_html_tables(content)
 
-    expected_caption = normalize_table_cell(
-        evidence.get("caption")
-    )
+    # Some PDF tables are stored as flattened plain text instead of HTML.
+    # Without row tags, use normalized evidence coverage as a fallback while
+    # retaining the document identity check above.
+    if not tables:
+        if not expected_text:
+            return 0.0
+        return evidence_text_match_score(expected_text, content)
 
-    for table in parse_html_tables(_chunk_content(chunk)):
-        actual_caption = normalize_table_cell(
-            table.get("caption")
-        )
-
-        if (
-            expected_caption
-            and expected_caption not in actual_caption
-        ):
-            continue
-
+    # 2. 解析召回chunk里的HTML表格
+    for table in tables:
         for row in table.get("rows") or []:
+
+            # 兼容原来的row_cells精确匹配
             actual_cells = [
                 normalize_table_cell(cell)
                 for cell in row
             ]
 
-            # 完整行完全一致。
-            if actual_cells == expected_cells:
-                return 1.0
-
-            # 允许表格解析器在目标行前后产生额外单元格，
-            # 但目标单元格必须保持连续和顺序一致。
-            expected_length = len(expected_cells)
-            for start in range(
-                len(actual_cells) - expected_length + 1
-            ):
-                if (
-                    actual_cells[start:start + expected_length]
-                    == expected_cells
-                ):
+            if expected_cells:
+                if actual_cells == expected_cells:
                     return 1.0
 
-    return 0.0
+                expected_length = len(expected_cells)
+                for start in range(
+                    len(actual_cells) - expected_length + 1
+                ):
+                    if (
+                        actual_cells[start:start + expected_length]
+                        == expected_cells
+                    ):
+                        return 1.0
+
+            # 支持现有relevant_evidence.text
+            if expected_text:
+                actual_row_text = " ".join(row)
+                row_score = evidence_text_match_score(
+                    expected_text,
+                    actual_row_text,
+                )
+                best_score = max(best_score, row_score)
+
+    return best_score
+
+
+def figure_chunk_match_score(
+    evidence: dict[str, Any],
+    chunk: dict[str, Any],
+) -> float:
+    """Match a retrieved figure by its caption/locator in the same document."""
+    evidence_document = normalize_document_name(evidence.get("document_name"))
+    chunk_document = normalize_document_name(_chunk_document_name(chunk))
+    if not evidence_document or evidence_document != chunk_document:
+        return 0.0
+
+    # Figure gold text often describes a visual fact that OCR cannot recover.
+    # The locator identifies the figure that must be retrieved, so use it as
+    # the primary retrieval-relevance reference and retain text as a fallback
+    # for older datasets without a locator.
+    reference = evidence.get("locator") or evidence.get("text")
+    return evidence_text_match_score(reference, _chunk_content(chunk))
+
+
+def relevant_evidence_chunk_match_score(
+    evidence: dict[str, Any],
+    chunk: dict[str, Any],
+) -> float:
+    evidence_type = str(
+        evidence.get("evidence_type") or "text"
+    ).casefold()
+
+    if evidence_type == "table":
+        return table_row_chunk_match_score(evidence, chunk)
+
+    if evidence_type == "figure":
+        return figure_chunk_match_score(evidence, chunk)
+
+    if evidence_type == "text":
+        return evidence_chunk_match_score(evidence, chunk)
+
+    raise ValueError(
+        f"Unsupported evidence_type: {evidence_type}"
+    )
 
 def evaluate_evidence_requirement(
     requirement: dict[str, Any],
@@ -388,10 +428,25 @@ def serialize_retrieved_chunk(
         "document_name": normalize_document_name(_chunk_document_name(chunk)),
         "content_with_weight": str(_chunk_content(chunk) or ""),
         "similarity": _optional_float(chunk.get("similarity")),
+        "rerank_score": _optional_float(chunk.get("rerank_score")),
+        "rrf_score": _optional_float(chunk.get("rrf_score")),
         "vector_similarity": _optional_float(
             chunk.get("vector_similarity")
         ),
         "term_similarity": _optional_float(chunk.get("term_similarity")),
+        "retrieval_ranks": _json_safe(
+            chunk.get("retrieval_ranks") or {}
+        ),
+        "retrieval_scores": _json_safe(
+            chunk.get("retrieval_scores") or {}
+        ),
+        "rrf_contributions": _json_safe(
+            chunk.get("rrf_contributions") or {}
+        ),
+        "constraint_compatibility": _json_safe(
+            chunk.get("constraint_compatibility") or {}
+        ),
+        "final_ranking": _json_safe(chunk.get("final_ranking") or {}),
         "positions": _json_safe(chunk.get("positions") or []),
         "kb_id": str(chunk.get("kb_id", "")),
         "image_id": str(chunk.get("image_id", "")),
@@ -449,7 +504,7 @@ def evaluate_retrieval_case(
             scored_chunks = [
                 (
                     rank,
-                    evidence_chunk_match_score(evidence, chunk),
+                    relevant_evidence_chunk_match_score(evidence, chunk),
                     str(chunk.get("chunk_id", "")),
                 )
                 for rank, chunk in enumerate(raw_chunks, start=1)
@@ -546,6 +601,24 @@ def evaluate_retrieval_case(
             "total_candidates": int(raw_result.get("total") or 0),
             "retrieved_count": len(serialized_chunks),
             "empty": not serialized_chunks,
+            "query_rewrite": _json_safe(
+                raw_result.get("query_rewrite") or {}
+            ),
+            "query_intent": _json_safe(
+                raw_result.get("query_intent") or {}
+            ),
+            "query_transform": _json_safe(
+                raw_result.get("query_transform") or {}
+            ),
+            "retrieval_fusion": _json_safe(
+                raw_result.get("retrieval_fusion") or {}
+            ),
+            "evidence_sufficiency": _json_safe(
+                raw_result.get("evidence_sufficiency") or {}
+            ),
+            "total_before_evidence_sufficiency": int(
+                raw_result.get("total_before_evidence_sufficiency") or 0
+            ),
             "chunks": serialized_chunks,
         },
         "gold_evidence_count": gold_evidence_count,
@@ -609,6 +682,11 @@ def aggregate_results(
     unanswerable = [
         result for result in successful if not result.get("answerable")
     ]
+    sufficiency_checked = [
+        result
+        for result in successful
+        if result["retrieval"].get("evidence_sufficiency")
+    ]
     hit_key = f"hit_at_{top_k}"
     recall_key = f"recall_at_{top_k}"
     mrr_key = f"mrr_at_{top_k}"
@@ -622,9 +700,24 @@ def aggregate_results(
         "empty_rate": _mean(
             float(result["retrieval"]["empty"]) for result in successful
         ),
+        "answerable_empty_rate": _mean(
+            float(result["retrieval"]["empty"])
+            for result in answerable
+        ),
         "unanswerable_empty_rate": _mean(
             float(result["retrieval"]["empty"])
             for result in unanswerable
+        ),
+        "unanswerable_rejection_rate": _mean(
+            float(result["retrieval"]["empty"])
+            for result in unanswerable
+        ),
+        "evidence_sufficiency_fallback_rate": _mean(
+            float(
+                result["retrieval"]["evidence_sufficiency"].get("source")
+                == "fallback"
+            )
+            for result in sufficiency_checked
         ),
         "average_latency_ms": _mean(
             float(result["latency_ms"]) for result in successful
