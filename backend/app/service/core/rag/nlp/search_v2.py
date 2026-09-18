@@ -17,6 +17,7 @@ import logging
 from collections import defaultdict
 #数据类，类似于其他语言中的结构体
 from dataclasses import dataclass, field as dataclass_field
+from service.core.evidence_metadata import EVIDENCE_FIELDS, evidence_metadata
 
 from service.core.rag.settings import TAG_FLD, PAGERANK_FLD
 from service.core.rag.utils import rmSpace
@@ -253,6 +254,7 @@ class Dealer:
             "top_int", "create_timestamp_flt", "knowledge_graph_kwd",
             "question_kwd", "question_tks", "available_int",
             "content_with_weight", PAGERANK_FLD, TAG_FLD,
+            *EVIDENCE_FIELDS,
         ]))
         return self.SearchContext(
             filters=self.get_filters(req),
@@ -912,6 +914,7 @@ class Dealer:
         ]
         return {
             "chunk_id": chunk_id,
+            **evidence_metadata(source),
             "content_ltks": source["content_ltks"],
             "content_with_weight": source["content_with_weight"],
             "doc_id": source.get("doc_id", ""),

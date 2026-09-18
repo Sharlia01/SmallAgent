@@ -792,15 +792,12 @@ class RAGFlowPdfParser:
         # crop figure out and add caption
         for k, bxs in figures.items():
             txt = "\n".join([b["text"] for b in bxs])
-            if not txt:
-                continue
-
             poss = []
             res.append(
                 (cropout(
                     bxs,
                     "figure", poss),
-                 [txt]))
+                 {"kind": "figure", "text": txt}))
             positions.append(poss)
 
         for k, bxs in tables.items():

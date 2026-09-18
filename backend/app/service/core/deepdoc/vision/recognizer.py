@@ -195,40 +195,42 @@ class Recognizer(object):
                         a["bottom"] < b["top"],
                         a["top"] > b["bottom"]])
 
-        i = 0
-        while i + 1 < len(layouts):
-            j = i + 1
-            while j < min(i + far, len(layouts)) \
-                    and (layouts[i].get("type", "") != layouts[j].get("type", "")
-                         or notOverlapped(layouts[i], layouts[j])):
-                j += 1
-            if j >= min(i + far, len(layouts)):
-                i += 1
+        def ocr_covered_area(layout):
+            return sum(
+                Recognizer.overlapped_area(box, layout, False)
+                for box in boxes
+                if not notOverlapped(box, layout)
+            )
+
+        def rank(item):
+            index, layout = item
+            score = layout.get("score")
+            if score is not None:
+                # Detector confidence is the primary signal.  The original
+                # index makes ties deterministic without changing page order.
+                return 1, float(score), -index
+            return 0, ocr_covered_area(layout), -index
+
+        def duplicates(a, b):
+            if a.get("type", "") != b.get("type", "") or notOverlapped(a, b):
+                return False
+            return Recognizer.overlapped_area(a, b) >= thr \
+                or Recognizer.overlapped_area(b, a) >= thr
+
+        # Suppress duplicate layouts globally in descending confidence order.
+        # Page-order greedy cleanup is not transitive: an oversized parent can
+        # remove one real child and then be removed by a higher-scoring sibling.
+        kept = []
+        for index, layout in sorted(enumerate(layouts), key=rank, reverse=True):
+            if any(duplicates(layout, kept_layout) for _, kept_layout in kept):
                 continue
-            if Recognizer.overlapped_area(layouts[i], layouts[j]) < thr \
-                    and Recognizer.overlapped_area(layouts[j], layouts[i]) < thr:
-                i += 1
-                continue
+            kept.append((index, layout))
 
-            if layouts[i].get("score") and layouts[j].get("score"):
-                if layouts[i]["score"] > layouts[j]["score"]:
-                    layouts.pop(j)
-                else:
-                    layouts.pop(i)
-                continue
-
-            area_i, area_i_1 = 0, 0
-            for b in boxes:
-                if not notOverlapped(b, layouts[i]):
-                    area_i += Recognizer.overlapped_area(b, layouts[i], False)
-                if not notOverlapped(b, layouts[j]):
-                    area_i_1 += Recognizer.overlapped_area(b, layouts[j], False)
-
-            if area_i > area_i_1:
-                layouts.pop(j)
-            else:
-                layouts.pop(i)
-
+        kept_indices = {index for index, _ in kept}
+        layouts[:] = [
+            layout for index, layout in enumerate(layouts)
+            if index in kept_indices
+        ]
         return layouts
 
     def create_inputs(self, imgs, im_info):
@@ -486,6 +488,5 @@ class Recognizer(object):
         #seeit.save_results(image_list, res, self.label_list, threshold=thr)
 
         return res
-
 
 

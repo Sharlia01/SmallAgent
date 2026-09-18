@@ -82,12 +82,69 @@ def test_unmatched_query_uses_model_structured_decision(monkeypatch):
     assert decision.intent == "complex_lookup"
     assert decision.need_rewrite is False
     assert decision.need_decompose is True
+    assert decision.retrieval_mode == "parallel"
+    assert decision.subqueries == []
     assert decision.reason == "包含两个独立检索目标"
     assert decision.source == "model"
     call = completions.calls[0]
     assert call["temperature"] == 0
     assert call["response_format"] == {"type": "json_object"}
     assert call["extra_body"] == {"enable_thinking": False}
+
+
+@pytest.mark.unit
+def test_rating_meaning_query_builds_sequential_plan_without_model(
+    monkeypatch,
+):
+    monkeypatch.setenv("RAG_QUERY_INTENT_ENABLED", "true")
+    completions = FakeCompletions(error=AssertionError("must not be called"))
+    question = "这份研报对国电电力到底是看多还是看空？给了什么评级？"
+
+    decision = query_intent.analyze_query_intent(
+        question,
+        client=fake_client(completions),
+    )
+
+    assert decision.intent == "complex_lookup"
+    assert decision.retrieval_mode == "sequential"
+    assert decision.need_decompose is True
+    assert len(decision.subqueries) == 2
+    first, second = decision.subqueries
+    assert first.query == question
+    assert first.output_slot == "rating"
+    assert second.depends_on == [first.id]
+    assert second.required_slots == ["rating"]
+    assert "{rating}" in second.query_template
+    assert second.inherit_document_scope is True
+    assert completions.calls == []
+
+
+@pytest.mark.unit
+def test_model_sequential_plan_is_parsed_and_validated(monkeypatch):
+    monkeypatch.setenv("RAG_QUERY_INTENT_ENABLED", "true")
+    completions = FakeCompletions(
+        '{"intent":"complex_lookup","need_rewrite":false,'
+        '"need_decompose":true,"retrieval_mode":"sequential",'
+        '"reason":"第二步依赖第一步实体",'
+        '"subqueries":['
+        '{"id":"policy_lookup","query":"公司采用了什么分红政策？",'
+        '"query_template":"","depends_on":[],"output_slot":"policy",'
+        '"required_slots":[],"inherit_document_scope":false},'
+        '{"id":"policy_effect","query":"",'
+        '"query_template":"{policy}对股息率有什么影响？",'
+        '"depends_on":["policy_lookup"],"output_slot":null,'
+        '"required_slots":["policy"],"inherit_document_scope":true}'
+        ']}'
+    )
+
+    decision = query_intent.analyze_query_intent(
+        "公司采用了什么分红政策，这项政策对股息率有什么影响？",
+        client=fake_client(completions),
+    )
+
+    assert decision.retrieval_mode == "sequential"
+    assert decision.subqueries[0].output_slot == "policy"
+    assert decision.subqueries[1].required_slots == ["policy"]
 
 
 @pytest.mark.unit

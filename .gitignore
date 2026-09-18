@@ -26,6 +26,7 @@ frontend/dist/
 *.log
 backend/storage/
 backend/app/storage/
+backend/app/service/core/storage/
 backend/evals/results/
 
 # Locally uploaded or test documents

@@ -6,6 +6,7 @@ services:
       dockerfile: Dockerfile
     hostname: LS_api
     container_name: LS_api
+    working_dir: /app/app
     environment:
       - HF_ENDPOINT=https://hf-mirror.com
       - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@LS_pg:5432/${POSTGRES_DB:-gsk}

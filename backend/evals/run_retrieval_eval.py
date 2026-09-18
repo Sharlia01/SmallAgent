@@ -25,6 +25,7 @@ if str(APP_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(APP_DIRECTORY))
 
 from service.core.retrieval_evaluation import (  # noqa: E402
+    RESULT_SCHEMA_VERSION,
     build_error_case,
     build_summary,
     evaluate_retrieval_case,
@@ -33,6 +34,9 @@ from service.core.evidence_sufficiency import (  # noqa: E402
     DEFAULT_EVIDENCE_SUFFICIENCY_MODEL,
 )
 from service.core.rag.nlp.model import RERANKER_MODEL  # noqa: E402
+from service.core.sequential_retrieval import (  # noqa: E402
+    DEFAULT_BRIDGE_EXTRACTION_MODEL,
+)
 
 
 REQUIRED_SAMPLE_FIELDS = {
@@ -408,12 +412,19 @@ def main() -> int:
                 top_k=args.top_k,
                 match_threshold=args.match_threshold,
             )
-            hit_value = result["metrics"][f"hit_at_{args.top_k}"]
-            hit_label = "N/A" if hit_value is None else str(hit_value)
+            hit_key = f"hit_at_{args.top_k}"
+            retrieval_hit = result["retrieval_metrics"][hit_key]
+            post_gate_hit = result["post_gate_metrics"][hit_key]
+            rejected = result["gate_metrics"]["rejected"]
             print(
                 f"[{position}/{len(samples)}] {sample['id']} "
-                f"retrieved={result['retrieval']['retrieved_count']} "
-                f"hit={hit_label} latency_ms={result['latency_ms']:.3f}",
+                f"retrieved_before_gate="
+                f"{result['retrieval']['retrieved_count_before_sufficiency']} "
+                f"returned={result['retrieval']['retrieved_count']} "
+                f"retrieval_hit={retrieval_hit if retrieval_hit is not None else 'N/A'} "
+                f"post_gate_hit={post_gate_hit if post_gate_hit is not None else 'N/A'} "
+                f"rejected={rejected if rejected is not None else 'N/A'} "
+                f"latency_ms={result['latency_ms']:.3f}",
                 flush=True,
             )
         except Exception as error:
@@ -437,6 +448,7 @@ def main() -> int:
     completed_at = datetime.now(timezone.utc)
     metric_summary = build_summary(results, top_k=args.top_k)
     summary = {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
         "run_name": args.run_name,
         "started_at": started_at.isoformat(),
         "completed_at": completed_at.isoformat(),
@@ -466,6 +478,14 @@ def main() -> int:
                 1.0 - args.final_reranker_weight
             ),
             "final_rrf_k": args.final_rrf_k,
+            "bridge_extraction_model": os.getenv(
+                "RAG_BRIDGE_EXTRACTION_MODEL",
+                DEFAULT_BRIDGE_EXTRACTION_MODEL,
+            ),
+            "sequential_retrieval_enabled": environment_flag(
+                "RAG_SEQUENTIAL_RETRIEVAL_ENABLED",
+                True,
+            ),
             "evidence_match_threshold": args.match_threshold,
             "evidence_sufficiency_enabled": environment_flag(
                 "RAG_EVIDENCE_SUFFICIENCY_ENABLED",

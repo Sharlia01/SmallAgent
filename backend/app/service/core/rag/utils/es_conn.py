@@ -22,6 +22,7 @@ import json
 
 import copy
 from elasticsearch import BadRequestError, Elasticsearch
+from elasticsearch.helpers import scan
 from elasticsearch_dsl import UpdateByQuery, Q, Search, Index
 from service.core.rag.utils import singleton
 from service.core.api.utils.file_utils import get_project_base_directory
@@ -183,12 +184,40 @@ class ESConnection:
             except Exception as e:
                 res.append(str(e))
                 logger.warning("ESConnection.insert got exception: " + str(e))
-                res = []
                 if re.search(r"(Timeout|time out)", str(e), re.IGNORECASE):
-                    res.append(str(e))
                     time.sleep(3)
                     continue
+                return res
         return res
+
+    def replace_document(self, documents: list[dict], index_name: str, doc_id: str) -> dict:
+        """Write new chunks first, then delete only the superseded snapshot IDs.
+
+        A failed write leaves old chunks intact. This is not an atomic ES swap;
+        readers can briefly see both versions, and a retry reconciles partial writes.
+        """
+        if not documents or any(d.get("doc_id") != doc_id or d.get("kb_id") != index_name for d in documents):
+            raise ValueError("Replacement requires nonempty chunks from one document and index")
+        self._ensure_index(index_name)
+        self.es.indices.refresh(index=index_name)
+        previous_ids = {hit["_id"] for hit in scan(
+            self.es, index=index_name,
+            query={"query": {"term": {"doc_id": doc_id}}, "_source": False},
+        )}
+        for offset in range(0, len(documents), 100):
+            errors = self.insert(documents[offset:offset + 100], index_name)
+            if errors:
+                raise RuntimeError(f"ES replacement failed; old chunks retained: {errors}")
+        self.es.indices.refresh(index=index_name)
+        stale_ids = sorted(previous_ids - {d["id"] for d in documents})
+        for offset in range(0, len(stale_ids), 100):
+            response = self.es.bulk(operations=[
+                {"delete": {"_index": index_name, "_id": identifier}}
+                for identifier in stale_ids[offset:offset + 100]
+            ], refresh=True)
+            if response.get("errors"):
+                raise RuntimeError("New chunks saved but stale chunk cleanup failed; retry reindex")
+        return {"indexed": len(documents), "removed": len(stale_ids)}
     
 
     @staticmethod

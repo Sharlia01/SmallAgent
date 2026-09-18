@@ -10,6 +10,9 @@ from collections import Counter, defaultdict
 from typing import Any, Iterable
 
 
+RESULT_SCHEMA_VERSION = "2.0"
+
+
 def normalize_text(text: Any) -> str:
     """Normalize OCR and layout differences before comparing evidence text."""
     normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
@@ -447,6 +450,9 @@ def serialize_retrieved_chunk(
             chunk.get("constraint_compatibility") or {}
         ),
         "final_ranking": _json_safe(chunk.get("final_ranking") or {}),
+        "sequential_subqueries": _json_safe(
+            chunk.get("sequential_subqueries") or []
+        ),
         "positions": _json_safe(chunk.get("positions") or []),
         "kb_id": str(chunk.get("kb_id", "")),
         "image_id": str(chunk.get("image_id", "")),
@@ -467,21 +473,14 @@ def get_source_modality(sample: dict[str, Any]) -> str:
     return "text" if sample.get("answerable") else "none"
 
 
-def evaluate_retrieval_case(
+def _evaluate_chunks(
     sample: dict[str, Any],
-    raw_result: dict[str, Any],
+    raw_chunks: list[dict[str, Any]],
     *,
-    latency_ms: float,
     top_k: int,
     match_threshold: float,
 ) -> dict[str, Any]:
-    """Evaluate one ranked retrieval result against all gold evidence."""
-    raw_chunks = list(raw_result.get("chunks") or [])[:top_k]
-    serialized_chunks = [
-        serialize_retrieved_chunk(chunk, rank)
-        for rank, chunk in enumerate(raw_chunks, start=1)
-    ]
-
+    """Score either retrieval stage using exactly the same evidence rules."""
     evidence_requirements = sample.get("evidence_requirements") or []
 
     if evidence_requirements:
@@ -495,8 +494,6 @@ def evaluate_retrieval_case(
         ]
     else:
         evidence_matches = []
-        relevant_ranks = set()
-
         for evidence_index, evidence in enumerate(
             sample.get("relevant_evidence") or [],
             start=1,
@@ -589,18 +586,92 @@ def evaluate_retrieval_case(
     }
 
     return {
+        "gold_evidence_count": gold_evidence_count,
+        "matched_evidence_count": matched_evidence_count,
+        "first_relevant_rank": first_relevant_rank,
+        "evidence_matches": evidence_matches,
+        "metrics": metrics,
+    }
+
+
+def _unavailable_metrics(top_k: int) -> dict[str, None]:
+    return {
+        f"hit_at_{top_k}": None,
+        f"recall_at_{top_k}": None,
+        f"mrr_at_{top_k}": None,
+    }
+
+
+def _gate_metrics(decision: dict[str, Any]) -> dict[str, Any]:
+    """Use the recorded decision, never empty chunks, to identify rejection."""
+    source = decision.get("source")
+    sufficient = decision.get("sufficient")
+    disabled = decision.get("enabled") is False or source == "disabled"
+    available = (
+        not disabled
+        and source in {"model", "rule", "fallback"}
+        and isinstance(sufficient, bool)
+    )
+    return {
+        "rejected": not sufficient if available else None,
+        "source": source,
+        "fallback": source == "fallback" if available else None,
+        "enabled": False if disabled else (True if available else None),
+    }
+
+
+def evaluate_retrieval_case(
+    sample: dict[str, Any],
+    raw_result: dict[str, Any],
+    *,
+    latency_ms: float,
+    top_k: int,
+    match_threshold: float,
+) -> dict[str, Any]:
+    """Evaluate retrieval, gate decisions and delivered evidence separately."""
+    raw_chunks = list(raw_result.get("chunks") or [])[:top_k]
+    serialized_chunks = [
+        serialize_retrieved_chunk(chunk, rank)
+        for rank, chunk in enumerate(raw_chunks, start=1)
+    ]
+    post_gate = _evaluate_chunks(
+        sample, raw_chunks, top_k=top_k, match_threshold=match_threshold,
+    )
+    # Missing historical snapshots are unknown, not an empty retrieval.
+    before_chunks = raw_result.get("chunks_before_sufficiency")
+    before = None
+    serialized_before = None
+    if before_chunks is not None:
+        before_chunks = list(before_chunks)[:top_k]
+        before = _evaluate_chunks(
+            sample, before_chunks, top_k=top_k, match_threshold=match_threshold,
+        )
+        serialized_before = [
+            serialize_retrieved_chunk(chunk, rank)
+            for rank, chunk in enumerate(before_chunks, start=1)
+        ]
+
+    return {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
         "id": sample.get("id"),
         "question": sample.get("question"),
         "reference_answer": sample.get("reference_answer"),
         "question_type": sample.get("question_type"),
         "source_modality": get_source_modality(sample),
-        "answerable": answerable,
+        "answerable": bool(sample.get("answerable")),
         "error": None,
         "latency_ms": round(float(latency_ms), 3),
         "retrieval": {
             "total_candidates": int(raw_result.get("total") or 0),
             "retrieved_count": len(serialized_chunks),
             "empty": not serialized_chunks,
+            "chunks_before_sufficiency": serialized_before,
+            "retrieved_count_before_sufficiency": (
+                len(serialized_before) if serialized_before is not None else None
+            ),
+            "empty_before_sufficiency": (
+                not serialized_before if serialized_before is not None else None
+            ),
             "query_rewrite": _json_safe(
                 raw_result.get("query_rewrite") or {}
             ),
@@ -613,6 +684,9 @@ def evaluate_retrieval_case(
             "retrieval_fusion": _json_safe(
                 raw_result.get("retrieval_fusion") or {}
             ),
+            "sequential_retrieval": _json_safe(
+                raw_result.get("sequential_retrieval") or {}
+            ),
             "evidence_sufficiency": _json_safe(
                 raw_result.get("evidence_sufficiency") or {}
             ),
@@ -621,11 +695,16 @@ def evaluate_retrieval_case(
             ),
             "chunks": serialized_chunks,
         },
-        "gold_evidence_count": gold_evidence_count,
-        "matched_evidence_count": matched_evidence_count,
-        "first_relevant_rank": first_relevant_rank,
-        "evidence_matches": evidence_matches,
-        "metrics": metrics,
+        # Existing fields retain their post-gate meaning for old consumers.
+        **post_gate,
+        "retrieval_metrics": (
+            before["metrics"] if before is not None else _unavailable_metrics(top_k)
+        ),
+        "evidence_matches_before_sufficiency": (
+            before["evidence_matches"] if before is not None else None
+        ),
+        "post_gate_metrics": dict(post_gate["metrics"]),
+        "gate_metrics": _gate_metrics(raw_result.get("evidence_sufficiency") or {}),
     }
 
 
@@ -638,6 +717,7 @@ def build_error_case(
 ) -> dict[str, Any]:
     """Record one failed query without losing the rest of the evaluation run."""
     return {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
         "id": sample.get("id"),
         "question": sample.get("question"),
         "reference_answer": sample.get("reference_answer"),
@@ -651,16 +731,19 @@ def build_error_case(
             "retrieved_count": 0,
             "empty": True,
             "chunks": [],
+            "chunks_before_sufficiency": None,
+            "retrieved_count_before_sufficiency": None,
+            "empty_before_sufficiency": None,
         },
         "gold_evidence_count": len(sample.get("relevant_evidence") or []),
         "matched_evidence_count": 0,
         "first_relevant_rank": None,
         "evidence_matches": [],
-        "metrics": {
-            f"hit_at_{top_k}": None,
-            f"recall_at_{top_k}": None,
-            f"mrr_at_{top_k}": None,
-        },
+        "metrics": _unavailable_metrics(top_k),
+        "retrieval_metrics": _unavailable_metrics(top_k),
+        "post_gate_metrics": _unavailable_metrics(top_k),
+        "gate_metrics": _gate_metrics({}),
+        "evidence_matches_before_sufficiency": None,
     }
 
 
@@ -671,12 +754,88 @@ def _mean(values: Iterable[float]) -> float | None:
     return round(sum(values) / len(values), 6)
 
 
+def _aggregate_stage_metrics(
+    results: list[dict[str, Any]],
+    *,
+    top_k: int,
+    before_sufficiency: bool,
+) -> dict[str, Any]:
+    successful = [result for result in results if not result.get("error")]
+    empty_key = "empty_before_sufficiency" if before_sufficiency else "empty"
+    metrics_key = "retrieval_metrics" if before_sufficiency else "metrics"
+    available = [
+        result for result in successful
+        if isinstance(result["retrieval"].get(empty_key), bool)
+        and isinstance(result.get(metrics_key), dict)
+    ]
+    answerable = [result for result in available if result.get("answerable")]
+    unanswerable = [result for result in available if not result.get("answerable")]
+    return {
+        "query_count": len(results),
+        "evaluated_query_count": len(available),
+        "unavailable_query_count": len(successful) - len(available),
+        "error_count": len(results) - len(successful),
+        "answerable_query_count": len(answerable),
+        "unanswerable_query_count": len(unanswerable),
+        "empty_rate": _mean(float(r["retrieval"][empty_key]) for r in available),
+        "answerable_empty_rate": _mean(
+            float(r["retrieval"][empty_key]) for r in answerable
+        ),
+        "unanswerable_empty_rate": _mean(
+            float(r["retrieval"][empty_key]) for r in unanswerable
+        ),
+        **{
+            key: _mean(
+                float(result[metrics_key][key]) for result in answerable
+                if result[metrics_key].get(key) is not None
+            )
+            for key in (f"hit_at_{top_k}", f"recall_at_{top_k}", f"mrr_at_{top_k}")
+        },
+    }
+
+
+def _aggregate_gate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
+    successful = [result for result in results if not result.get("error")]
+    decisions = [
+        (
+            result,
+            _gate_metrics(result["retrieval"].get("evidence_sufficiency") or {}),
+        )
+        for result in successful
+    ]
+    available = [(r, gate) for r, gate in decisions if gate["rejected"] is not None]
+    disabled_count = sum(gate["enabled"] is False for _, gate in decisions)
+    answerable = [gate for r, gate in available if r.get("answerable")]
+    unanswerable = [gate for r, gate in available if not r.get("answerable")]
+    return {
+        "query_count": len(results),
+        "decision_query_count": len(available),
+        "disabled_query_count": disabled_count,
+        "unavailable_query_count": len(successful) - len(available) - disabled_count,
+        "error_count": len(results) - len(successful),
+        "answerable_decision_count": len(answerable),
+        "unanswerable_decision_count": len(unanswerable),
+        "rejected_query_count": sum(gate["rejected"] for _, gate in available),
+        "answerable_rejected_count": sum(gate["rejected"] for gate in answerable),
+        "unanswerable_rejected_count": sum(gate["rejected"] for gate in unanswerable),
+        "rejection_rate": _mean(float(gate["rejected"]) for _, gate in available),
+        "answerable_rejection_rate": _mean(
+            float(gate["rejected"]) for gate in answerable
+        ),
+        "unanswerable_rejection_rate": _mean(
+            float(gate["rejected"]) for gate in unanswerable
+        ),
+        "fallback_count": sum(gate["fallback"] for _, gate in available),
+        "fallback_rate": _mean(float(gate["fallback"]) for _, gate in available),
+    }
+
+
 def aggregate_results(
     results: list[dict[str, Any]],
     *,
     top_k: int,
 ) -> dict[str, Any]:
-    """Compute macro retrieval metrics for one result slice."""
+    """Keep legacy metrics and add separate stage metrics for one slice."""
     successful = [result for result in results if not result.get("error")]
     answerable = [result for result in successful if result.get("answerable")]
     unanswerable = [
@@ -731,6 +890,13 @@ def aggregate_results(
         mrr_key: _mean(
             float(result["metrics"][mrr_key]) for result in answerable
         ),
+        "retrieval_metrics": _aggregate_stage_metrics(
+            results, top_k=top_k, before_sufficiency=True,
+        ),
+        "gate_metrics": _aggregate_gate_metrics(results),
+        "post_gate_metrics": _aggregate_stage_metrics(
+            results, top_k=top_k, before_sufficiency=False,
+        ),
     }
 
 
@@ -751,6 +917,7 @@ def build_summary(
         )
 
     return {
+        "result_schema_version": RESULT_SCHEMA_VERSION,
         "question_type_counts": dict(
             sorted(Counter(result["question_type"] for result in results).items())
         ),

@@ -7,8 +7,8 @@ services:
       context: .
       dockerfile: Dockerfile
       target: development
-    container_name: swxy_frontend_dev
-    hostname: swxy_frontend_dev
+    container_name: LS_frontend_dev
+    hostname: LS_frontend_dev
     ports:
       - "5181:5181"
     volumes:
@@ -19,7 +19,7 @@ services:
       - CHOKIDAR_USEPOLLING=true  # 支持热重载
     restart: unless-stopped
     networks:
-      - swxy_network
+      - LS_network
     profiles:
       - dev  # 使用 profile 来控制启动哪个服务
 
@@ -29,18 +29,18 @@ services:
       context: .
       dockerfile: Dockerfile
       target: production
-    container_name: swxy_frontend_prod
-    hostname: swxy_frontend_prod
+    container_name: LS_frontend_prod
+    hostname: LS_frontend_prod
     ports:
       - "80:80"
     environment:
       - NODE_ENV=production
     restart: unless-stopped
     networks:
-      - swxy_network
+      - LS_network
     profiles:
       - prod
 
 networks:
-  swxy_network:
+  LS_network:
     driver: bridge

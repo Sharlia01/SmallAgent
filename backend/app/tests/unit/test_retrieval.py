@@ -6,7 +6,7 @@ from service.core.query_expansion import (
     QueryExpansionResult,
     validate_query_preservation,
 )
-from service.core.query_intent import QueryIntentDecision
+from service.core.query_intent import QueryIntentDecision, QuerySubqueryPlan
 from service.core.rag.nlp import search_v2
 from service.core.rag.nlp.search_v2 import reciprocal_rank_fusion
 from service.core.retrieval_evaluation import (
@@ -126,6 +126,8 @@ def test_retrieve_raw_results_reuses_production_options(monkeypatch):
         "need_decompose": False,
         "reason": "测试口语查询",
         "source": "rule",
+        "retrieval_mode": "single",
+        "subqueries": [],
     }
     assert result["query_transform"]["expanded"] == "测试问题 规范化 扩展"
     assert result["query_transform"]["effective_query"] == (
@@ -231,6 +233,12 @@ def test_retrieve_raw_results_removes_insufficient_evidence(monkeypatch):
     assert result["doc_aggs"] == []
     assert result["total"] == 0
     assert result["total_before_evidence_sufficiency"] == 12
+    assert result["chunks_before_sufficiency"] == [
+        {
+            "chunk_id": "half-year",
+            "content_with_weight": "2025年上半年营业收入50亿元。",
+        }
+    ]
     assert result["evidence_sufficiency"]["sufficient"] is False
     assert result["evidence_sufficiency"]["evaluated_chunk_ids"] == [
         "half-year"
@@ -288,8 +296,157 @@ def test_retrieve_raw_results_keeps_sufficient_evidence(monkeypatch):
 
     assert result["chunks"] == original_chunks
     assert result["total"] == 1
-    assert "total_before_evidence_sufficiency" not in result
+    assert result["total_before_evidence_sufficiency"] == 1
+    assert result["chunks_before_sufficiency"] == original_chunks
+    assert result["chunks_before_sufficiency"] is not result["chunks"]
     assert result["evidence_sufficiency"]["sufficient"] is True
+
+
+@pytest.mark.unit
+def test_sequential_retrieval_extracts_bridge_and_preserves_each_hop(
+    monkeypatch,
+):
+    monkeypatch.setenv("RAG_SEQUENTIAL_RETRIEVAL_ENABLED", "true")
+    calls = []
+    original_question = (
+        "这份研报对国电电力到底是看多还是看空？给了什么评级？"
+    )
+
+    class FakeDealer:
+        @staticmethod
+        def retrieval(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return {
+                    "total": 10,
+                    "chunks": [
+                        {
+                            "chunk_id": "rating",
+                            "doc_id": "doc-1",
+                            "docnm_kwd": "国电电力.pdf",
+                            "content_with_weight": "维持“优于大市”评级。",
+                            "rerank_score": 0.95,
+                            "rrf_score": 0.03,
+                            "final_ranking": {"final_fusion_score": 0.09},
+                        }
+                    ],
+                    "doc_aggs": [],
+                    "retrieval_fusion": {"method": "weighted_rrf"},
+                }
+            return {
+                "total": 4,
+                "chunks": [
+                    {
+                        "chunk_id": "rating",
+                        "doc_id": "doc-1",
+                        "docnm_kwd": "国电电力.pdf",
+                        "content_with_weight": "维持“优于大市”评级。",
+                        "rerank_score": 0.93,
+                        "rrf_score": 0.025,
+                        "final_ranking": {"final_fusion_score": 0.085},
+                    },
+                    {
+                        "chunk_id": "definition",
+                        "doc_id": "doc-1",
+                        "docnm_kwd": "国电电力.pdf",
+                        "content_with_weight": (
+                            "优于大市：股价表现优于市场代表性指数10%以上。"
+                        ),
+                        "rerank_score": 0.91,
+                        "rrf_score": 0.02,
+                        "final_ranking": {"final_fusion_score": 0.08},
+                    }
+                ],
+                "doc_aggs": [],
+                "retrieval_fusion": {"method": "weighted_rrf"},
+            }
+
+    intent = QueryIntentDecision(
+        intent="complex_lookup",
+        need_rewrite=False,
+        need_decompose=True,
+        reason="评级解释依赖评级名称",
+        source="rule",
+        retrieval_mode="sequential",
+        subqueries=[
+            QuerySubqueryPlan(
+                id="rating_lookup",
+                query=original_question,
+                output_slot="rating",
+            ),
+            QuerySubqueryPlan(
+                id="rating_definition",
+                query_template="“{rating}”的评级定义和评级标准是什么？",
+                depends_on=["rating_lookup"],
+                required_slots=["rating"],
+                inherit_document_scope=True,
+            ),
+        ],
+    )
+    sufficiency_calls = []
+    final_rerank_calls = []
+
+    def rerank_merged(question, documents):
+        final_rerank_calls.append((question, documents))
+        return [0.98, 0.7], None
+
+    monkeypatch.setattr(retrieval, "rerank_similarity", rerank_merged)
+    monkeypatch.setattr(retrieval, "get_retrieval_dealer", FakeDealer)
+    monkeypatch.setattr(retrieval, "analyze_query_intent", lambda _q: intent)
+    monkeypatch.setattr(
+        retrieval,
+        "check_evidence_sufficiency",
+        lambda question, chunks: (
+            sufficiency_calls.append((question, chunks))
+            or EvidenceSufficiencyDecision(
+                sufficient=True,
+                reason="评级和定义均已覆盖",
+                missing_requirements=[],
+                supporting_chunk_indices=[1, 2],
+                source="model",
+                evaluated_chunk_count=2,
+                evaluated_chunk_ids=["rating", "definition"],
+            )
+        ),
+    )
+
+    result = retrieval.retrieve_raw_results("42", original_question)
+
+    assert len(calls) == 2
+    assert calls[0]["question"] == original_question
+    assert calls[1]["question"] == (
+        "“优于大市”的评级定义和评级标准是什么？"
+    )
+    assert calls[1]["options"].doc_ids == ["doc-1"]
+    assert [chunk["chunk_id"] for chunk in result["chunks"]] == [
+        "rating",
+        "definition",
+    ]
+    assert result["retrieval_fusion"]["method"] == (
+        "sequential_original_question_rerank"
+    )
+    assert final_rerank_calls == [(original_question, [
+        "维持“优于大市”评级。",
+        "优于大市：股价表现优于市场代表性指数10%以上。",
+    ])]
+    assert result["retrieval_fusion"]["final_rerank"]["source"] == "model"
+    assert result["chunks"][0]["rerank_score"] == 0.98
+    assert result["sequential_retrieval"]["bridge"]["value"] == (
+        "优于大市"
+    )
+    assert result["chunks"][0]["sequential_subqueries"][0][
+        "subquery_id"
+    ] == "rating_lookup"
+    assert [
+        item["subquery_id"]
+        for item in result["chunks"][0]["sequential_subqueries"]
+    ] == ["rating_lookup", "rating_definition"]
+    assert result["chunks"][1]["sequential_subqueries"][0][
+        "subquery_id"
+    ] == "rating_definition"
+    assert len(sufficiency_calls) == 1
+    assert len(sufficiency_calls[0][1]) == 2
+    assert result["chunks_before_sufficiency"] == sufficiency_calls[0][1]
 
 
 # 用例功能：验证 RRF 只使用各路排名，并让多路共同命中的 chunk 优先。
@@ -928,6 +1085,7 @@ def test_retrieve_content_preserves_ranking_metadata(monkeypatch):
                 "retrieval_rrf_rank": 2,
                 "final_fusion_score": 0.08,
             },
+            "sequential_subqueries": [],
             "positions": [[5, 10]],
             "kb_id": "42",
             "image_id": "image-1",

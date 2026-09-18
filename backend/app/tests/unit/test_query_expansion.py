@@ -229,3 +229,62 @@ def test_query_anchor_extraction_does_not_treat_large_value_as_year():
     )
 
     assert not any(anchor.startswith("2080") for anchor in anchors)
+
+
+@pytest.mark.unit
+def test_report_context_is_not_part_of_organization_anchor():
+    original = "这份研报对国电电力到底是看多还是看空？给了什么评级？"
+    rewritten = "国电电力 研报 投资评级 看多 看空"
+
+    anchors = query_expansion.extract_query_anchors(original)
+    validation = query_expansion.validate_query_preservation(
+        original,
+        rewritten,
+    )
+
+    assert "国电电力" in anchors
+    assert "这份研报对国电电力" not in anchors
+    assert validation.valid is True
+    assert validation.missing_anchors == []
+    assert validation.added_risky_terms == []
+
+
+@pytest.mark.unit
+def test_rating_expansion_adds_definition_terms_and_removes_target_price(
+    monkeypatch,
+):
+    monkeypatch.setenv("QUERY_EXPANSION_ENABLED", "true")
+    completions = FakeCompletions(
+        '{"expanded_query":"国电电力 研报 评级 看多 看空 投资建议 目标价",'
+        '"added_terms":["投资建议","目标价"]}'
+    )
+    original = "这份研报对国电电力到底是看多还是看空？给了什么评级？"
+    rewritten = "国电电力 研报 评级 看多 看空"
+
+    result = query_expansion.expand_query(
+        original,
+        rewritten,
+        client=fake_client(completions),
+    )
+
+    assert result.rewrite_validation.valid is True
+    assert result.expansion_validation.valid is True
+    assert result.expansion_applied is True
+    assert "目标价" not in result.effective_query
+    assert "投资评级" in result.effective_query
+    assert "评级定义" in result.effective_query
+    assert "评级标准" in result.effective_query
+    assert "目标价" not in result.added_terms
+
+
+@pytest.mark.unit
+def test_domain_policy_keeps_target_price_when_user_requests_it():
+    expanded, added_terms = query_expansion._apply_domain_expansion_policy(
+        "国电电力的目标价和投资评级是什么？",
+        "国电电力 目标价 投资评级",
+        "国电电力 目标价 投资评级",
+        [],
+    )
+
+    assert "目标价" in expanded
+    assert added_terms == []

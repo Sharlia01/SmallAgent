@@ -6,6 +6,8 @@ import logging
 import chardet
 from service.core.rag.utils import num_tokens_from_string
 from PIL import Image
+from service.core.table_evidence import bind_table_rows
+from service.core.figure_evidence import figure_evidence
 
 def is_english(texts):
     eng = 0
@@ -217,6 +219,24 @@ def tokenize_table(tbls, doc, eng, batch_size=10):
     """
     for (img, rows), poss in tbls:
         if not rows:
+            continue
+        if isinstance(rows, dict) and rows.get("kind") == "figure":
+            records = [figure_evidence(img, rows.get("text", ""))]
+        # 如果识别的表格是HTML字符串，则解析出表格的行和列
+        elif isinstance(rows, str) and re.search(r"<table\b", rows, re.I):
+            records = bind_table_rows(rows)
+        else:
+            records = []
+        if records:
+            for record in records:
+                d = copy.deepcopy(doc)
+                tokenize(d, record["content"], eng)
+                # 把record里的其他字段（除了content，例如标题、表头）更新到d中
+                d.update({key: value for key, value in record.items() if key != "content"})
+                if img is not None:
+                    d["image"] = img
+                add_positions(d, poss)
+                res.append(d)
             continue
         if isinstance(rows, str):
             d = copy.deepcopy(doc)

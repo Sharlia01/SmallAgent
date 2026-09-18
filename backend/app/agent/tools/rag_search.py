@@ -1,6 +1,7 @@
 """Knowledge-base search exposed through the standard Agent tool protocol."""
 
 from typing import Any
+from service.core.evidence_metadata import evidence_metadata
 
 from agent.schemas import ToolResult, ToolSource
 from service.core.retrieval import DEFAULT_PAGE_SIZE, retrieve_content
@@ -33,6 +34,7 @@ def _chunk_to_source(chunk: dict[str, Any], rank: int) -> ToolSource:
         content=str(content),
         score=chunk.get("similarity"),
         metadata={
+            **evidence_metadata(chunk),
             "rank": source_rank,
             "document_id": chunk.get("document_id"),
             "chunk_id": chunk.get("chunk_id"),

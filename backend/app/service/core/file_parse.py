@@ -1,4 +1,9 @@
 import datetime
+import hashlib
+import json
+import os
+from io import BytesIO
+from pathlib import Path
 from typing import Any, Dict, List
 
 import xxhash
@@ -6,6 +11,24 @@ import xxhash
 from service.core.rag.app.naive import chunk
 from service.core.rag.nlp.model import EMBEDDING_VECTOR_FIELD, generate_embedding
 from service.core.rag.utils.es_conn import ESConnection
+from service.core.api.utils.file_utils import get_project_base_directory
+from service.core.evidence_metadata import evidence_metadata
+
+PARSER_VERSION = "table-figure-v2"
+
+
+def _save_evidence_image(image, index_name: str, doc_id: str) -> str:
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    data = buffer.getvalue()
+    # Hash tenant and document identifiers instead of accepting path fragments.
+    tenant = hashlib.sha256(index_name.encode()).hexdigest()[:24]
+    relative = Path("storage/evidence") / tenant / doc_id / (hashlib.sha256(data).hexdigest() + ".png")
+    path = Path(get_project_base_directory()) / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_bytes(data)
+    return relative.as_posix()
 
 
 def dummy(prog=None, msg=""):
@@ -63,14 +86,18 @@ def process_items(
 
     # 处理每个数据项
     results = []
-    for item, embedding in zip(items, embeddings):
+    doc_id = xxhash.xxh64(file_name.encode("utf-8")).hexdigest()
+    image_refs = {}
+    for ordinal, (item, embedding) in enumerate(zip(items, embeddings)):
         # 生成 chunk_id
-        chunck_id = xxhash.xxh64(
-            (item["content_with_weight"] + index_name).encode("utf-8")
-        ).hexdigest()
+        identity = [PARSER_VERSION, index_name, doc_id, ordinal,
+                    item.get("position_int", []), item["content_with_weight"]]
+        chunck_id = hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
 
         # 构建数据字典
         d = {
+            **evidence_metadata(item),
+            "parser_version_kwd": PARSER_VERSION,
             "id": chunck_id,
             "content_ltks": item["content_ltks"],
             "content_with_weight": item["content_with_weight"],
@@ -84,10 +111,15 @@ def process_items(
         }
 
         d["kb_id"] = index_name
-        d["docnm_kwd"] = item["docnm_kwd"]
+        d["docnm_kwd"] = file_name
         d["title_tks"] = item["title_tks"]
-        d["doc_id"] = xxhash.xxh64(file_name.encode("utf-8")).hexdigest()
+        d["doc_id"] = doc_id
         d["docnm"] = file_name
+        if item.get("image") is not None:
+            image_key = id(item["image"])
+            if image_key not in image_refs:
+                image_refs[image_key] = _save_evidence_image(item["image"], index_name, doc_id)
+            d["image_ref_kwd"] = image_refs[image_key]
 
         d[EMBEDDING_VECTOR_FIELD] = embedding
 
@@ -108,27 +140,17 @@ def execute_insert_process(file_path: str, file_name: str, index_name: str):
     # 解析文档
     documents = parse(file_path)
     if not documents:
-        print(f"No documents found in {file_path}")
-        return
+        raise RuntimeError(f"No documents found in {file_path}; existing chunks retained")
 
     # 批量生成嵌入向量并存储到processed_documents中
     processed_documents = process_items(documents, file_name, index_name)
     if not processed_documents:
         raise RuntimeError(f"Failed to process documents from {file_path}")
 
-    # 分批插入 ES，避免单次请求超过 100mb
-    batch_size = 100
-    try:
-        es_connection = ESConnection()
-        for i in range(0, len(processed_documents), batch_size):
-            batch = processed_documents[i:i + batch_size]
-            errors = es_connection.insert(documents=batch, indexName=index_name)
-            if errors:
-                raise Exception(f"ES insert errors: {errors}")
-        print(f"Successfully inserted {len(processed_documents)} documents into ES")
-    except Exception as e:
-        print(f"Failed to insert documents into ES: {e}")
-        raise
+    es_connection = ESConnection()
+    return es_connection.replace_document(
+        processed_documents, index_name, processed_documents[0]["doc_id"]
+    )
 
 # 测试代码
 if __name__ == "__main__":

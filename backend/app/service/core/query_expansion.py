@@ -81,6 +81,10 @@ ENTITY_PREFIXES = (
     "觉得",
     "认为",
 )
+ENTITY_LEADING_CONTEXT_PATTERN = re.compile(
+    r"^(?:(?:这份|该|本)?(?:研报|研究报告|报告)(?:中|里)?"
+    r"(?:对|关于|认为|觉得)?|帮我查询|帮我查|想知道|请问|关于|根据|对)+"
+)
 GENERIC_ORGANIZATIONS = {
     "上市公司",
     "该公司",
@@ -103,6 +107,19 @@ CANONICAL_TERM_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+RATING_INTERPRETATION_CUE_PATTERN = re.compile(
+    r"看多|看空|含义|意思|定义|标准|代表什么|意味着什么|如何理解|到底"
+)
+RATING_REQUIRED_EXPANSION_TERMS = (
+    "投资评级",
+    "评级定义",
+    "评级标准",
+)
+TARGET_PRICE_PATTERN = re.compile(r"目标价(?:格)?")
+TARGET_PRICE_INTENT_PATTERN = re.compile(
+    r"目标价(?:格)?|合理价(?:格)?|估值|值多少钱|贵不贵|便不便宜"
+)
+
 QUERY_EXPANSION_SYSTEM_PROMPT = """
 你是知识库 RAG 的查询扩展器。请根据原问题和规范化问题，生成一条用于关键词召回的扩展查询；不要回答问题。
 
@@ -111,13 +128,18 @@ QUERY_EXPANSION_SYSTEM_PROMPT = """
 2. 只补充原问题中口语表达对应的常见书面语、专业字段名、缩写和同义检索词。
 3. 不得猜测或新增具体年份、日期、数字、实体、结论及事实。
 4. 同时覆盖原问题中的每个子意图，不得只保留其中一部分。
-5. added_terms 只列出相对规范化问题新增的检索词，最多 {max_terms} 个。
-6. 只返回 JSON 对象，格式为：
+5. 不得补充只是同属金融领域、但用户没有询问的字段；例如只问投资评级时，不得加入目标价或盈利预测。
+6. 当用户询问评级代表看多还是看空、评级的含义或标准时，应补充“投资评级、评级定义、评级标准”等检索词。
+7. added_terms 只列出相对规范化问题新增的检索词，最多 {max_terms} 个。
+8. 只返回 JSON 对象，格式为：
 {{"expanded_query":"扩展查询","added_terms":["新增词1","新增词2"]}}
 
 示例：
 输入：{{"original_query":"研报觉得国电电力未来三年能赚多少钱，对应估值贵不贵？","normalized_query":"国电电力未来三年盈利预测与估值"}}
 输出：{{"expanded_query":"国电电力 未来三年 盈利预测 归母净利润 每股收益 EPS 市盈率 PE 估值","added_terms":["归母净利润","每股收益","EPS","市盈率","PE"]}}
+
+输入：{{"original_query":"这份研报对国电电力到底是看多还是看空？给了什么评级？","normalized_query":"国电电力 研报 投资评级 看多 看空"}}
+输出：{{"expanded_query":"国电电力 研报 投资评级 看多 看空 评级定义 评级标准","added_terms":["评级定义","评级标准"]}}
 """.strip()
 
 
@@ -239,6 +261,7 @@ def _extract_organizations(query: str) -> set[str]:
     organizations = set()
     for match in ORGANIZATION_PATTERN.finditer(query):
         candidate = match.group(0).strip()
+        candidate = ENTITY_LEADING_CONTEXT_PATTERN.sub("", candidate).strip()
         for prefix in ENTITY_PREFIXES:
             prefix_position = candidate.rfind(prefix)
             if prefix_position >= 0:
@@ -378,6 +401,58 @@ def _parse_expansion(content: str) -> tuple[str, list[str]]:
     return expanded_query, added_terms
 
 
+def _apply_domain_expansion_policy(
+    original: str,
+    rewritten: str,
+    expanded: str,
+    added_terms: list[str],
+) -> tuple[str, list[str]]:
+    """Apply small deterministic guards for high-value retrieval intents."""
+    filtered_terms = list(added_terms)
+
+    # 目标价不是“投资评级”的同义词。用户没有询问价格或估值时，移除模型
+    # 顺手补入的目标价，避免关键词分支被带到另一个检索意图。
+    if not TARGET_PRICE_INTENT_PATTERN.search(original):
+        expanded = TARGET_PRICE_PATTERN.sub(" ", expanded)
+        filtered_terms = [
+            term
+            for term in filtered_terms
+            if not TARGET_PRICE_PATTERN.search(term)
+        ]
+
+    required_terms = []
+    if (
+        "评级" in original
+        and RATING_INTERPRETATION_CUE_PATTERN.search(original)
+    ):
+        required_terms.extend(RATING_REQUIRED_EXPANSION_TERMS)
+
+    normalized_expanded = _normalize_for_match(expanded)
+    for term in required_terms:
+        if _normalize_for_match(term) not in normalized_expanded:
+            expanded = f"{expanded} {term}"
+            normalized_expanded = _normalize_for_match(expanded)
+
+    normalized_rewritten = _normalize_for_match(rewritten)
+    required_added_terms = [
+        term
+        for term in required_terms
+        if _normalize_for_match(term) not in normalized_rewritten
+    ]
+    combined_terms = list(
+        dict.fromkeys([*required_added_terms, *filtered_terms])
+    )
+
+    maximum_terms = _max_expansion_terms()
+    retained_terms = combined_terms[:maximum_terms]
+    dropped_terms = combined_terms[maximum_terms:]
+    for term in dropped_terms:
+        if term not in required_terms:
+            expanded = expanded.replace(term, " ")
+
+    return " ".join(expanded.split()).strip(), retained_terms
+
+
 def _fallback_result(
     original: str,
     rewritten: str,
@@ -478,6 +553,12 @@ def expand_query(
         #对模型生成的扩展查询做“意图保留校验”，保证扩展后的查询不会把用户本来的意思改丢/改偏
         expanded_query, added_terms = _parse_expansion(
             _response_content(completion)
+        )
+        expanded_query, added_terms = _apply_domain_expansion_policy(
+            original_query,
+            rewritten_query,
+            expanded_query,
+            added_terms,
         )
         rewrite_validation = validate_query_preservation(
             original_query,

@@ -22,6 +22,7 @@ from io import BytesIO
 from docx import Document
 from timeit import default_timer as timer
 import re
+from html import escape
 from service.core.deepdoc.parser.pdf_parser import PlainParser
 from service.core.rag.nlp import rag_tokenizer, naive_merge, tokenize_table, tokenize_chunks, find_codec, concat_img, \
     naive_merge_docx, tokenize_chunks_docx
@@ -263,14 +264,16 @@ class Docx(DocxParser):
             # python-docx 读取横向合并单元格时，可能返回多个内容相同的
             # cell。这里沿用原来的策略，将它们表示成一个 colspan 单元格。
             for following_index in range(cell_index + 1, len(row.cells)):
-                if cell.text == row.cells[following_index].text:
+                if cell._tc is row.cells[following_index]._tc:
                     span += 1
                     cell_index = following_index
+                else:
+                    break
             cell_index += 1
             html += (
-                f"<td>{cell.text}</td>"
+                f"<td>{escape(cell.text)}</td>"
                 if span == 1
-                else f"<td colspan='{span}'>{cell.text}</td>"
+                else f"<td colspan='{span}'>{escape(cell.text)}</td>"
             )
         return html + "</tr>"
 
