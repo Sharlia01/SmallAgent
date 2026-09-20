@@ -30,6 +30,7 @@ backend/app/service/core/storage/
 backend/evals/results/
 
 # Locally uploaded or test documents
+backend/pdf/
 backend/*.pdf
 backend/*.doc
 backend/*.docx

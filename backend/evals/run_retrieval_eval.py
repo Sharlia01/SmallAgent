@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,7 @@ from typing import Any
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 BACKEND_DIRECTORY = SCRIPT_DIRECTORY.parent
 APP_DIRECTORY = BACKEND_DIRECTORY / "app"
-DEFAULT_DATASET = SCRIPT_DIRECTORY / "data" / "guodian_power_eval_v1.jsonl"
+DEFAULT_DATASET = SCRIPT_DIRECTORY / "data" / "power_reports_eval_v2.jsonl"
 DEFAULT_OUTPUT_DIRECTORY = SCRIPT_DIRECTORY / "results"
 
 if str(APP_DIRECTORY) not in sys.path:
@@ -29,6 +30,7 @@ from service.core.retrieval_evaluation import (  # noqa: E402
     build_error_case,
     build_summary,
     evaluate_retrieval_case,
+    resolve_metric_ks,
 )
 from service.core.evidence_sufficiency import (  # noqa: E402
     DEFAULT_EVIDENCE_SUFFICIENCY_MODEL,
@@ -50,6 +52,9 @@ REQUIRED_SAMPLE_FIELDS = {
     "relevant_evidence",
     "metadata",
 }
+
+V2_SPLITS = {"dev", "test", "challenge"}
+V2_RETRIEVAL_MODES = {"single", "parallel", "sequential"}
 
 
 def environment_flag(name: str, default: bool) -> bool:
@@ -121,10 +126,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--final-reranker-weight",
         type=float,
-        default=0.7,
+        default=0.4,
         help=(
             "Semantic reranker weight in second-stage rank fusion "
-            "(default: 0.7)."
+            "(default: 0.4)."
         ),
     )
     parser.add_argument(
@@ -143,6 +148,14 @@ def parse_args() -> argparse.Namespace:
         "--sample-id",
         action="append",
         help="Run only selected sample IDs. May be repeated.",
+    )
+    parser.add_argument(
+        "--split",
+        action="append",
+        help=(
+            "Run only samples whose metadata.split matches this value. "
+            "Repeat or use commas for more than one split."
+        ),
     )
     parser.add_argument(
         "--limit",
@@ -199,6 +212,155 @@ def expand_index_names(values: list[str]) -> list[str]:
     if not names:
         raise ValueError("At least one non-empty --index-name is required")
     return names
+
+
+def validate_v2_annotations(sample: dict[str, Any], line_number: int) -> None:
+    """Validate the richer annotations used by the v2 evaluation set."""
+    if not str(sample.get("schema_version") or "").startswith("2."):
+        return
+
+    sample_id = str(sample.get("id") or "")
+    metadata = sample.get("metadata")
+    if not isinstance(metadata, dict) or metadata.get("split") not in V2_SPLITS:
+        raise ValueError(
+            f"Dataset line {line_number} sample {sample_id!r} must use one "
+            f"of metadata.split={sorted(V2_SPLITS)}"
+        )
+
+    expected_behavior = sample.get("expected_behavior")
+    required_behavior = "answer" if sample.get("answerable") else "refuse"
+    if expected_behavior != required_behavior:
+        raise ValueError(
+            f"Sample {sample_id!r} expected_behavior must be "
+            f"{required_behavior!r}"
+        )
+
+    retrieval = sample.get("expected_retrieval")
+    if not isinstance(retrieval, dict):
+        raise ValueError(f"Sample {sample_id!r} has no expected_retrieval")
+    if retrieval.get("mode") not in V2_RETRIEVAL_MODES:
+        raise ValueError(f"Sample {sample_id!r} has invalid retrieval mode")
+    hop_count = retrieval.get("hop_count")
+    if (
+        not isinstance(hop_count, int)
+        or isinstance(hop_count, bool)
+        or hop_count <= 0
+    ):
+        raise ValueError(f"Sample {sample_id!r} has invalid retrieval hop_count")
+
+    evidence_ids = []
+    for evidence in sample.get("relevant_evidence") or []:
+        evidence_id = evidence.get("id")
+        if not isinstance(evidence_id, str) or not evidence_id.strip():
+            raise ValueError(f"Sample {sample_id!r} has evidence without an id")
+        evidence_ids.append(evidence_id)
+    if len(evidence_ids) != len(set(evidence_ids)):
+        raise ValueError(f"Sample {sample_id!r} has duplicate evidence ids")
+
+    claims = sample.get("reference_claims")
+    if not isinstance(claims, list):
+        raise ValueError(f"Sample {sample_id!r} has invalid reference_claims")
+    if sample.get("answerable") and not claims:
+        raise ValueError(f"Answerable sample {sample_id!r} has no reference claims")
+    if not sample.get("answerable") and claims:
+        raise ValueError(f"Unanswerable sample {sample_id!r} has reference claims")
+
+    claim_ids = set()
+    known_evidence_ids = set(evidence_ids)
+    for claim in claims:
+        if not isinstance(claim, dict):
+            raise ValueError(f"Sample {sample_id!r} has a non-object claim")
+        claim_id = claim.get("id")
+        if (
+            not isinstance(claim_id, str)
+            or not claim_id.strip()
+            or claim_id in claim_ids
+        ):
+            raise ValueError(f"Sample {sample_id!r} has an invalid claim id")
+        claim_ids.add(claim_id)
+        if not str(claim.get("text") or "").strip():
+            raise ValueError(f"Sample {sample_id!r} claim {claim_id!r} has no text")
+        required_ids = claim.get("required_evidence_ids")
+        if not isinstance(required_ids, list) or not required_ids:
+            raise ValueError(
+                f"Sample {sample_id!r} claim {claim_id!r} has no evidence links"
+            )
+        unknown_ids = sorted(set(required_ids) - known_evidence_ids)
+        if unknown_ids:
+            raise ValueError(
+                f"Sample {sample_id!r} claim {claim_id!r} references unknown "
+                f"evidence ids: {unknown_ids}"
+            )
+
+    requirements = sample.get("evidence_requirements") or []
+    if not isinstance(requirements, list):
+        raise ValueError(f"Sample {sample_id!r} has invalid evidence_requirements")
+    requirement_ids = set()
+    for requirement in requirements:
+        if not isinstance(requirement, dict):
+            raise ValueError(
+                f"Sample {sample_id!r} has a non-object evidence requirement"
+            )
+        requirement_id = requirement.get("id")
+        if (
+            not isinstance(requirement_id, str)
+            or not requirement_id.strip()
+            or requirement_id in requirement_ids
+        ):
+            raise ValueError(
+                f"Sample {sample_id!r} has an invalid evidence requirement id"
+            )
+        requirement_ids.add(requirement_id)
+        alternatives = requirement.get("alternatives")
+        if not isinstance(alternatives, list) or not alternatives:
+            raise ValueError(
+                f"Sample {sample_id!r} requirement {requirement_id!r} has "
+                "no alternatives"
+            )
+        for alternative in alternatives:
+            if not isinstance(alternative, list) or not alternative:
+                raise ValueError(
+                    f"Sample {sample_id!r} requirement {requirement_id!r} "
+                    "has an empty alternative"
+                )
+            for atom in alternative:
+                if not isinstance(atom, dict):
+                    raise ValueError(
+                        f"Sample {sample_id!r} requirement {requirement_id!r} "
+                        "has a non-object atom"
+                    )
+                match_type = atom.get("type", "text")
+                if match_type not in {"text", "table_row"}:
+                    raise ValueError(
+                        f"Sample {sample_id!r} requirement {requirement_id!r} "
+                        f"has unsupported atom type {match_type!r}"
+                    )
+                if not str(atom.get("document_name") or "").strip():
+                    raise ValueError(
+                        f"Sample {sample_id!r} requirement {requirement_id!r} "
+                        "has an atom without document_name"
+                    )
+                if (
+                    match_type == "text"
+                    and not str(atom.get("text") or "").strip()
+                ):
+                    raise ValueError(
+                        f"Sample {sample_id!r} requirement {requirement_id!r} "
+                        "has a text atom without text"
+                    )
+                if match_type == "table_row" and not atom.get("row_cells"):
+                    raise ValueError(
+                        f"Sample {sample_id!r} requirement {requirement_id!r} "
+                        "has a table atom without row_cells"
+                    )
+
+    if not sample.get("answerable") and sample.get(
+        "expected_evidence_sufficient"
+    ) is not False:
+        raise ValueError(
+            f"Unanswerable sample {sample_id!r} must set "
+            "expected_evidence_sufficient=false"
+        )
 
 
 def load_dataset(path: Path) -> list[dict[str, Any]]:
@@ -280,6 +442,7 @@ def load_dataset(path: Path) -> list[dict[str, Any]]:
             )
         if sample["id"] in identifiers:
             raise ValueError(f"Duplicate sample ID: {sample['id']!r}")
+        validate_v2_annotations(sample, line_number)
         identifiers.add(sample["id"])
         samples.append(sample)
 
@@ -292,11 +455,32 @@ def select_samples(
     samples: list[dict[str, Any]],
     sample_ids: list[str] | None,
     limit: int | None,
+    splits: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     selected = samples
+    if splits:
+        requested_splits = {
+            part.strip()
+            for value in splits
+            for part in value.split(",")
+            if part.strip()
+        }
+        available_splits = {
+            str((sample.get("metadata") or {}).get("split") or "")
+            for sample in samples
+        }
+        missing_splits = sorted(requested_splits - available_splits)
+        if missing_splits:
+            raise ValueError(f"Unknown --split values: {missing_splits}")
+        selected = [
+            sample
+            for sample in selected
+            if str((sample.get("metadata") or {}).get("split") or "")
+            in requested_splits
+        ]
     if sample_ids:
         requested = set(sample_ids)
-        available = {str(sample["id"]) for sample in samples}
+        available = {str(sample["id"]) for sample in selected}
         missing = sorted(requested - available)
         if missing:
             raise ValueError(f"Unknown --sample-id values: {missing}")
@@ -346,7 +530,12 @@ def main() -> int:
     dataset_path = args.dataset.resolve()
     #加载数据集并筛选样本
     samples = load_dataset(dataset_path)
-    samples = select_samples(samples, args.sample_id, args.limit)
+    samples = select_samples(
+        samples,
+        args.sample_id,
+        args.limit,
+        splits=args.split,
+    )
 
     if args.validate_only:
         print(
@@ -359,6 +548,25 @@ def main() -> int:
                             str(sample.get("dataset_version", "unknown"))
                             for sample in samples
                         }
+                    ),
+                    "splits": dict(
+                        sorted(
+                            Counter(
+                                str(
+                                    (sample.get("metadata") or {}).get("split")
+                                    or "unknown"
+                                )
+                                for sample in samples
+                            ).items()
+                        )
+                    ),
+                    "question_types": dict(
+                        sorted(
+                            Counter(
+                                str(sample.get("question_type") or "unknown")
+                                for sample in samples
+                            ).items()
+                        )
                     ),
                 },
                 ensure_ascii=False,
@@ -385,6 +593,7 @@ def main() -> int:
     started_at = datetime.now(timezone.utc)
     started_clock = time.perf_counter()
     results = []
+    metric_ks = resolve_metric_ks(args.top_k)
     retrieval_index_argument: str | list[str] = (
         index_names[0] if len(index_names) == 1 else index_names
     )
@@ -411,6 +620,7 @@ def main() -> int:
                 latency_ms=latency_ms,
                 top_k=args.top_k,
                 match_threshold=args.match_threshold,
+                metric_ks=metric_ks,
             )
             hit_key = f"hit_at_{args.top_k}"
             retrieval_hit = result["retrieval_metrics"][hit_key]
@@ -436,6 +646,7 @@ def main() -> int:
                 error=error,
                 latency_ms=latency_ms,
                 top_k=args.top_k,
+                metric_ks=metric_ks,
             )
             print(
                 f"[{position}/{len(samples)}] {sample['id']} ERROR: "
@@ -446,7 +657,11 @@ def main() -> int:
         results.append(result)
 
     completed_at = datetime.now(timezone.utc)
-    metric_summary = build_summary(results, top_k=args.top_k)
+    metric_summary = build_summary(
+        results,
+        top_k=args.top_k,
+        metric_ks=metric_ks,
+    )
     summary = {
         "result_schema_version": RESULT_SCHEMA_VERSION,
         "run_name": args.run_name,
@@ -463,10 +678,20 @@ def main() -> int:
                     for sample in samples
                 }
             ),
+            "splits": sorted(
+                {
+                    str(
+                        (sample.get("metadata") or {}).get("split")
+                        or "unknown"
+                    )
+                    for sample in samples
+                }
+            ),
         },
         "retrieval_config": {
             "index_names": index_names,
             "top_k": args.top_k,
+            "metric_ks": list(metric_ks),
             "similarity_threshold": args.similarity_threshold,
             "vector_rrf_weight": args.vector_weight,
             "candidate_size_per_branch": args.candidate_size,
@@ -497,7 +722,7 @@ def main() -> int:
             ),
             "evidence_sufficiency_fail_open": environment_flag(
                 "RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN",
-                True,
+                False,
             ),
         },
         "result_file": str(result_path),

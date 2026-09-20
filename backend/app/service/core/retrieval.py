@@ -32,7 +32,7 @@ DEFAULT_VECTOR_SIMILARITY_WEIGHT = 0.6
 DEFAULT_RETRIEVAL_CANDIDATE_SIZE = 100
 DEFAULT_RERANK_CANDIDATE_SIZE = 20
 DEFAULT_RRF_K = 60
-DEFAULT_FINAL_RERANKER_WEIGHT = 0.7
+DEFAULT_FINAL_RERANKER_WEIGHT = 0.4
 DEFAULT_FINAL_RRF_K = 10
 
 
@@ -531,11 +531,39 @@ def retrieve_content(
     page_size: int = DEFAULT_PAGE_SIZE,
 ) -> list[dict[str, Any]]:
     """Retrieve the top chunks for chat while retaining ranking metadata."""
+    chunks, _diagnostics = retrieve_content_with_diagnostics(
+        indexNames,
+        question,
+        page_size=page_size,
+    )
+    return chunks
+
+
+def retrieve_content_with_diagnostics(
+    indexNames: str,
+    question: str,
+    *,
+    page_size: int = DEFAULT_PAGE_SIZE,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Return chat chunks plus bounded policy/retrieval diagnostics."""
     results = retrieve_raw_results(indexNames, question, page_size=page_size)
-    return [
+    chunks = [
         format_retrieved_chunk(chunk, rank)
         for rank, chunk in enumerate(results.get("chunks", []), start=1)
     ]
+    diagnostics = {
+        "evidence_sufficiency": dict(
+            results.get("evidence_sufficiency") or {}
+        ),
+        "query_intent": dict(results.get("query_intent") or {}),
+        "sequential_retrieval": dict(
+            results.get("sequential_retrieval") or {}
+        ),
+        "total_before_evidence_sufficiency": int(
+            results.get("total_before_evidence_sufficiency") or 0
+        ),
+    }
+    return chunks, diagnostics
 
 
 if __name__ == "__main__":

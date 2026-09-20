@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from agent.orchestrator import AgentOrchestrator
 from agent.tools.rag_search import RagSearchTool
 from agent.tools.web_search import WebSearchTool
+from service.core.streaming_response import read_stream_chunk as _read_stream_chunk
 
 load_dotenv()
 
@@ -21,6 +22,7 @@ load_dotenv()
 CHAT_MODEL = os.getenv("CHAT_MODEL", "deepseek-v4-pro")
 AGENT_MODEL = os.getenv("AGENT_MODEL", "qwen3.7-flash-2026-07-15")
 AGENT_MAX_STEPS = 3
+SESSION_NAME_MAX_LENGTH = 30
 
 
 def _positive_int_env(name: str, default: int, maximum: int) -> int:
@@ -268,52 +270,12 @@ def generate_recommended_questions(user_question, retrieved_content=None, sessio
         logger.error(f"调用大模型生成推荐问题时发生错误: {str(e)}")
         return []
 
-def generate_session_name(user_question):
-    prompt = f"""
-    请根据以下用户提问，生成一个简洁且具有代表性的会话名称：
-    用户提问：{user_question}
-
-    要求：
-    1. 会话名称应简洁明了，能够概括用户提问的主题。
-    2. 返回一个 JSON 对象，包含一个字段 "session_name"，值为生成的会话名称。
-
-    输出格式示例：
-    {{
-      "session_name": "会话名称内容"
-    }}
-
-    请严格按照上述格式返回 JSON 对象。
-    """
-    
-    # 调用大模型生成会话名称
-    try:
-        client = OpenAI(
-                api_key=os.getenv("DASHSCOPE_API_KEY"),
-                base_url=os.getenv("DASHSCOPE_BASE_URL")
-            )
-        completion = client.chat.completions.create(
-            model="qwen3.7-flash-2026-07-15",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            stream=False,
-        )
-
-        # 提取生成的会话名称
-        if completion.choices:
-            response = completion.choices[0].message.content
-            try:
-                # 解析 JSON 响应
-                response_json = json.loads(response)
-                session_name = response_json.get("session_name")
-                print("生成的会话名称：\n")
-                print(session_name)
-                return session_name
-            except json.JSONDecodeError:
-                print("Failed to parse JSON response.")
-                return user_question
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        return user_question
+def generate_session_name(user_question: str) -> str:
+    """Build a session title locally from the first question."""
+    normalized_question = " ".join(str(user_question or "").split())
+    if not normalized_question:
+        return DEFAULT_SESSION_NAME
+    return normalized_question[:SESSION_NAME_MAX_LENGTH]
 
 
 def write_chat_to_db(session_id: str, user_question: str, model_answer: str, retrieval_content, recommended_questions, think ):
@@ -430,21 +392,6 @@ def _make_sse_event(event_name, data):
     return f"event: {event_name}\ndata: {payload}\n\n"
 
 
-def _read_stream_chunk(chunk):
-    """从模型返回的一小块数据中，取出结束标志、正文和思考内容。"""
-    if not chunk.choices:
-        return None, "", ""
-
-    choice = chunk.choices[0]
-    delta = choice.delta
-
-    # getattr(对象, 属性名, 默认值) 是 Python 的安全取属性方式。
-    # 某些模型没有 reasoning_content 属性，使用 getattr 就不会因此报错。
-    answer_text = getattr(delta, "content", None) or ""
-    thinking_text = getattr(delta, "reasoning_content", None) or ""
-    return choice.finish_reason, answer_text, thinking_text
-
-
 def _generate_recommended_questions_safely(question, retrieved_content, session_id):
     """生成推荐问题；失败时返回空列表，不影响主要回答。"""
     try:
@@ -464,6 +411,7 @@ def get_chat_completion(
     question,
     retrieved_content=None,
     user_id: int | None = None,
+    include_recommended_questions: bool = True,
 ):
     """
     流式生成聊天回答，并把结果包装成 SSE 事件交给前端。
@@ -476,6 +424,7 @@ def get_chat_completion(
     :param question: 用户提出的问题
     :param retrieved_content: 兼容旧调用的预检索文档；None 时由 Agent 决定是否检索
     :param user_id: 当前用户 ID
+    :param include_recommended_questions: 是否在正文后同步生成推荐问题
     :return: 逐个产生 SSE 格式字符串的生成器
     """
     request_started_at = time.perf_counter()
@@ -512,45 +461,58 @@ def get_chat_completion(
         first_output_logged = False
         stream_chunk_count = 0
 
-        # 第三步：不断读取回答模型的小块，并立即转发给前端。
-        for chunk in completion:
-            stream_chunk_count += 1
-            finish_reason, answer_text, thinking_text = _read_stream_chunk(chunk)
+        if execution.direct_answer is not None:
+            first_output_logged = True
+            answer_parts.append(execution.direct_answer)
+            yield _make_sse_event(
+                "message",
+                {
+                    "role": "assistant",
+                    "content": execution.direct_answer,
+                    "thinking": False,
+                    "response_mode": execution.response_mode,
+                },
+            )
+        else:
+            # 第三步：不断读取回答模型的小块，并立即转发给前端。
+            for chunk in completion:
+                stream_chunk_count += 1
+                finish_reason, answer_text, thinking_text = _read_stream_chunk(chunk)
 
-            # finish_reason 不是 None，表示模型已经停止生成。
-            if finish_reason is not None:
-                break
+                # finish_reason 不是 None，表示模型已经停止生成。
+                if finish_reason is not None:
+                    break
 
-            if not first_output_logged and (answer_text or thinking_text):
-                first_output_logged = True
-                logger.info(
-                    "PERF session_id=%s stage=answer_first_output "
-                    "answer_wait_ms=%.1f request_elapsed_ms=%.1f",
-                    session_id,
-                    (time.perf_counter() - answer_stream_started_at) * 1000,
-                    (time.perf_counter() - request_started_at) * 1000,
-                )
+                if not first_output_logged and (answer_text or thinking_text):
+                    first_output_logged = True
+                    logger.info(
+                        "PERF session_id=%s stage=answer_first_output "
+                        "answer_wait_ms=%.1f request_elapsed_ms=%.1f",
+                        session_id,
+                        (time.perf_counter() - answer_stream_started_at) * 1000,
+                        (time.perf_counter() - request_started_at) * 1000,
+                    )
 
-            if answer_text:
-                answer_parts.append(answer_text)
-                yield _make_sse_event(
-                    "message",
-                    {
-                        "role": "assistant",
-                        "content": answer_text,
-                        "thinking": False,
-                    },
-                )
-            elif thinking_text:
-                thinking_parts.append(thinking_text)
-                yield _make_sse_event(
-                    "message",
-                    {
-                        "role": "assistant",
-                        "content": thinking_text,
-                        "thinking": True,
-                    },
-                )
+                if answer_text:
+                    answer_parts.append(answer_text)
+                    yield _make_sse_event(
+                        "message",
+                        {
+                            "role": "assistant",
+                            "content": answer_text,
+                            "thinking": False,
+                        },
+                    )
+                elif thinking_text:
+                    thinking_parts.append(thinking_text)
+                    yield _make_sse_event(
+                        "message",
+                        {
+                            "role": "assistant",
+                            "content": thinking_text,
+                            "thinking": True,
+                        },
+                    )
 
         # 第四步：流式回答结束后，拼出完整正文和完整思考过程。
         model_answer = "".join(answer_parts)
@@ -567,15 +529,21 @@ def get_chat_completion(
         )
 
         recommended_started_at = time.perf_counter()
-        recommended_questions = _generate_recommended_questions_safely(
-            question,
-            retrieved_content,
-            session_id,
-        )
+        if include_recommended_questions:
+            recommended_questions = _generate_recommended_questions_safely(
+                question,
+                retrieved_content,
+                session_id,
+            )
+            recommended_status = "ok"
+        else:
+            recommended_questions = []
+            recommended_status = "skipped"
         logger.info(
-            "PERF session_id=%s stage=recommended_questions count=%s "
-            "duration_ms=%.1f",
+            "PERF session_id=%s stage=recommended_questions status=%s "
+            "count=%s duration_ms=%.1f",
             session_id,
+            recommended_status,
             len(recommended_questions),
             (time.perf_counter() - recommended_started_at) * 1000,
         )

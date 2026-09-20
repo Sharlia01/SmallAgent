@@ -71,6 +71,13 @@ class EmptyTool(FakeTool):
             query=kwargs["query"],
             content="",
             sources=[],
+            metadata={
+                "evidence_sufficiency": {
+                    "sufficient": False,
+                    "source": "model",
+                    "missing_requirements": ["审批时限"],
+                }
+            },
         )
 
 
@@ -379,6 +386,45 @@ def test_orchestrator_falls_back_without_repeating_answer_generation():
     assert fallback_tool.calls == [{"query": "内部制度是什么？"}]
     assert execution.answer_stream is answer_stream
     assert len(answer_completions.calls) == 1
+
+
+@pytest.mark.unit
+def test_orchestrator_returns_deterministic_refusal_for_insufficient_kb():
+    tool = EmptyTool()
+    planner_completions = FakeCompletions(
+        [
+            completion(
+                assistant_message(
+                    tool_calls=[
+                        tool_call("call-1", tool.name, '{"query":"审批时限"}')
+                    ]
+                )
+            ),
+            completion(assistant_message(content="READY")),
+        ]
+    )
+    answer_completions = FakeCompletions([])
+    orchestrator = AgentOrchestrator(
+        planner_client=SimpleNamespace(
+            chat=SimpleNamespace(completions=planner_completions)
+        ),
+        planner_model="small-planner",
+        answer_client=SimpleNamespace(
+            chat=SimpleNamespace(completions=answer_completions)
+        ),
+        answer_model="large-answer",
+        tools=[tool],
+    )
+
+    execution = orchestrator.run(
+        session_id="session-1",
+        question="审批时限是多久？",
+    )
+
+    assert execution.response_mode == "refuse"
+    assert execution.answer_stream is None
+    assert "审批时限" in execution.direct_answer
+    assert answer_completions.calls == []
 
 
 @pytest.mark.unit

@@ -4,7 +4,10 @@ from typing import Any
 from service.core.evidence_metadata import evidence_metadata
 
 from agent.schemas import ToolResult, ToolSource
-from service.core.retrieval import DEFAULT_PAGE_SIZE, retrieve_content
+from service.core.retrieval import (
+    DEFAULT_PAGE_SIZE,
+    retrieve_content_with_diagnostics,
+)
 from utils import logger
 
 
@@ -127,7 +130,7 @@ class RagSearchTool:
             )
 
         try:
-            chunks = retrieve_content(
+            chunks, diagnostics = retrieve_content_with_diagnostics(
                 str(self._user_id),
                 normalized_query,
                 page_size=top_k,
@@ -154,7 +157,11 @@ class RagSearchTool:
             query=normalized_query,
             content=_format_sources_for_agent(sources),
             sources=sources,
-            metadata={"result_count": len(sources), "top_k": top_k},
+            metadata={
+                "result_count": len(sources),
+                "top_k": top_k,
+                **diagnostics,
+            },
         )
 
 

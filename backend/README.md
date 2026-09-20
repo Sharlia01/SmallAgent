@@ -22,20 +22,22 @@ cd LS-p1
 ```bash
 DASHSCOPE_API_KEY="your-api-key"
 BGE_MODEL_HOST_PATH=../../models/bge-small-zh-v1.5
+RERANKER_MODEL_HOST_PATH=../../models/bge-reranker-v2-m3
 RAG_QUERY_INTENT_ENABLED=true
 QUERY_REWRITE_ENABLED=true
 QUERY_EXPANSION_ENABLED=true
 RAG_EVIDENCE_SUFFICIENCY_ENABLED=true
 ```
 
-Embedding 使用本地 `bge-small-zh-v1.5`，重排使用 DashScope `qwen3.7-text-rerank`；DashScope Key 同时用于 RAG 查询意图识别、查询规范化与扩展及聊天模型。
-`BGE_MODEL_HOST_PATH` 相对于本目录的 `docker-compose.yml`。
+Embedding 使用本地 `bge-small-zh-v1.5`，重排使用本地
+`bge-reranker-v2-m3`；DashScope Key 用于 RAG 查询意图识别、查询规范化与扩展及聊天模型。
+两个模型宿主机路径都相对于本目录的 `docker-compose.yml`。
 
-RAG 检索入口会先识别查询类型和检索模式。明确的表号、图号、章节或页码查询直接检索；口语、简称和上下文指代查询先规范化，再生成一条包含专业字段和同义词的关键词扩展查询。扩展结果必须通过实体、时间、数字、单位、否定词和定位信息保留校验，否则自动回退到规范化查询或原查询。普通问题使用 `single` 模式；只有后一个子问题依赖第一步证据中的术语或实体时才使用 `sequential` 模式。递进式检索最多执行两跳，桥接值必须逐字存在于第一跳来源 chunk；“这份研报/该报告”场景会把第二跳限定在同一文档。检索器内部仍分别执行原问题关键词、扩展查询关键词和原问题向量召回，在 Python 层通过第一阶段加权 RRF 合并候选，再只使用当前跳的问题进行语义重排；每跳以语义重排名次 `0.7`、第一阶段检索 RRF 名次 `0.3` 做第二阶段加权 RRF。
+RAG 检索入口会先识别查询类型和检索模式。明确的表号、图号、章节或页码查询直接检索；口语、简称和上下文指代查询先规范化，再生成一条包含专业字段和同义词的关键词扩展查询。扩展结果必须通过实体、时间、数字、单位、否定词和定位信息保留校验，否则自动回退到规范化查询或原查询。普通问题使用 `single` 模式；只有后一个子问题依赖第一步证据中的术语或实体时才使用 `sequential` 模式。递进式检索最多执行两跳，桥接值必须逐字存在于第一跳来源 chunk；“这份研报/该报告”场景会把第二跳限定在同一文档。检索器内部仍分别执行原问题关键词、扩展查询关键词和原问题向量召回，在 Python 层通过第一阶段加权 RRF 合并候选，再只使用当前跳的问题进行语义重排；每跳以语义重排名次 `0.4`、第一阶段检索 RRF 名次 `0.6` 做第二阶段加权 RRF。
 
 两跳结果去重合并后，额外使用用户原始问题统一重排一次，并重新检查原问题的限定条件。首页在容量允许时保留经过校验的桥接来源片段和第二跳的独立证据，其余位置按统一排名补齐；保留证据也按统一排名展示，不固定置顶。最终重排只决定顺序，不再次用原问题分数过滤辅助证据。统一重排失败时保留两跳结果，回退到各跳名次的等权 RRF，并记录失败来源。设置 `RAG_SEQUENTIAL_RETRIEVAL_ENABLED=false` 可关闭整个递进式检索并回退单跳。
 
-重排后的最终 Top 片段会再经过证据充分性检查：只有当所有时间范围、指标、限定条件和子问题都有直接证据时才保留结果，否则返回空结果并记录 `evidence_sufficiency`诊断。设置 `RAG_EVIDENCE_SUFFICIENCY_ENABLED=false` 可关闭该检查。调用异常默认保留原结果；如需异常时也拒绝返回，设置 `RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN=false`。
+重排后的最终 Top 片段会再经过证据充分性检查：只有当所有时间范围、指标、限定条件和子问题都有直接证据时才保留结果，否则返回空结果并记录 `evidence_sufficiency`诊断。设置 `RAG_EVIDENCE_SUFFICIENCY_ENABLED=false` 可关闭该检查。调用异常默认保守拒绝返回；只有在可用性优先于证据保证时才设置 `RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN=true`。
 
 设置 `RAG_QUERY_INTENT_ENABLED=false` 可关闭意图判断并恢复全量改写策略，设置 `QUERY_REWRITE_ENABLED=false` 可完全关闭改写和扩展，设置 `QUERY_EXPANSION_ENABLED=false` 可只保留规范化改写。
 
@@ -57,6 +59,42 @@ docker compose logs -f LS_api
 # 检查服务健康状态
 curl http://localhost:8000/docs
 ```
+
+### 终端 CLI（无需启动前端）
+
+CLI 通过 HTTP 复用 FastAPI 的现有接口，不会另写一套 RAG 逻辑。因此终端与网页
+使用相同的用户隔离、会话历史、检索与重排、证据充分性检查、引用和拒答行为。
+
+```bash
+# 首次使用：注册账号，密码会隐藏输入
+docker compose exec LS_api python rag_cli.py --username <用户名> --register
+
+# 以后直接登录并进入交互问答
+docker compose exec LS_api python rag_cli.py --username <用户名>
+```
+
+进入后可以直接输入问题，也可以使用：
+
+- `/new`：创建新会话
+- `/sessions`、`/use <session_id>`：列出和切换会话
+- `/history`：查看当前会话历史
+- `/upload <文件...>`：上传个人知识库文件；带空格的路径需要加引号
+- `/quick <文件>`：上传只供当前会话使用的临时文档
+- `/files`：查看知识库文件
+- `/sources`：再次查看上一轮引用来源
+- `/thinking on|off`：控制是否显示模型思考内容
+- `/help`：查看完整帮助，`/exit` 退出
+
+后端依赖已安装在本机时，也可在 `backend` 目录运行：
+
+```bash
+python app/rag_cli.py --username <用户名>
+```
+
+默认连接 `http://localhost:8000`。远程 API 可通过 `--base-url` 或环境变量
+`RAG_API_URL` 指定。使用 `--question "问题"` 可只提一个问题并在回答后退出。
+CLI 请求默认关闭回答后的推荐问题生成；会话标题直接取首次问题的前 30 个字符，
+不再为标题额外调用模型。网页端仍默认生成推荐问题。
 
 ### 表格、图表与重新入库
 
@@ -99,11 +137,12 @@ ES 批量写入失败也不会清理旧片段，可重新执行恢复。替换�
 Compose 的 API 工作目录为 `/app/app`，与代码挂载一致。首次应用此配置后运行
 `docker compose up -d --no-deps --force-recreate LS_api`，使服务加载新代码。
 
-### 在线重排模型
+### 本地重排模型
 
-检索器通过 DashScope `qwen3.7-text-rerank` 对“原问题、候选片段”逐对打分。
-只需配置 `DASHSCOPE_API_KEY`，无需下载额外重排权重，也无需重新生成现有
-embedding 或重新上传文档。
+检索器通过本地 `BAAI/bge-reranker-v2-m3` 对“原问题、候选片段”逐对打分。
+模型默认从 `/models/bge-reranker-v2-m3` 加载，并通过
+`RERANKER_MODEL_HOST_PATH` 只读挂载。切换重排模型无需重新生成现有 embedding
+或重新上传文档。
 
 ### 服务列表
 

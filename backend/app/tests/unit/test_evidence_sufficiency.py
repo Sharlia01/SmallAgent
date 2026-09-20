@@ -136,26 +136,9 @@ def test_preparation_keeps_every_returned_top_chunk_within_total_budget():
 
 
 @pytest.mark.unit
-def test_provider_failure_is_fail_open_by_default(monkeypatch):
+def test_provider_failure_is_fail_closed_by_default(monkeypatch):
     monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_ENABLED", "true")
     monkeypatch.delenv("RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN", raising=False)
-    completions = FakeCompletions(error=TimeoutError("provider timeout"))
-
-    decision = evidence_sufficiency.check_evidence_sufficiency(
-        "2025年全年营业收入是多少？",
-        chunks(),
-        client=fake_client(completions),
-    )
-
-    assert decision.sufficient is True
-    assert decision.source == "fallback"
-    assert decision.missing_requirements == []
-
-
-@pytest.mark.unit
-def test_provider_failure_can_fail_closed(monkeypatch):
-    monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_ENABLED", "true")
-    monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN", "false")
     completions = FakeCompletions(error=TimeoutError("provider timeout"))
 
     decision = evidence_sufficiency.check_evidence_sufficiency(
@@ -167,6 +150,23 @@ def test_provider_failure_can_fail_closed(monkeypatch):
     assert decision.sufficient is False
     assert decision.source == "fallback"
     assert decision.missing_requirements == ["无法确认证据是否充分"]
+
+
+@pytest.mark.unit
+def test_provider_failure_can_fail_open(monkeypatch):
+    monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_ENABLED", "true")
+    monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN", "true")
+    completions = FakeCompletions(error=TimeoutError("provider timeout"))
+
+    decision = evidence_sufficiency.check_evidence_sufficiency(
+        "2025年全年营业收入是多少？",
+        chunks(),
+        client=fake_client(completions),
+    )
+
+    assert decision.sufficient is True
+    assert decision.source == "fallback"
+    assert decision.missing_requirements == []
 
 
 @pytest.mark.unit

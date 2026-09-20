@@ -12,6 +12,16 @@ from service.core import chat
 
 
 @pytest.mark.unit
+def test_generate_session_name_uses_first_question_without_model_call():
+    assert (
+        chat.generate_session_name("  今天杭州天气怎么样？\n请简短回答  ")
+        == "今天杭州天气怎么样？ 请简短回答"
+    )
+    assert chat.generate_session_name("问题" * 20) == ("问题" * 15)
+    assert chat.generate_session_name("   ") == "新对话"
+
+
+@pytest.mark.unit
 def test_chat_builds_two_model_orchestrator_with_rag_and_web_tools(monkeypatch):
     captured = {}
 
@@ -311,3 +321,56 @@ def test_chat_uses_agent_evidence_in_stream_and_persistence(monkeypatch):
     assert saved["orchestrator_user_id"] == 42
     assert saved["orchestrator_args"]["conversation_history"] == history
     assert saved["orchestrator_args"]["question"] == "差旅如何审批？"
+
+
+@pytest.mark.unit
+def test_chat_streams_and_persists_direct_refusal(monkeypatch):
+    saved = {}
+    execution = AgentExecution(
+        planning=AgentRun(steps=1, stop_reason="completed"),
+        retrieved_content=[],
+        response_documents=[],
+        answer_messages=[],
+        answer_stream=None,
+        direct_answer="当前资料不足以可靠回答这个问题。",
+        response_mode="refuse",
+        evidence_sufficiency={"sufficient": False, "source": "model"},
+    )
+
+    class FakeOrchestrator:
+        def run(self, **_kwargs):
+            return execution
+
+    monkeypatch.setattr(chat, "load_conversation_history", lambda *_args: [])
+    monkeypatch.setattr(chat, "get_quick_parse_content", lambda *_args: None)
+    monkeypatch.setattr(
+        chat,
+        "_create_agent_orchestrator",
+        lambda *_args: FakeOrchestrator(),
+    )
+    monkeypatch.setattr(
+        chat,
+        "_generate_recommended_questions_safely",
+        lambda *_args: pytest.fail("CLI 模式不应生成推荐问题"),
+    )
+    monkeypatch.setattr(
+        chat,
+        "write_chat_to_db",
+        lambda *args: saved.update({"write_args": args}),
+    )
+    monkeypatch.setattr(chat, "update_session_name", lambda *_args: None)
+
+    events = list(
+        chat.get_chat_completion(
+            "session-1",
+            "未知资料是什么？",
+            user_id=42,
+            include_recommended_questions=False,
+        )
+    )
+
+    assert any('"response_mode": "refuse"' in event for event in events)
+    assert any("当前资料不足" in event for event in events)
+    assert not any("recommended_questions" in event for event in events)
+    assert saved["write_args"][2] == "当前资料不足以可靠回答这个问题。"
+    assert saved["write_args"][4] == []

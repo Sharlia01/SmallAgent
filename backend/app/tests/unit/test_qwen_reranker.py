@@ -3,6 +3,7 @@ from unittest.mock import Mock
 
 import numpy as np
 import pytest
+import torch
 
 from service.core.rag.nlp import model as reranker
 
@@ -10,52 +11,55 @@ from service.core.rag.nlp import model as reranker
 pytestmark = pytest.mark.unit
 
 
-def _response(results, *, status_code=200):
-    return SimpleNamespace(
-        status_code=status_code,
-        output=SimpleNamespace(results=results),
-        code=None,
-        message=None,
+def test_rerank_uses_local_bge_in_batches_and_preserves_input_order(monkeypatch):
+    tokenizer = Mock(side_effect=[
+        {"input_ids": torch.tensor([[1], [2]])},
+        {"input_ids": torch.tensor([[3]])},
+    ])
+    model = Mock(side_effect=[
+        SimpleNamespace(logits=torch.tensor([[0.42], [0.91]])),
+        SimpleNamespace(logits=torch.tensor([[-0.25]])),
+    ])
+    monkeypatch.setattr(
+        reranker,
+        "get_reranker_model",
+        lambda: (tokenizer, model, "cpu"),
     )
-
-
-def test_rerank_uses_qwen_and_restores_input_order(monkeypatch):
-    call = Mock(
-        return_value=_response(
-            [
-                SimpleNamespace(index=1, relevance_score=0.91),
-                SimpleNamespace(index=0, relevance_score=0.42),
-            ]
-        )
-    )
-    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
-    monkeypatch.setattr(reranker.dashscope.TextReRank, "call", call)
+    monkeypatch.setenv("RERANKER_MAX_LENGTH", "512")
 
     scores, metadata = reranker.rerank_similarity(
         "原始问题",
-        iter(["候选片段一", "候选片段二"]),
+        iter(["候选片段一", "候选片段二", "候选片段三"]),
+        batch_size=2,
     )
 
-    np.testing.assert_allclose(scores, [0.42, 0.91])
+    np.testing.assert_allclose(scores, [0.42, 0.91, -0.25])
     assert metadata is None
-    call.assert_called_once_with(
-        model="qwen3.7-text-rerank",
-        top_n=2,
-        query="原始问题",
-        documents=["候选片段一", "候选片段二"],
-        api_key="test-key",
-    )
+    assert tokenizer.call_args_list[0].args[0] == [
+        ["原始问题", "候选片段一"],
+        ["原始问题", "候选片段二"],
+    ]
+    assert tokenizer.call_args_list[0].kwargs == {
+        "padding": True,
+        "truncation": True,
+        "return_tensors": "pt",
+        "max_length": 512,
+    }
+    assert tokenizer.call_args_list[1].args[0] == [
+        ["原始问题", "候选片段三"],
+    ]
+    assert model.call_count == 2
 
 
-def test_empty_candidates_do_not_call_dashscope(monkeypatch):
-    call = Mock(side_effect=AssertionError("must not call DashScope"))
-    monkeypatch.setattr(reranker.dashscope.TextReRank, "call", call)
+def test_empty_candidates_do_not_load_local_model(monkeypatch):
+    load_model = Mock(side_effect=AssertionError("must not load model"))
+    monkeypatch.setattr(reranker, "get_reranker_model", load_model)
 
     scores, metadata = reranker.rerank_similarity("问题", [])
 
     assert scores.shape == (0,)
     assert metadata is None
-    call.assert_not_called()
+    load_model.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -67,63 +71,55 @@ def test_invalid_inputs_are_rejected(query, texts):
         reranker.rerank_similarity(query, texts)
 
 
-def test_missing_api_key_is_reported(monkeypatch):
-    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
-
-    with pytest.raises(RuntimeError, match="DASHSCOPE_API_KEY"):
-        reranker.rerank_similarity("问题", ["片段"])
-
-
-def test_provider_error_is_reported(monkeypatch):
-    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+def test_invalid_batch_size_is_rejected(monkeypatch):
     monkeypatch.setattr(
-        reranker.dashscope.TextReRank,
-        "call",
-        Mock(side_effect=TimeoutError("provider timeout")),
+        reranker,
+        "get_reranker_model",
+        Mock(side_effect=AssertionError("must validate first")),
     )
 
-    with pytest.raises(RuntimeError, match="qwen3.7-text-rerank request failed"):
-        reranker.rerank_similarity("问题", ["片段"])
+    with pytest.raises(ValueError, match="batch_size"):
+        reranker.rerank_similarity("问题", ["片段"], batch_size=0)
 
 
-def test_unsuccessful_response_is_reported(monkeypatch):
-    response = _response([], status_code=500)
-    response.code = "InternalError"
-    response.message = "failed"
-    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+def test_missing_local_model_is_reported(monkeypatch, tmp_path):
+    missing = tmp_path / "missing-reranker"
+    monkeypatch.setenv("RERANKER_MODEL_PATH", str(missing))
+    reranker.get_reranker_model.cache_clear()
+
+    with pytest.raises(RuntimeError, match="does not exist"):
+        reranker.get_reranker_model()
+
+    reranker.get_reranker_model.cache_clear()
+
+
+def test_local_inference_error_is_reported(monkeypatch):
+    tokenizer = Mock(side_effect=RuntimeError("tokenization failed"))
     monkeypatch.setattr(
-        reranker.dashscope.TextReRank,
-        "call",
-        Mock(return_value=response),
+        reranker,
+        "get_reranker_model",
+        lambda: (tokenizer, Mock(), "cpu"),
     )
 
-    with pytest.raises(RuntimeError, match="returned 500"):
+    with pytest.raises(RuntimeError, match="Local BAAI/bge-reranker-v2-m3"):
         reranker.rerank_similarity("问题", ["片段"])
 
 
 @pytest.mark.parametrize(
-    "results,error",
+    "logits,error",
     [
-        ([SimpleNamespace(index=2, relevance_score=0.5)], "invalid result index"),
-        (
-            [
-                SimpleNamespace(index=0, relevance_score=0.5),
-                SimpleNamespace(index=0, relevance_score=0.4),
-            ],
-            "duplicate result index",
-        ),
-        ([SimpleNamespace(index=0, relevance_score="bad")], "invalid relevance score"),
-        ([SimpleNamespace(index=0, relevance_score=np.nan)], "did not score every"),
-        ([], "did not score every"),
+        (torch.tensor([[float("nan")], [0.1]]), "non-finite"),
+        (torch.tensor([[0.2]]), "1 scores for 2 candidates"),
     ],
 )
-def test_invalid_rerank_results_are_rejected(monkeypatch, results, error):
-    monkeypatch.setenv("DASHSCOPE_API_KEY", "test-key")
+def test_invalid_local_scores_are_rejected(monkeypatch, logits, error):
+    tokenizer = Mock(return_value={"input_ids": torch.tensor([[1], [2]])})
+    model = Mock(return_value=SimpleNamespace(logits=logits))
     monkeypatch.setattr(
-        reranker.dashscope.TextReRank,
-        "call",
-        Mock(return_value=_response(results)),
+        reranker,
+        "get_reranker_model",
+        lambda: (tokenizer, model, "cpu"),
     )
 
     with pytest.raises(RuntimeError, match=error):
-        reranker.rerank_similarity("问题", ["片段"])
+        reranker.rerank_similarity("问题", ["片段一", "片段二"])

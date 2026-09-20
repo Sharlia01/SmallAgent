@@ -113,7 +113,7 @@ def test_retrieve_raw_results_reuses_production_options(monkeypatch):
     assert options.candidate_size == 100
     assert options.rerank_candidate_size == 20
     assert options.rrf_k == 60
-    assert options.final_reranker_weight == pytest.approx(0.7)
+    assert options.final_reranker_weight == pytest.approx(0.4)
     assert options.final_rrf_k == 10
     assert result["query_rewrite"] == {
         "original": "测试问题",
@@ -756,8 +756,8 @@ def test_rerank_preserves_semantic_order_without_constraints(monkeypatch):
     assert chunk_two_ranking["final_fusion_score"] == pytest.approx(1 / 11)
     assert chunk_two_ranking["final_fusion_contributions"] == pytest.approx(
         {
-            "semantic_reranker": 0.7 / 11,
-            "retrieval_rrf": 0.3 / 11,
+            "semantic_reranker": 0.4 / 11,
+            "retrieval_rrf": 0.6 / 11,
         }
     )
 
@@ -990,8 +990,8 @@ def test_retrieval_result_preserves_rrf_and_branch_diagnostics():
             "method": "weighted_rrf",
             "rrf_k": 10,
             "weights": {
-                "semantic_reranker": 0.7,
-                "retrieval_rrf": pytest.approx(0.3),
+                "semantic_reranker": 0.4,
+                "retrieval_rrf": pytest.approx(0.6),
             },
             "constraint_conflicts_first": True,
         },
@@ -1177,11 +1177,10 @@ def test_multi_hop_case_computes_hit_recall_and_mrr():
         match_threshold=0.8,
     )
 
-    assert result["metrics"] == {
-        "hit_at_5": True,
-        "recall_at_5": 1.0,
-        "mrr_at_5": 1.0,
-    }
+    assert result["metrics"]["hit_at_5"] is True
+    assert result["metrics"]["recall_at_5"] == 1.0
+    assert result["metrics"]["precision_at_5"] == 0.4
+    assert result["metrics"]["mrr_at_5"] == 1.0
     assert result["matched_evidence_count"] == 2
     assert result["first_relevant_rank"] == 1
     assert [match["matched_rank"] for match in result["evidence_matches"]] == [2, 1]
@@ -1305,6 +1304,8 @@ def test_multi_chunk_requirement_uses_completion_rank():
     assert result["metrics"]["hit_at_5"] is True
     assert result["metrics"]["recall_at_5"] == 1.0
     assert result["metrics"]["mrr_at_5"] == pytest.approx(0.2)
+    assert result["metrics"]["all_requirements_hit_at_3"] is False
+    assert result["metrics"]["all_requirements_hit_at_5"] is True
     assert result["first_relevant_rank"] == 5
 
 # 用例功能：验证评测器能够按表格标题和完整数据行匹配 HTML 表格证据。
@@ -1424,11 +1425,10 @@ def test_unanswerable_case_is_excluded_from_positive_retrieval_metrics():
         match_threshold=0.8,
     )
 
-    assert result["metrics"] == {
-        "hit_at_5": None,
-        "recall_at_5": None,
-        "mrr_at_5": None,
-    }
+    assert result["metrics"]["hit_at_5"] is None
+    assert result["metrics"]["recall_at_5"] is None
+    assert result["metrics"]["precision_at_5"] is None
+    assert result["metrics"]["mrr_at_5"] is None
     summary = build_summary([result], top_k=5)
     assert summary["overall"]["answerable_query_count"] == 0
     assert summary["overall"]["unanswerable_empty_rate"] == 1.0

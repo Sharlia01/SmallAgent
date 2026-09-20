@@ -176,6 +176,10 @@ async def get_parsed_content(
 @router.post("/chat_on_docs")
 async def chat_on_docs(
     session_id: str = Query(...),
+    include_recommended_questions: bool = Query(
+        True,
+        description="是否在回答后生成推荐问题",
+    ),
     request: ChatRequest = Body(..., description="User message"),
     credentials: JwtAuthorizationCredentials = Security(access_security),
     db: Session = Depends(get_db),
@@ -191,7 +195,12 @@ async def chat_on_docs(
         logger.info("开始运行 Agent 并生成回答...")
         # 返回流式响应
         return StreamingResponse(
-            get_chat_completion(session_id, question, user_id=user_id),
+            get_chat_completion(
+                session_id,
+                question,
+                user_id=user_id,
+                include_recommended_questions=include_recommended_questions,
+            ),
             media_type="text/event-stream"
         )
     

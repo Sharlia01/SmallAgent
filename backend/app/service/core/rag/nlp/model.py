@@ -3,7 +3,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import List
 
-import dashscope
 import numpy as np
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -16,7 +15,11 @@ DEFAULT_EMBEDDING_DEVICE = "cpu"
 DEFAULT_EMBEDDING_BATCH_SIZE = 32
 EMBEDDING_DIMENSION = 512
 EMBEDDING_VECTOR_FIELD = f"q_{EMBEDDING_DIMENSION}_vec"
-RERANKER_MODEL = "qwen3.7-text-rerank"
+RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
+DEFAULT_RERANKER_MODEL_PATH = "/models/bge-reranker-v2-m3"
+DEFAULT_RERANKER_DEVICE = "cpu"
+DEFAULT_RERANKER_BATCH_SIZE = 8
+DEFAULT_RERANKER_MAX_LENGTH = 1024
 
 
 def _positive_int_environment(name: str, default: int) -> int:
@@ -62,6 +65,47 @@ def get_embedding_model():
         ) from error
 
 
+@lru_cache(maxsize=1)
+def get_reranker_model():
+    """Load the local cross-encoder reranker once per API process."""
+    model_path = Path(
+        os.getenv("RERANKER_MODEL_PATH", DEFAULT_RERANKER_MODEL_PATH)
+    ).expanduser()
+    if not model_path.is_dir():
+        raise RuntimeError(
+            "Local reranker model directory does not exist: "
+            f"{model_path}. Check RERANKER_MODEL_HOST_PATH and the Docker volume."
+        )
+
+    try:
+        from transformers import (
+            AutoModelForSequenceClassification,
+            AutoTokenizer,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "transformers is required for local BGE reranking"
+        ) from error
+
+    device = os.getenv("RERANKER_DEVICE", DEFAULT_RERANKER_DEVICE)
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            str(model_path),
+            local_files_only=True,
+        )
+        model = AutoModelForSequenceClassification.from_pretrained(
+            str(model_path),
+            local_files_only=True,
+        )
+        model.to(device)
+        model.eval()
+    except Exception as error:
+        raise RuntimeError(
+            f"Failed to load local reranker model from {model_path}: {error}"
+        ) from error
+    return tokenizer, model, device
+
+
 def get_chat_completion_block(session_id, question, references):
     """
     结合知识库内容生成回答，并在回答中标注引用来源。
@@ -95,14 +139,8 @@ def get_chat_completion_block(session_id, question, references):
     except Exception as e:
         return f"Error: {str(e)}"
 
-def _rerank_result_field(result, name):
-    if isinstance(result, dict):
-        return result.get(name)
-    return getattr(result, name, None)
-
-
-def rerank_similarity(query, texts):
-    """Rerank candidates with DashScope and preserve their input order."""
+def rerank_similarity(query, texts, *, batch_size: int | None = None):
+    """Score query-document pairs with the local BGE cross-encoder."""
     if not isinstance(query, str):
         raise TypeError("query must be a string")
     if isinstance(texts, str):
@@ -113,65 +151,65 @@ def rerank_similarity(query, texts):
     if not texts:
         return np.array([], dtype=float), None
 
-    api_key = os.getenv("DASHSCOPE_API_KEY")
-    if not api_key:
-        raise RuntimeError("DASHSCOPE_API_KEY is required for reranking")
-
-    native_base_url = os.getenv("DASHSCOPE_NATIVE_BASE_URL")
-    if native_base_url:
-        dashscope.base_http_api_url = native_base_url.rstrip("/")
-
-    try:
-        response = dashscope.TextReRank.call(
-            model=RERANKER_MODEL,
-            top_n=len(texts),
-            query=query,
-            documents=texts,
-            api_key=api_key,
+    resolved_batch_size = (
+        _positive_int_environment(
+            "RERANKER_BATCH_SIZE",
+            DEFAULT_RERANKER_BATCH_SIZE,
         )
+        if batch_size is None
+        else batch_size
+    )
+    if resolved_batch_size <= 0:
+        raise ValueError("batch_size must be greater than zero")
+    max_length = _positive_int_environment(
+        "RERANKER_MAX_LENGTH",
+        DEFAULT_RERANKER_MAX_LENGTH,
+    )
+
+    tokenizer, model, device = get_reranker_model()
+    try:
+        import torch
+    except ImportError as error:
+        raise RuntimeError("torch is required for local BGE reranking") from error
+
+    score_batches = []
+    try:
+        for start in range(0, len(texts), resolved_batch_size):
+            text_batch = texts[start:start + resolved_batch_size]
+            pairs = [[query, text] for text in text_batch]
+            inputs = tokenizer(
+                pairs,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+                max_length=max_length,
+            )
+            inputs = {
+                name: tensor.to(device)
+                for name, tensor in inputs.items()
+            }
+            with torch.no_grad():
+                logits = model(
+                    **inputs,
+                    return_dict=True,
+                ).logits.reshape(-1)
+            score_batches.append(
+                logits.detach().float().cpu().numpy()
+            )
     except Exception as error:
         raise RuntimeError(
-            f"DashScope {RERANKER_MODEL} request failed: {error}"
+            f"Local {RERANKER_MODEL} inference failed: {error}"
         ) from error
 
-    status_code = getattr(response, "status_code", None)
-    if status_code is not None and int(status_code) >= 400:
-        code = getattr(response, "code", "unknown")
-        message = getattr(response, "message", "unknown error")
+    scores = np.concatenate(score_batches).astype(float, copy=False)
+    if scores.shape != (len(texts),):
         raise RuntimeError(
-            f"DashScope {RERANKER_MODEL} returned {status_code}: "
-            f"{code}: {message}"
+            f"Local {RERANKER_MODEL} returned {scores.shape[0]} scores for "
+            f"{len(texts)} candidates"
         )
-
-    output = getattr(response, "output", None)
-    results = _rerank_result_field(output, "results")
-    if results is None:
-        raise RuntimeError(
-            f"DashScope {RERANKER_MODEL} response has no rerank results"
-        )
-
-    scores = np.full(len(texts), np.nan, dtype=float)
-    for result in results:
-        index = _rerank_result_field(result, "index")
-        relevance_score = _rerank_result_field(result, "relevance_score")
-        if not isinstance(index, (int, np.integer)) or not 0 <= index < len(texts):
-            raise RuntimeError(
-                f"DashScope {RERANKER_MODEL} returned an invalid result index"
-            )
-        if not np.isnan(scores[index]):
-            raise RuntimeError(
-                f"DashScope {RERANKER_MODEL} returned a duplicate result index"
-            )
-        try:
-            scores[index] = float(relevance_score)
-        except (TypeError, ValueError) as error:
-            raise RuntimeError(
-                f"DashScope {RERANKER_MODEL} returned an invalid relevance score"
-            ) from error
-
     if not np.isfinite(scores).all():
         raise RuntimeError(
-            f"DashScope {RERANKER_MODEL} did not score every candidate"
+            f"Local {RERANKER_MODEL} returned non-finite scores"
         )
     return scores, None
 

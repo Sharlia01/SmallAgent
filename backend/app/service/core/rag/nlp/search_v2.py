@@ -176,7 +176,7 @@ class Dealer:
         candidate_size: int = 100  # 每一路独立召回的候选数量
         rerank_candidate_size: int = 20  # RRF 后进入语义重排的数量
         rrf_k: int = 60  # RRF 排名平滑常数
-        final_reranker_weight: float = 0.7  # 二阶段融合中的重排模型权重
+        final_reranker_weight: float = 0.4  # 二阶段融合中的重排模型权重
         final_rrf_k: int = 10  # 二阶段 RRF 平滑常数
         highlight: bool = False  # 是否返回高亮内容
         doc_ids: list[str] | None = None #用于限定只搜索哪些文档
@@ -839,6 +839,7 @@ class Dealer:
             "semantic_reranker": reranker_weight,
             "retrieval_rrf": 1.0 - reranker_weight,
         }
+        # 这里使用了二阶段融合的方式，将语义重排的结果和第一阶段 RRF 的结果进行融合，得到最终的排序结果。
         final_fusion = reciprocal_rank_fusion(
             {
                 "semantic_reranker": semantic_ids,

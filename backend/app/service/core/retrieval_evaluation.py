@@ -9,8 +9,31 @@ from html.parser import HTMLParser
 from collections import Counter, defaultdict
 from typing import Any, Iterable
 
+from service.core.evidence_metadata import evidence_metadata
 
-RESULT_SCHEMA_VERSION = "2.0"
+
+RESULT_SCHEMA_VERSION = "2.1"
+DEFAULT_METRIC_KS = (1, 3, 5, 10)
+
+
+def resolve_metric_ks(
+    top_k: int,
+    metric_ks: Iterable[int] | None = None,
+) -> tuple[int, ...]:
+    """Return useful metric cutoffs that can be scored from Top K results."""
+    if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
+        raise ValueError("top_k must be a positive integer")
+
+    requested = DEFAULT_METRIC_KS if metric_ks is None else tuple(metric_ks)
+    cutoffs = {
+        cutoff
+        for cutoff in requested
+        if isinstance(cutoff, int)
+        and not isinstance(cutoff, bool)
+        and 0 < cutoff <= top_k
+    }
+    cutoffs.add(top_k)
+    return tuple(sorted(cutoffs))
 
 
 def normalize_text(text: Any) -> str:
@@ -426,6 +449,7 @@ def serialize_retrieved_chunk(
     """Keep ranking diagnostics while omitting the large embedding vector."""
     return {
         "rank": rank,
+        **evidence_metadata(chunk),
         "chunk_id": str(chunk.get("chunk_id", "")),
         "document_id": str(chunk.get("doc_id", "")),
         "document_name": normalize_document_name(_chunk_document_name(chunk)),
@@ -473,6 +497,65 @@ def get_source_modality(sample: dict[str, Any]) -> str:
     return "text" if sample.get("answerable") else "none"
 
 
+def _iter_gold_matchers(sample: dict[str, Any]):
+    requirements = sample.get("evidence_requirements") or []
+    if requirements:
+        for requirement in requirements:
+            for alternative in requirement.get("alternatives") or []:
+                for atom in alternative:
+                    match_type = atom.get("type", "text")
+                    if match_type == "text":
+                        yield evidence_chunk_match_score, atom
+                    elif match_type == "table_row":
+                        yield table_row_chunk_match_score, atom
+                    else:
+                        raise ValueError(
+                            f"Unsupported evidence match type: {match_type}"
+                        )
+        return
+
+    for evidence in sample.get("relevant_evidence") or []:
+        yield relevant_evidence_chunk_match_score, evidence
+
+
+def _relevant_chunk_count(
+    sample: dict[str, Any],
+    chunks: list[dict[str, Any]],
+    match_threshold: float,
+) -> int:
+    matchers = list(_iter_gold_matchers(sample))
+    return sum(
+        any(
+            score_function(evidence, chunk) >= match_threshold
+            for score_function, evidence in matchers
+        )
+        for chunk in chunks
+    )
+
+
+def _chunk_fingerprint(chunk: dict[str, Any], rank: int) -> tuple[str, ...]:
+    document_name = normalize_document_name(_chunk_document_name(chunk))
+    content = normalize_text(_chunk_content(chunk))
+    if content:
+        return ("content", document_name, content)
+
+    chunk_id = str(chunk.get("chunk_id") or "").strip()
+    if chunk_id:
+        return ("chunk_id", chunk_id)
+    return ("rank", str(rank))
+
+
+def _exact_duplicate_rate(chunks: list[dict[str, Any]]) -> float | None:
+    """Return exact normalized duplicate share; empty result sets are unknown."""
+    if not chunks:
+        return None
+    fingerprints = {
+        _chunk_fingerprint(chunk, rank)
+        for rank, chunk in enumerate(chunks, start=1)
+    }
+    return round((len(chunks) - len(fingerprints)) / len(chunks), 6)
+
+
 def _evaluate_chunks(
     sample: dict[str, Any],
     raw_chunks: list[dict[str, Any]],
@@ -483,6 +566,8 @@ def _evaluate_chunks(
     """Score either retrieval stage using exactly the same evidence rules."""
     evidence_requirements = sample.get("evidence_requirements") or []
 
+    # 先确定“标准答案”长什么样子，然后再去看检索结果里有没有匹配的。
+    # 多证据题的覆盖要求；所有 requirement 都满足，Hit 才算成功
     if evidence_requirements:
         evidence_matches = [
             evaluate_evidence_requirement(
@@ -493,6 +578,7 @@ def _evaluate_chunks(
             for requirement in evidence_requirements
         ]
     else:
+        # 对于每一条relevant_evidence，检查检索结果里有没有匹配的chunk。
         evidence_matches = []
         for evidence_index, evidence in enumerate(
             sample.get("relevant_evidence") or [],
@@ -506,21 +592,25 @@ def _evaluate_chunks(
                 )
                 for rank, chunk in enumerate(raw_chunks, start=1)
             ]
+            # 检索片段里得分超过阈值的片段
             passing_matches = [
                 item for item in scored_chunks
                 if item[1] >= match_threshold
             ]
+            # 排名最前的匹配片段（如果有的话）
             first_match = min(
                 passing_matches,
                 default=None,
                 key=lambda item: item[0],
             )
+            # 所有检索片段里得分最高的片段的分数
             best_score = max(
                 (item[1] for item in scored_chunks),
                 default=0.0,
             )
             matched_rank = first_match[0] if first_match else None
 
+            # 记录每条evidence的匹配结果，包括是否匹配、匹配的排名、匹配的chunk_id，以及最佳匹配分数。
             evidence_matches.append(
                 {
                     "evidence_index": evidence_index,
@@ -551,6 +641,7 @@ def _evaluate_chunks(
     ]
 
     if evidence_requirements:
+        # 对于requirements，只有当所有requirements都匹配时，才算满足要求。
         all_requirements_matched = (
             bool(evidence_matches)
             and all(evidence["matched"] for evidence in evidence_matches)
@@ -568,6 +659,11 @@ def _evaluate_chunks(
         )
 
     metric_suffix = str(top_k)
+    relevant_chunk_count = _relevant_chunk_count(
+        sample,
+        raw_chunks,
+        match_threshold,
+    )
 
     metrics = {
         f"hit_at_{metric_suffix}": (
@@ -578,11 +674,20 @@ def _evaluate_chunks(
             if answerable and gold_evidence_count
             else None
         ),
+        f"precision_at_{metric_suffix}": (
+            relevant_chunk_count / top_k if answerable else None
+        ),
         f"mrr_at_{metric_suffix}": (
             1.0 / first_relevant_rank
             if answerable and first_relevant_rank
             else (0.0 if answerable else None)
         ),
+        f"all_requirements_hit_at_{metric_suffix}": (
+            bool(first_relevant_rank)
+            if answerable and evidence_requirements
+            else None
+        ),
+        f"duplicate_rate_at_{metric_suffix}": _exact_duplicate_rate(raw_chunks),
     }
 
     return {
@@ -594,12 +699,45 @@ def _evaluate_chunks(
     }
 
 
-def _unavailable_metrics(top_k: int) -> dict[str, None]:
-    return {
-        f"hit_at_{top_k}": None,
-        f"recall_at_{top_k}": None,
-        f"mrr_at_{top_k}": None,
+def _evaluate_ranked_chunks(
+    sample: dict[str, Any],
+    raw_chunks: list[dict[str, Any]],
+    *,
+    top_k: int,
+    metric_ks: Iterable[int],
+    match_threshold: float,
+) -> dict[str, Any]:
+    evaluations = {
+        cutoff: _evaluate_chunks(
+            sample,
+            raw_chunks[:cutoff],
+            top_k=cutoff,
+            match_threshold=match_threshold,
+        )
+        for cutoff in metric_ks
     }
+    top_k_result = evaluations[top_k]
+    metrics = {}
+    for cutoff in metric_ks:
+        metrics.update(evaluations[cutoff]["metrics"])
+    return {**top_k_result, "metrics": metrics}
+
+
+def _unavailable_metrics(
+    top_k: int,
+    metric_ks: Iterable[int] | None = None,
+) -> dict[str, None]:
+    metrics = {}
+    for cutoff in resolve_metric_ks(top_k, metric_ks):
+        metrics.update({
+            f"hit_at_{cutoff}": None,
+            f"recall_at_{cutoff}": None,
+            f"precision_at_{cutoff}": None,
+            f"mrr_at_{cutoff}": None,
+            f"all_requirements_hit_at_{cutoff}": None,
+            f"duplicate_rate_at_{cutoff}": None,
+        })
+    return metrics
 
 
 def _gate_metrics(decision: dict[str, Any]) -> dict[str, Any]:
@@ -627,15 +765,21 @@ def evaluate_retrieval_case(
     latency_ms: float,
     top_k: int,
     match_threshold: float,
+    metric_ks: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     """Evaluate retrieval, gate decisions and delivered evidence separately."""
+    resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
     raw_chunks = list(raw_result.get("chunks") or [])[:top_k]
     serialized_chunks = [
         serialize_retrieved_chunk(chunk, rank)
         for rank, chunk in enumerate(raw_chunks, start=1)
     ]
-    post_gate = _evaluate_chunks(
-        sample, raw_chunks, top_k=top_k, match_threshold=match_threshold,
+    post_gate = _evaluate_ranked_chunks(
+        sample,
+        raw_chunks,
+        top_k=top_k,
+        metric_ks=resolved_metric_ks,
+        match_threshold=match_threshold,
     )
     # Missing historical snapshots are unknown, not an empty retrieval.
     before_chunks = raw_result.get("chunks_before_sufficiency")
@@ -643,8 +787,12 @@ def evaluate_retrieval_case(
     serialized_before = None
     if before_chunks is not None:
         before_chunks = list(before_chunks)[:top_k]
-        before = _evaluate_chunks(
-            sample, before_chunks, top_k=top_k, match_threshold=match_threshold,
+        before = _evaluate_ranked_chunks(
+            sample,
+            before_chunks,
+            top_k=top_k,
+            metric_ks=resolved_metric_ks,
+            match_threshold=match_threshold,
         )
         serialized_before = [
             serialize_retrieved_chunk(chunk, rank)
@@ -657,11 +805,15 @@ def evaluate_retrieval_case(
         "question": sample.get("question"),
         "reference_answer": sample.get("reference_answer"),
         "question_type": sample.get("question_type"),
+        "split": str(
+            (sample.get("metadata") or {}).get("split") or "unknown"
+        ),
         "source_modality": get_source_modality(sample),
         "answerable": bool(sample.get("answerable")),
         "error": None,
         "latency_ms": round(float(latency_ms), 3),
         "retrieval": {
+            "metric_ks": list(resolved_metric_ks),
             "total_candidates": int(raw_result.get("total") or 0),
             "retrieved_count": len(serialized_chunks),
             "empty": not serialized_chunks,
@@ -698,7 +850,9 @@ def evaluate_retrieval_case(
         # Existing fields retain their post-gate meaning for old consumers.
         **post_gate,
         "retrieval_metrics": (
-            before["metrics"] if before is not None else _unavailable_metrics(top_k)
+            before["metrics"]
+            if before is not None
+            else _unavailable_metrics(top_k, resolved_metric_ks)
         ),
         "evidence_matches_before_sufficiency": (
             before["evidence_matches"] if before is not None else None
@@ -714,19 +868,25 @@ def build_error_case(
     error: Exception,
     latency_ms: float,
     top_k: int,
+    metric_ks: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     """Record one failed query without losing the rest of the evaluation run."""
+    resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
     return {
         "result_schema_version": RESULT_SCHEMA_VERSION,
         "id": sample.get("id"),
         "question": sample.get("question"),
         "reference_answer": sample.get("reference_answer"),
         "question_type": sample.get("question_type"),
+        "split": str(
+            (sample.get("metadata") or {}).get("split") or "unknown"
+        ),
         "source_modality": get_source_modality(sample),
         "answerable": bool(sample.get("answerable")),
         "error": f"{type(error).__name__}: {error}",
         "latency_ms": round(float(latency_ms), 3),
         "retrieval": {
+            "metric_ks": list(resolved_metric_ks),
             "total_candidates": 0,
             "retrieved_count": 0,
             "empty": True,
@@ -739,9 +899,9 @@ def build_error_case(
         "matched_evidence_count": 0,
         "first_relevant_rank": None,
         "evidence_matches": [],
-        "metrics": _unavailable_metrics(top_k),
-        "retrieval_metrics": _unavailable_metrics(top_k),
-        "post_gate_metrics": _unavailable_metrics(top_k),
+        "metrics": _unavailable_metrics(top_k, resolved_metric_ks),
+        "retrieval_metrics": _unavailable_metrics(top_k, resolved_metric_ks),
+        "post_gate_metrics": _unavailable_metrics(top_k, resolved_metric_ks),
         "gate_metrics": _gate_metrics({}),
         "evidence_matches_before_sufficiency": None,
     }
@@ -754,12 +914,37 @@ def _mean(values: Iterable[float]) -> float | None:
     return round(sum(values) / len(values), 6)
 
 
+def _rate(numerator: int, denominator: int) -> float | None:
+    if not denominator:
+        return None
+    return round(numerator / denominator, 6)
+
+
+def _percentile(values: Iterable[float], quantile: float) -> float | None:
+    ordered = sorted(values)
+    if not ordered:
+        return None
+    position = (len(ordered) - 1) * quantile
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    if lower_index == upper_index:
+        return round(ordered[lower_index], 6)
+    fraction = position - lower_index
+    return round(
+        ordered[lower_index]
+        + (ordered[upper_index] - ordered[lower_index]) * fraction,
+        6,
+    )
+
+
 def _aggregate_stage_metrics(
     results: list[dict[str, Any]],
     *,
     top_k: int,
     before_sufficiency: bool,
+    metric_ks: Iterable[int] | None = None,
 ) -> dict[str, Any]:
+    resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
     successful = [result for result in results if not result.get("error")]
     empty_key = "empty_before_sufficiency" if before_sufficiency else "empty"
     metrics_key = "retrieval_metrics" if before_sufficiency else "metrics"
@@ -770,11 +955,13 @@ def _aggregate_stage_metrics(
     ]
     answerable = [result for result in available if result.get("answerable")]
     unanswerable = [result for result in available if not result.get("answerable")]
-    return {
+    error_count = len(results) - len(successful)
+    aggregated = {
         "query_count": len(results),
         "evaluated_query_count": len(available),
         "unavailable_query_count": len(successful) - len(available),
-        "error_count": len(results) - len(successful),
+        "error_count": error_count,
+        "error_rate": _rate(error_count, len(results)),
         "answerable_query_count": len(answerable),
         "unanswerable_query_count": len(unanswerable),
         "empty_rate": _mean(float(r["retrieval"][empty_key]) for r in available),
@@ -784,14 +971,29 @@ def _aggregate_stage_metrics(
         "unanswerable_empty_rate": _mean(
             float(r["retrieval"][empty_key]) for r in unanswerable
         ),
-        **{
-            key: _mean(
-                float(result[metrics_key][key]) for result in answerable
+    }
+    for cutoff in resolved_metric_ks:
+        for metric_name in (
+            "hit",
+            "recall",
+            "precision",
+            "mrr",
+            "all_requirements_hit",
+        ):
+            key = f"{metric_name}_at_{cutoff}"
+            aggregated[key] = _mean(
+                float(result[metrics_key][key])
+                for result in answerable
                 if result[metrics_key].get(key) is not None
             )
-            for key in (f"hit_at_{top_k}", f"recall_at_{top_k}", f"mrr_at_{top_k}")
-        },
-    }
+
+        duplicate_key = f"duplicate_rate_at_{cutoff}"
+        aggregated[duplicate_key] = _mean(
+            float(result[metrics_key][duplicate_key])
+            for result in available
+            if result[metrics_key].get(duplicate_key) is not None
+        )
+    return aggregated
 
 
 def _aggregate_gate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
@@ -807,12 +1009,14 @@ def _aggregate_gate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     disabled_count = sum(gate["enabled"] is False for _, gate in decisions)
     answerable = [gate for r, gate in available if r.get("answerable")]
     unanswerable = [gate for r, gate in available if not r.get("answerable")]
+    error_count = len(results) - len(successful)
     return {
         "query_count": len(results),
         "decision_query_count": len(available),
         "disabled_query_count": disabled_count,
         "unavailable_query_count": len(successful) - len(available) - disabled_count,
-        "error_count": len(results) - len(successful),
+        "error_count": error_count,
+        "error_rate": _rate(error_count, len(results)),
         "answerable_decision_count": len(answerable),
         "unanswerable_decision_count": len(unanswerable),
         "rejected_query_count": sum(gate["rejected"] for _, gate in available),
@@ -834,8 +1038,10 @@ def aggregate_results(
     results: list[dict[str, Any]],
     *,
     top_k: int,
+    metric_ks: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     """Keep legacy metrics and add separate stage metrics for one slice."""
+    resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
     successful = [result for result in results if not result.get("error")]
     answerable = [result for result in successful if result.get("answerable")]
     unanswerable = [
@@ -849,11 +1055,14 @@ def aggregate_results(
     hit_key = f"hit_at_{top_k}"
     recall_key = f"recall_at_{top_k}"
     mrr_key = f"mrr_at_{top_k}"
+    error_count = len(results) - len(successful)
+    latencies = [float(result["latency_ms"]) for result in successful]
 
     return {
         "query_count": len(results),
         "successful_query_count": len(successful),
-        "error_count": len(results) - len(successful),
+        "error_count": error_count,
+        "error_rate": _rate(error_count, len(results)),
         "answerable_query_count": len(answerable),
         "unanswerable_query_count": len(unanswerable),
         "empty_rate": _mean(
@@ -878,9 +1087,10 @@ def aggregate_results(
             )
             for result in sufficiency_checked
         ),
-        "average_latency_ms": _mean(
-            float(result["latency_ms"]) for result in successful
-        ),
+        "latency_sample_count": len(latencies),
+        "average_latency_ms": _mean(latencies),
+        "latency_p50_ms": _percentile(latencies, 0.5),
+        "latency_p95_ms": _percentile(latencies, 0.95),
         hit_key: _mean(
             float(result["metrics"][hit_key]) for result in answerable
         ),
@@ -891,11 +1101,17 @@ def aggregate_results(
             float(result["metrics"][mrr_key]) for result in answerable
         ),
         "retrieval_metrics": _aggregate_stage_metrics(
-            results, top_k=top_k, before_sufficiency=True,
+            results,
+            top_k=top_k,
+            before_sufficiency=True,
+            metric_ks=resolved_metric_ks,
         ),
         "gate_metrics": _aggregate_gate_metrics(results),
         "post_gate_metrics": _aggregate_stage_metrics(
-            results, top_k=top_k, before_sufficiency=False,
+            results,
+            top_k=top_k,
+            before_sufficiency=False,
+            metric_ks=resolved_metric_ks,
         ),
     }
 
@@ -904,10 +1120,13 @@ def build_summary(
     results: list[dict[str, Any]],
     *,
     top_k: int,
+    metric_ks: Iterable[int] | None = None,
 ) -> dict[str, Any]:
     """Build overall and per-slice summaries for a completed run."""
+    resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
     by_question_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_source_modality: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_split: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for result in results:
         by_question_type[str(result.get("question_type") or "unknown")].append(
             result
@@ -915,6 +1134,7 @@ def build_summary(
         by_source_modality[str(result.get("source_modality") or "unknown")].append(
             result
         )
+        by_split[str(result.get("split") or "unknown")].append(result)
 
     return {
         "result_schema_version": RESULT_SCHEMA_VERSION,
@@ -924,13 +1144,42 @@ def build_summary(
         "source_modality_counts": dict(
             sorted(Counter(result["source_modality"] for result in results).items())
         ),
-        "overall": aggregate_results(results, top_k=top_k),
+        "split_counts": dict(
+            sorted(
+                Counter(
+                    str(result.get("split") or "unknown")
+                    for result in results
+                ).items()
+            )
+        ),
+        "metric_ks": list(resolved_metric_ks),
+        "overall": aggregate_results(
+            results,
+            top_k=top_k,
+            metric_ks=resolved_metric_ks,
+        ),
         "by_question_type": {
-            name: aggregate_results(items, top_k=top_k)
+            name: aggregate_results(
+                items,
+                top_k=top_k,
+                metric_ks=resolved_metric_ks,
+            )
             for name, items in sorted(by_question_type.items())
         },
         "by_source_modality": {
-            name: aggregate_results(items, top_k=top_k)
+            name: aggregate_results(
+                items,
+                top_k=top_k,
+                metric_ks=resolved_metric_ks,
+            )
             for name, items in sorted(by_source_modality.items())
+        },
+        "by_split": {
+            name: aggregate_results(
+                items,
+                top_k=top_k,
+                metric_ks=resolved_metric_ks,
+            )
+            for name, items in sorted(by_split.items())
         },
     }

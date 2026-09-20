@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 from service.core.evidence_metadata import evidence_metadata
+from service.core.answer_policy import refusal_from_tool_results
 
 from agent.schemas import ToolResult
 from agent.tools.base import AgentTool
@@ -52,7 +53,10 @@ class AgentExecution:
     retrieved_content: list[dict[str, Any]]
     response_documents: list[dict[str, Any]]
     answer_messages: list[dict[str, str]]
-    answer_stream: Any
+    answer_stream: Any | None
+    direct_answer: str | None = None
+    response_mode: str = "answer"
+    evidence_sufficiency: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)
@@ -673,12 +677,34 @@ class AgentOrchestrator:
             session_context,
         )
         answer_messages = build_answer_messages(question, documents, history)
+
+        refusal = refusal_from_tool_results(planning.tool_results)
+        if not documents and refusal is not None:
+            refusal_text, sufficiency = refusal
+            logger.info(
+                "PERF session_id=%s stage=answer_policy mode=refuse "
+                "source=%s",
+                session_id,
+                sufficiency.get("source") or "rule",
+            )
+            return AgentExecution(
+                planning=planning,
+                retrieved_content=evidence,
+                response_documents=documents,
+                answer_messages=answer_messages,
+                answer_stream=None,
+                direct_answer=refusal_text,
+                response_mode="refuse",
+                evidence_sufficiency=sufficiency,
+            )
+
         answer_request_started_at = time.perf_counter()
         try:
             answer_stream = self._answer_client.chat.completions.create(
                 model=self._answer_model,
                 messages=answer_messages,
                 stream=True,
+                temperature=0,
             )
         except Exception:
             logger.info(

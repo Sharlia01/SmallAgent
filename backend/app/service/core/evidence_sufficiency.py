@@ -226,7 +226,7 @@ def _fallback_decision(
 ) -> EvidenceSufficiencyDecision:
     fail_open = _environment_flag(
         "RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN",
-        True,
+        False,
     )
     return EvidenceSufficiencyDecision(
         sufficient=fail_open,

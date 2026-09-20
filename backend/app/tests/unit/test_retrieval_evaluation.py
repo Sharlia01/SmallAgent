@@ -8,10 +8,17 @@ from service.core.retrieval_evaluation import (
     build_error_case,
     build_summary,
     evaluate_retrieval_case,
+    resolve_metric_ks,
 )
 
 
 pytestmark = pytest.mark.unit
+
+
+def test_metric_cutoffs_cover_recommended_values_without_exceeding_top_k():
+    assert resolve_metric_ks(5) == (1, 3, 5)
+    assert resolve_metric_ks(10) == (1, 3, 5, 10)
+    assert resolve_metric_ks(7) == (1, 3, 5, 7)
 
 
 def sample(*, answerable=True):
@@ -56,13 +63,19 @@ def test_rejected_hit_keeps_pre_gate_ranking_and_serializable_evidence():
         "evidence_sufficiency": {"source": "model", "sufficient": False},
     })
 
-    assert result["result_schema_version"] == "2.0"
-    assert result["retrieval_metrics"] == {
-        "hit_at_5": True, "recall_at_5": 1.0, "mrr_at_5": 0.5,
-    }
-    assert result["post_gate_metrics"] == result["metrics"] == {
-        "hit_at_5": False, "recall_at_5": 0.0, "mrr_at_5": 0.0,
-    }
+    assert result["result_schema_version"] == "2.1"
+    assert result["retrieval"]["metric_ks"] == [1, 3, 5]
+    assert result["retrieval_metrics"]["hit_at_1"] is False
+    assert result["retrieval_metrics"]["hit_at_3"] is True
+    assert result["retrieval_metrics"]["hit_at_5"] is True
+    assert result["retrieval_metrics"]["recall_at_5"] == 1.0
+    assert result["retrieval_metrics"]["precision_at_5"] == 0.2
+    assert result["retrieval_metrics"]["mrr_at_5"] == 0.5
+    assert result["post_gate_metrics"] == result["metrics"]
+    assert result["post_gate_metrics"]["hit_at_5"] is False
+    assert result["post_gate_metrics"]["recall_at_5"] == 0.0
+    assert result["post_gate_metrics"]["precision_at_5"] == 0.0
+    assert result["post_gate_metrics"]["mrr_at_5"] == 0.0
     assert result["gate_metrics"]["rejected"] is True
     saved = result["retrieval"]
     assert saved["retrieved_count_before_sufficiency"] == 2
@@ -90,6 +103,24 @@ def test_top_k_is_applied_before_scoring_both_stages(sufficient):
     assert result["retrieval_metrics"]["hit_at_1"] is False
     assert result["post_gate_metrics"]["hit_at_1"] is False
     assert len(result["retrieval"]["chunks_before_sufficiency"]) == 1
+
+
+def test_precision_and_exact_duplicate_rate_are_reported_at_multiple_cutoffs():
+    duplicate = chunk("duplicate")
+    chunks = [chunk(), duplicate, chunk("noise", "其他业务信息")]
+    result = evaluate({
+        "chunks_before_sufficiency": chunks,
+        "chunks": chunks,
+        "evidence_sufficiency": {"source": "model", "sufficient": True},
+    })
+
+    metrics = result["retrieval_metrics"]
+    assert metrics["precision_at_1"] == 1.0
+    assert metrics["precision_at_3"] == pytest.approx(2 / 3, abs=1e-6)
+    assert metrics["precision_at_5"] == 0.4
+    assert metrics["duplicate_rate_at_1"] == 0.0
+    assert metrics["duplicate_rate_at_3"] == pytest.approx(1 / 3, abs=1e-6)
+    assert metrics["duplicate_rate_at_5"] == pytest.approx(1 / 3, abs=1e-6)
 
 
 @pytest.mark.parametrize("sufficient", [True, False])
@@ -182,7 +213,11 @@ def test_summary_keeps_correct_denominators_and_all_slices():
     )
     summary = build_summary([accepted, rejected, unanswerable, failed], top_k=5)
     overall = summary["overall"]
-    assert summary["result_schema_version"] == "2.0"
+    assert summary["result_schema_version"] == "2.1"
+    assert summary["metric_ks"] == [1, 3, 5]
+    assert overall["error_rate"] == 0.25
+    assert overall["latency_p50_ms"] == 12.0
+    assert overall["latency_p95_ms"] == 12.0
     assert overall["retrieval_metrics"]["hit_at_5"] == 1.0
     assert overall["post_gate_metrics"]["hit_at_5"] == overall["hit_at_5"] == 0.5
     assert overall["retrieval_metrics"]["empty_rate"] == 0.0
@@ -198,6 +233,8 @@ def test_summary_keeps_correct_denominators_and_all_slices():
         assert overall[group]["error_count"] == 1
         assert group in summary["by_question_type"]["fact"]
         assert group in summary["by_source_modality"]["text"]
+        assert group in summary["by_split"]["unknown"]
+    assert summary["split_counts"] == {"unknown": 4}
     assert summary["by_question_type"]["unanswerable"]["retrieval_metrics"]["hit_at_5"] is None
     assert failed["retrieval_metrics"]["hit_at_5"] is None
     assert failed["gate_metrics"]["rejected"] is None
