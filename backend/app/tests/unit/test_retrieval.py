@@ -113,7 +113,7 @@ def test_retrieve_raw_results_reuses_production_options(monkeypatch):
     assert options.candidate_size == 100
     assert options.rerank_candidate_size == 20
     assert options.rrf_k == 60
-    assert options.final_reranker_weight == pytest.approx(0.4)
+    assert options.final_reranker_weight == pytest.approx(0.7)
     assert options.final_rrf_k == 10
     assert result["query_rewrite"] == {
         "original": "测试问题",
@@ -756,8 +756,8 @@ def test_rerank_preserves_semantic_order_without_constraints(monkeypatch):
     assert chunk_two_ranking["final_fusion_score"] == pytest.approx(1 / 11)
     assert chunk_two_ranking["final_fusion_contributions"] == pytest.approx(
         {
-            "semantic_reranker": 0.4 / 11,
-            "retrieval_rrf": 0.6 / 11,
+            "semantic_reranker": 0.7 / 11,
+            "retrieval_rrf": 0.3 / 11,
         }
     )
 
@@ -989,9 +989,9 @@ def test_retrieval_result_preserves_rrf_and_branch_diagnostics():
         "final_fusion": {
             "method": "weighted_rrf",
             "rrf_k": 10,
-            "weights": {
-                "semantic_reranker": 0.4,
-                "retrieval_rrf": pytest.approx(0.6),
+                "weights": {
+                    "semantic_reranker": 0.7,
+                    "retrieval_rrf": pytest.approx(0.3),
             },
             "constraint_conflicts_first": True,
         },

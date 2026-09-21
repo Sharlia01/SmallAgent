@@ -84,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-size", type=int, default=100)
     parser.add_argument("--rerank-candidate-size", type=int, default=20)
     parser.add_argument("--rrf-k", type=int, default=60)
-    parser.add_argument("--final-reranker-weight", type=float, default=0.4)
+    parser.add_argument("--final-reranker-weight", type=float, default=0.7)
     parser.add_argument("--final-rrf-k", type=int, default=10)
     parser.add_argument("--match-threshold", type=float, default=0.8)
     parser.add_argument("--answer-model", default=None)
@@ -447,6 +447,15 @@ def main() -> int:
             "evidence_sufficiency_fail_open": environment_flag(
                 "RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN",
                 False,
+            ),
+            "reranker_backend": os.getenv("RERANKER_BACKEND", "local"),
+            "reranker_score_mode": os.getenv(
+                "RERANKER_SCORE_MODE",
+                "probability",
+            ),
+            "reranker_remote_score_mode": os.getenv(
+                "RERANKER_REMOTE_SCORE_MODE",
+                "raw_logits",
             ),
             "top_k": args.top_k,
             "metric_ks": list(resolve_metric_ks(args.top_k)),

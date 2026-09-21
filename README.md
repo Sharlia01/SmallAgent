@@ -52,8 +52,8 @@ The Agent is responsible for retrieval decisions and tool execution. A separate 
 | Final answer generation | `CHAT_MODEL` | `deepseek-v4-pro` |
 | Live web search | `WEB_SEARCH_MODEL` | `qwen-plus` |
 | Suggested questions and session titles | Configured in code | `qwen3.7-flash-2026-07-15` |
-| Text embeddings | Local model directory | `bge-small-zh-v1.5` |
-| Retrieval reranking | Local model directory | `bge-reranker-v2-m3` |
+| Text embeddings | `EMBEDDING_BACKEND` | Local CPU or remote inference service |
+| Retrieval reranking | `RERANKER_BACKEND` | Local CPU or remote inference service |
 
 Both `AGENT_MODEL` and `CHAT_MODEL` are currently set to `deepseek-v4-pro` in `.env.example`. To use a smaller model for routing and a larger model for answer synthesis, configure them separately in `backend/.env`:
 
@@ -68,8 +68,8 @@ CHAT_MODEL=deepseek-v4-pro
 - **Backend:** FastAPI and Python
 - **Data services:** PostgreSQL, Elasticsearch, and Redis
 - **Agent:** An OpenAI-compatible function-calling loop
-- **Embeddings:** Local `bge-small-zh-v1.5`
-- **Reranking:** Local `bge-reranker-v2-m3`
+- **Embeddings:** Local or remote `bge-small-zh-v1.5`
+- **Reranking:** Local or remote `bge-reranker-v2-m3`
 - **LLM:** Alibaba Cloud DashScope
 
 ## Getting started
@@ -78,8 +78,7 @@ CHAT_MODEL=deepseek-v4-pro
 
 - Docker and Docker Compose
 - Node.js and npm (only when using the optional frontend)
-- A local `bge-small-zh-v1.5` model directory
-- A local `bge-reranker-v2-m3` model directory
+- Local model directories, a reachable remote inference service, or one of each
 - A DashScope API key
 
 ### 1. Start the backend
@@ -93,7 +92,9 @@ Edit `backend/.env`, add your DashScope API key, and replace the example Postgre
 
 ```env
 DASHSCOPE_API_KEY="your-api-key"
+EMBEDDING_BACKEND=local
 BGE_MODEL_HOST_PATH=../../models/bge-small-zh-v1.5
+RERANKER_BACKEND=local
 RERANKER_MODEL_HOST_PATH=../../models/bge-reranker-v2-m3
 POSTGRES_PASSWORD="replace-with-a-strong-password"
 ELASTIC_PASSWORD="replace-with-a-strong-password"
@@ -104,6 +105,40 @@ The model host paths are resolved relative to `backend/docker-compose.yml`.
 Their defaults point to `Projects/models/bge-small-zh-v1.5` and
 `Projects/models/bge-reranker-v2-m3`. Switching the reranker does not require
 rebuilding the existing 512-dimensional embedding index.
+
+Embedding and reranking can be selected independently. To run both models on a
+remote GPU host while keeping the Agent, Elasticsearch, database, and document
+pipeline local, configure:
+
+```env
+EMBEDDING_BACKEND=remote
+EMBEDDING_REMOTE_BASE_URL=https://gpu.example.com
+EMBEDDING_REMOTE_API_KEY=replace-with-shared-key
+
+RERANKER_BACKEND=remote
+RERANKER_REMOTE_BASE_URL=https://gpu.example.com
+RERANKER_REMOTE_API_KEY=replace-with-shared-key
+RERANKER_SCORE_MODE=probability
+RERANKER_REMOTE_SCORE_MODE=raw_logits
+```
+
+The two `*_BACKEND` values may be mixed. The self-contained remote service lives
+in `gpu_inference/`; copy only that directory to the model host, configure its
+model paths and start it with Docker Compose:
+
+```bash
+cd gpu_inference
+cp .env.example .env
+# Edit the two model paths and INFERENCE_SERVER_API_KEY in .env.
+docker compose up -d --build
+```
+
+Set both remote base URLs to `http://<gpu-host>:9000` when TLS is terminated by
+another service. Production deployments should expose this endpoint through
+TLS or a private network. Local and remote embedding deployments must use the
+same model revision, pooling, normalization, and 512-dimensional output; using
+a different embedding model requires rebuilding the Elasticsearch index. See
+`gpu_inference/README.md` for host requirements and non-Docker deployment.
 
 After reranking, the final Top chunks are checked for complete evidence coverage.
 The checker requires every requested metric, time range, qualifier, and sub-question

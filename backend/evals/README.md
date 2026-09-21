@@ -167,7 +167,7 @@ docker compose exec LS_api \
   --rerank-candidate-size 20 \
   --rrf-k 60 \
   --vector-weight 0.6 \
-  --final-reranker-weight 0.4 \
+  --final-reranker-weight 0.7 \
   --final-rrf-k 10 \
   --split test \
   --run-name retrieval_baseline

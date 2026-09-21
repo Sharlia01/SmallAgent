@@ -1,0 +1,37 @@
+services:
+  model-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: agentrag-gpu-inference:latest
+    container_name: agentrag-gpu-inference
+    environment:
+      INFERENCE_SERVER_API_KEY: ${INFERENCE_SERVER_API_KEY:-}
+      INFERENCE_SERVER_RERANKER_SCORE_MODE: ${INFERENCE_SERVER_RERANKER_SCORE_MODE:-raw_logits}
+      INFERENCE_MAX_CONCURRENCY: ${INFERENCE_MAX_CONCURRENCY:-1}
+      INFERENCE_MAX_REQUEST_ITEMS: ${INFERENCE_MAX_REQUEST_ITEMS:-128}
+      EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-BAAI/bge-small-zh-v1.5}
+      EMBEDDING_MODEL_PATH: /models/embedding
+      EMBEDDING_DEVICE: ${EMBEDDING_DEVICE:-cuda}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-32}
+      RERANKER_MODEL_ID: ${RERANKER_MODEL_ID:-BAAI/bge-reranker-v2-m3}
+      RERANKER_MODEL_PATH: /models/reranker
+      RERANKER_DEVICE: ${RERANKER_DEVICE:-cuda}
+      RERANKER_BATCH_SIZE: ${RERANKER_BATCH_SIZE:-8}
+      RERANKER_MAX_LENGTH: ${RERANKER_MAX_LENGTH:-1024}
+      PRELOAD_MODELS: ${PRELOAD_MODELS:-true}
+      CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-0}
+    ports:
+      - "${INFERENCE_PORT:-9000}:9000"
+    volumes:
+      - "${EMBEDDING_MODEL_HOST_PATH:?Set EMBEDDING_MODEL_HOST_PATH in .env}:/models/embedding:ro"
+      - "${RERANKER_MODEL_HOST_PATH:?Set RERANKER_MODEL_HOST_PATH in .env}:/models/reranker:ro"
+    shm_size: "1gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped

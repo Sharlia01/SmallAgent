@@ -50,7 +50,7 @@ def batch_generate_embeddings(
     
     Args:
         texts: 文本列表
-        batch_size: 本地 BGE 推理的批处理大小，不传时读取环境变量
+        batch_size: Embedding 推理批处理大小，不传时读取环境变量
     
     Returns:
         向量列表
@@ -58,7 +58,7 @@ def batch_generate_embeddings(
     embeddings = generate_embedding(texts, batch_size=batch_size)
     if len(embeddings) != len(texts):
         raise RuntimeError(
-            "Local BGE returned a different number of embeddings than inputs"
+            "Embedding provider returned a different number of vectors than inputs"
         )
     return embeddings
 
@@ -81,7 +81,7 @@ def process_items(
     """
     # 准备批量处理的数据
     texts = [item["content_with_weight"] for item in items]
-    # 批量生成本地 BGE 向量
+    # 使用当前配置的本地或远程 provider 批量生成向量
     embeddings = batch_generate_embeddings(texts)
 
     # 处理每个数据项

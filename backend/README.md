@@ -21,7 +21,9 @@ cd LS-p1
 2. **.env 配置文件**
 ```bash
 DASHSCOPE_API_KEY="your-api-key"
+EMBEDDING_BACKEND=local
 BGE_MODEL_HOST_PATH=../../models/bge-small-zh-v1.5
+RERANKER_BACKEND=local
 RERANKER_MODEL_HOST_PATH=../../models/bge-reranker-v2-m3
 RAG_QUERY_INTENT_ENABLED=true
 QUERY_REWRITE_ENABLED=true
@@ -29,9 +31,38 @@ QUERY_EXPANSION_ENABLED=true
 RAG_EVIDENCE_SUFFICIENCY_ENABLED=true
 ```
 
-Embedding 使用本地 `bge-small-zh-v1.5`，重排使用本地
-`bge-reranker-v2-m3`；DashScope Key 用于 RAG 查询意图识别、查询规范化与扩展及聊天模型。
-两个模型宿主机路径都相对于本目录的 `docker-compose.yml`。
+Embedding 和重排默认分别使用本地 `bge-small-zh-v1.5` 与
+`bge-reranker-v2-m3`，也可以各自切换到远程推理服务；DashScope Key 用于 RAG
+查询意图识别、查询规范化与扩展及聊天模型。本地模型宿主机路径都相对于本目录的
+`docker-compose.yml`。
+
+远程 GPU 模式配置示例：
+
+```bash
+EMBEDDING_BACKEND=remote
+EMBEDDING_REMOTE_BASE_URL=https://gpu.example.com
+EMBEDDING_REMOTE_API_KEY=replace-with-shared-key
+RERANKER_BACKEND=remote
+RERANKER_REMOTE_BASE_URL=https://gpu.example.com
+RERANKER_REMOTE_API_KEY=replace-with-shared-key
+# AgentRAG 的相似度阈值使用 0～1 概率；GPU 服务仍返回 raw logits。
+RERANKER_SCORE_MODE=probability
+RERANKER_REMOTE_SCORE_MODE=raw_logits
+```
+
+远程模型机只需复制仓库根目录的 `gpu_inference/`，不需要复制 Agent、数据库、
+文档解析或前端代码：
+
+```bash
+cd gpu_inference
+cp .env.example .env
+# 修改模型路径与 INFERENCE_SERVER_API_KEY
+docker compose up -d --build
+```
+
+`EMBEDDING_BACKEND` 与 `RERANKER_BACKEND` 可以独立设置。本地与远程
+Embedding 必须使用相同模型版本、归一化方式和 512 维输出，否则必须重新入库。
+完整 GPU 主机部署说明见 `gpu_inference/README.md`。
 
 RAG 检索入口会先识别查询类型和检索模式。明确的表号、图号、章节或页码查询直接检索；口语、简称和上下文指代查询先规范化，再生成一条包含专业字段和同义词的关键词扩展查询。扩展结果必须通过实体、时间、数字、单位、否定词和定位信息保留校验，否则自动回退到规范化查询或原查询。普通问题使用 `single` 模式；只有后一个子问题依赖第一步证据中的术语或实体时才使用 `sequential` 模式。递进式检索最多执行两跳，桥接值必须逐字存在于第一跳来源 chunk；“这份研报/该报告”场景会把第二跳限定在同一文档。检索器内部仍分别执行原问题关键词、扩展查询关键词和原问题向量召回，在 Python 层通过第一阶段加权 RRF 合并候选，再只使用当前跳的问题进行语义重排；每跳以语义重排名次 `0.4`、第一阶段检索 RRF 名次 `0.6` 做第二阶段加权 RRF。
 
@@ -137,12 +168,15 @@ ES 批量写入失败也不会清理旧片段，可重新执行恢复。替换�
 Compose 的 API 工作目录为 `/app/app`，与代码挂载一致。首次应用此配置后运行
 `docker compose up -d --no-deps --force-recreate LS_api`，使服务加载新代码。
 
-### 本地重排模型
+### 本地或远程重排模型
 
-检索器通过本地 `BAAI/bge-reranker-v2-m3` 对“原问题、候选片段”逐对打分。
-模型默认从 `/models/bge-reranker-v2-m3` 加载，并通过
-`RERANKER_MODEL_HOST_PATH` 只读挂载。切换重排模型无需重新生成现有 embedding
-或重新上传文档。
+检索器通过 `BAAI/bge-reranker-v2-m3` 对“原问题、候选片段”逐对打分。
+本地模式默认从 `/models/bge-reranker-v2-m3` 加载，并通过
+`RERANKER_MODEL_HOST_PATH` 只读挂载；远程模式调用 `/v1/rerank`。切换重排部署位置
+无需重新生成现有 embedding 或重新上传文档。远程服务如果返回 0～1 概率，需要将
+`RERANKER_REMOTE_SCORE_MODE` 设置为 `probability`。`RERANKER_SCORE_MODE` 默认是
+`probability`，确保检索器的 `similarity_threshold` 始终作用在 0～1 的统一量纲上；
+当远程服务返回 raw logits 时，客户端会在过滤候选前自动转换。
 
 ### 服务列表
 

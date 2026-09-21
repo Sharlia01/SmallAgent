@@ -126,10 +126,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--final-reranker-weight",
         type=float,
-        default=0.4,
+        default=0.7,
         help=(
             "Semantic reranker weight in second-stage rank fusion "
-            "(default: 0.4)."
+            "(default: 0.7)."
         ),
     )
     parser.add_argument(
@@ -697,6 +697,15 @@ def main() -> int:
             "candidate_size_per_branch": args.candidate_size,
             "rerank_candidate_size": args.rerank_candidate_size,
             "reranker_model": RERANKER_MODEL,
+            "reranker_backend": os.getenv("RERANKER_BACKEND", "local"),
+            "reranker_score_mode": os.getenv(
+                "RERANKER_SCORE_MODE",
+                "probability",
+            ),
+            "reranker_remote_score_mode": os.getenv(
+                "RERANKER_REMOTE_SCORE_MODE",
+                "raw_logits",
+            ),
             "rrf_k": args.rrf_k,
             "final_reranker_weight": args.final_reranker_weight,
             "final_retrieval_rrf_weight": (
