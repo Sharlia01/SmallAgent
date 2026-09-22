@@ -46,7 +46,7 @@ def figure_evidence(image, text: str, *, client=None) -> dict:
                         ]},
                     ],
                     response_format={"type": "json_object"}, temperature=0,
-                    max_tokens=2400, timeout=30, stream=False,
+                    max_tokens=2400, timeout=90, stream=False,
                 )
                 payload = json.loads(response.choices[0].message.content)
                 facts = payload["facts"]

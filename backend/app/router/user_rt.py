@@ -83,7 +83,7 @@ async def get_sts_token(request: STSTokenRequest):
                 "https://openspeech.bytedance.com/api/v1/sts/token",
                 headers=headers,
                 json=body,
-                timeout=30.0
+                timeout=90.0
             )
             
             # 返回原始响应

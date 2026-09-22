@@ -327,6 +327,7 @@ class RAGFlowPdfParser:
         self.boxes, self.page_layout = self.layouter(
             self.page_images, self.boxes, ZM, drop=drop)
         # cumlative Y
+        # 统一坐标系，把分页坐标转换为全局坐标
         for i in range(len(self.boxes)):
             self.boxes[i]["top"] += \
                 self.page_cum_height[self.boxes[i]["page_number"] - 1]

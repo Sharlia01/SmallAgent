@@ -14,8 +14,7 @@ from service.core.rag.utils.es_conn import ESConnection
 from service.core.api.utils.file_utils import get_project_base_directory
 from service.core.evidence_metadata import evidence_metadata
 
-PARSER_VERSION = "table-figure-v2"
-
+PARSER_VERSION = "table-figure-v4"
 
 def _save_evidence_image(image, index_name: str, doc_id: str) -> str:
     buffer = BytesIO()

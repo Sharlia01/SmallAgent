@@ -5,7 +5,7 @@ from unittest.mock import Mock
 from PIL import Image
 import pytest
 
-from service.core.table_evidence import bind_table_rows
+from service.core.table_evidence import bind_table_rows, extract_visual_table, table_evidence
 from service.core.figure_evidence import figure_evidence
 from service.core.rag.nlp import tokenize_table
 from service.core.rag.nlp import rag_tokenizer
@@ -35,6 +35,10 @@ def test_multilevel_headers_rowspans_units_blank_and_zero():
     assert "业务：发电；地区：境外" in rows[1]["content"]
     assert "收入 / 2023年：（空白）" in rows[1]["content"]
     assert all("单位：亿元" in row["content"] for row in rows)
+    assert rows[0]["table_headers_kwd"] == [
+        "业务", "地区", "收入 / 2023年", "收入 / 2024年",
+    ]
+    assert rows[0]["table_cells_kwd"] == ["发电", "境内", "0", "-12.5"]
     assert rows[1]["table_row_int"] == 5
 
 
@@ -104,6 +108,117 @@ def test_body_section_labels_do_not_leak_to_following_sections():
     assert "境内" in rows[0]["content"]
     assert "境外" in rows[1]["content"]
     assert "境内" not in rows[1]["content"]
+
+
+def test_visual_table_extracts_self_contained_rows(monkeypatch):
+    monkeypatch.setenv("FIGURE_VISION_MODEL", "test-vision")
+    client = Mock()
+    client.chat.completions.create.return_value = SimpleNamespace(choices=[
+        SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+            "caption": "表1 收入（亿元）",
+            "rows": [
+                {
+                    "headers": ["指标", "2024年"],
+                    "cells": ["营业收入", "100"],
+                },
+                {
+                    "context": "境内业务",
+                    "headers": ["指标", "2024年"],
+                    "cells": ["净利润", "20"],
+                },
+            ],
+        })))
+    ])
+
+    rows = extract_visual_table(
+        Image.new("RGB", (10, 10)),
+        "<table><tr><td>OCR</td></tr></table>",
+        client=client,
+    )
+
+    assert len(rows) == 2
+    assert rows[0]["content"].startswith(
+        "表1 收入（亿元）\n指标：营业收入；2024年：100\n<table>"
+    )
+    assert "<caption>表1 收入（亿元）</caption>" in rows[0]["content"]
+    assert "<tr><th>指标</th><th>2024年</th></tr>" in rows[0]["content"]
+    assert "<tr><td>营业收入</td><td>100</td></tr>" in rows[0]["content"]
+    assert rows[0]["table_headers_kwd"] == ["指标", "2024年"]
+    assert rows[0]["table_cells_kwd"] == ["营业收入", "100"]
+    assert "表1 收入（亿元）；境内业务" in rows[1]["content"]
+    assert rows[0]["table_binding_source_kwd"] == "vision"
+    assert rows[0]["table_model_kwd"] == "test-vision"
+    call = client.chat.completions.create.call_args.kwargs
+    assert call["messages"][1]["content"][1]["image_url"]["url"].startswith(
+        "data:image/png;base64,"
+    )
+
+
+@pytest.mark.parametrize("payload", [
+    {"caption": "表1", "rows": [123]},
+    {"caption": "表1", "rows": [""]},
+    {"caption": "表1", "rows": [{"headers": ["指标"], "cells": []}]},
+    {"caption": "表1", "rows": [{"headers": ["指标"], "cells": [""]}]},
+    {"caption": 1, "rows": [{"headers": ["指标"], "cells": ["收入"]}]},
+])
+def test_visual_table_rejects_invalid_model_output(monkeypatch, payload):
+    monkeypatch.setenv("FIGURE_VISION_MODEL", "test-vision")
+    client = Mock()
+    client.chat.completions.create.return_value = SimpleNamespace(choices=[
+        SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))
+    ])
+
+    assert extract_visual_table(Image.new("RGB", (10, 10)), "<table></table>", client=client) == []
+
+
+def test_visual_table_escapes_model_values_and_deduplicates_rows(monkeypatch):
+    monkeypatch.setenv("FIGURE_VISION_MODEL", "test-vision")
+    client = Mock()
+    row = {
+        "headers": ["公司", "收入 < 目标"],
+        "cells": ["A & B", "100"],
+    }
+    client.chat.completions.create.return_value = SimpleNamespace(choices=[
+        SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+            "caption": "估值 < 表",
+            "rows": [row, row],
+        })))
+    ])
+
+    rows = extract_visual_table(
+        Image.new("RGB", (10, 10)),
+        "<table></table>",
+        client=client,
+    )
+
+    assert len(rows) == 1
+    assert "<caption>估值 &lt; 表</caption>" in rows[0]["content"]
+    assert "<th>收入 &lt; 目标</th>" in rows[0]["content"]
+    assert "<td>A &amp; B</td>" in rows[0]["content"]
+
+
+def test_table_evidence_only_uses_vision_for_unbound_tables(monkeypatch):
+    monkeypatch.setenv("FIGURE_VISION_ENABLED", "true")
+    monkeypatch.setenv("FIGURE_VISION_MODEL", "test-vision")
+    client = Mock()
+
+    bound = '<table><tr><th>指标</th><th>2024</th></tr><tr><td>收入</td><td>100</td></tr></table>'
+    assert table_evidence(Image.new("RGB", (10, 10)), bound, client=client)[0]["table_binding_kwd"] == "bound"
+    client.chat.completions.create.assert_not_called()
+
+    client.chat.completions.create.return_value = SimpleNamespace(choices=[
+        SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+            "caption": "",
+            "rows": [{
+                "headers": ["指标", "数值"],
+                "cells": ["收入", "100"],
+            }],
+        })))
+    ])
+    unbound = '<table><tr><td>收入</td><td>100</td></tr></table>'
+    assert table_evidence(Image.new("RGB", (10, 10)), unbound, client=client)[0][
+        "table_binding_source_kwd"
+    ] == "vision"
 
 
 def test_docx_only_merges_actual_adjacent_merged_cells():
@@ -241,3 +356,17 @@ def test_retrieval_and_tool_source_keep_evidence_metadata():
     ])
     assert references[0]["visual_status_kwd"] == "disabled"
     assert references[0]["page_num_int"] == [2]
+
+
+def test_retrieval_keeps_structured_table_metadata():
+    formatted = format_retrieved_chunk({
+        "chunk_id": "table-row",
+        "content_with_weight": "<table></table>",
+        "evidence_type_kwd": "table",
+        "table_binding_kwd": "bound",
+        "table_headers_kwd": ["公司", "PE / 25E"],
+        "table_cells_kwd": ["龙源电力", "19.6"],
+    }, 1)
+
+    assert formatted["table_headers_kwd"] == ["公司", "PE / 25E"]
+    assert formatted["table_cells_kwd"] == ["龙源电力", "19.6"]

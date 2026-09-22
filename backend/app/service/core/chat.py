@@ -230,7 +230,7 @@ def generate_recommended_questions(user_question, retrieved_content=None, sessio
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             stream=False,
-            timeout=30,  # 添加超时设置
+            timeout=90,  # 添加超时设置
         )
 
         # 提取生成的推荐问题

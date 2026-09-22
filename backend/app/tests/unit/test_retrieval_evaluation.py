@@ -9,6 +9,7 @@ from service.core.retrieval_evaluation import (
     build_summary,
     evaluate_retrieval_case,
     resolve_metric_ks,
+    table_row_chunk_match_score,
 )
 
 
@@ -51,6 +52,61 @@ def evaluate(raw_result, *, answerable=True, top_k=5):
         sample(answerable=answerable), raw_result,
         latency_ms=12, top_k=top_k, match_threshold=0.8,
     )
+
+
+def test_structured_table_cells_match_before_rendered_content():
+    evidence = {
+        "document_name": "国电电力.pdf",
+        "evidence_type": "table",
+        "row_cells": [
+            "001289.SZ", "龙源电力", "16.65", "1,392", "19.6",
+        ],
+        "text": "001289.SZ 龙源电力 16.65 1,392 19.6",
+    }
+    retrieved = {
+        "docnm_kwd": "国电电力.pdf",
+        "table_cells_kwd": [
+            "001289.sz", "龙源电力", "16.65", "1392", "19.6",
+        ],
+        "content_with_weight": "文本措辞可以与gold不同",
+    }
+
+    assert table_row_chunk_match_score(evidence, retrieved) == 1.0
+
+
+def test_structured_table_cell_mismatch_cannot_be_hidden_by_duplicate_text():
+    evidence = {
+        "document_name": "国电电力.pdf",
+        "evidence_type": "table",
+        "row_cells": ["龙源电力", "19.6"],
+        "text": "龙源电力 19.6",
+    }
+    retrieved = {
+        "docnm_kwd": "国电电力.pdf",
+        "table_cells_kwd": ["龙源电力", "18.6"],
+        "content_with_weight": "龙源电力 19.6",
+    }
+
+    assert table_row_chunk_match_score(evidence, retrieved) == 0.0
+
+
+def test_canonical_html_table_remains_compatible_with_legacy_gold_text():
+    evidence = {
+        "document_name": "国电电力.pdf",
+        "evidence_type": "table",
+        "text": "001289.SZ 龙源电力 16.65 1,392 19.6",
+    }
+    retrieved = {
+        "docnm_kwd": "国电电力.pdf",
+        "content_with_weight": (
+            "<table><tr><th>代码</th><th>公司</th><th>股价</th>"
+            "<th>总市值</th><th>PE / 25E</th></tr>"
+            "<tr><td>001289.SZ</td><td>龙源电力</td><td>16.65</td>"
+            "<td>1,392</td><td>19.6</td></tr></table>"
+        ),
+    }
+
+    assert table_row_chunk_match_score(evidence, retrieved) == 1.0
 
 
 def test_rejected_hit_keeps_pre_gate_ranking_and_serializable_evidence():

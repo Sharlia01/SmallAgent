@@ -206,6 +206,24 @@ def table_row_chunk_match_score(evidence, chunk):
         normalize_table_cell(cell)
         for cell in evidence.get("row_cells") or []
     ]
+    structured_cells = chunk.get("table_cells_kwd")
+    if expected_cells and isinstance(structured_cells, (list, tuple)):
+        actual_cells = [
+            normalize_table_cell(cell)
+            for cell in structured_cells
+        ]
+        if actual_cells == expected_cells:
+            return 1.0
+        expected_length = len(expected_cells)
+        if any(
+            actual_cells[start:start + expected_length] == expected_cells
+            for start in range(len(actual_cells) - expected_length + 1)
+        ):
+            return 1.0
+        # Structured cells are the source of truth for newly parsed rows.  Do
+        # not let duplicated prose or HTML override an explicit cell mismatch.
+        return 0.0
+
     expected_text = evidence.get("text")
     best_score = 0.0
     content = _chunk_content(chunk)
