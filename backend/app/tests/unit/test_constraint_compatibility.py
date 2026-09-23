@@ -2,6 +2,7 @@ import pytest
 
 from service.core.constraint_compatibility import (
     evaluate_constraint_compatibility,
+    extract_metrics,
     extract_organizations,
     extract_time_scopes,
 )
@@ -121,3 +122,38 @@ def test_constraint_compatibility_detects_locator_conflict():
     )
 
     assert decision.categories["locator"].level == "conflict"
+
+
+@pytest.mark.unit
+def test_metric_extraction_distinguishes_expense_rate_from_amount():
+    assert extract_metrics("财务费用率为3.71%") == {
+        "financial_expense_rate"
+    }
+    assert extract_metrics("财务费用金额为10049百万元") == {
+        "financial_expense_amount"
+    }
+
+
+@pytest.mark.unit
+def test_metric_compatibility_demotes_wrong_expense_measure():
+    rate_question = "国电电力2025年上半年财务费用率是多少？"
+
+    exact_rate = evaluate_constraint_compatibility(
+        rate_question,
+        "2025年上半年财务费用率为3.71%。",
+        document_name="国电电力.pdf",
+    )
+    expense_amount = evaluate_constraint_compatibility(
+        rate_question,
+        "2026E财务费用为10049百万元。",
+        document_name="国电电力.pdf",
+    )
+    unrelated_margin = evaluate_constraint_compatibility(
+        rate_question,
+        "2025年上半年毛利率为16.27%。",
+        document_name="国电电力.pdf",
+    )
+
+    assert exact_rate.categories["metric"].level == "compatible"
+    assert expense_amount.categories["metric"].level == "conflict"
+    assert unrelated_margin.categories["metric"].level == "conflict"

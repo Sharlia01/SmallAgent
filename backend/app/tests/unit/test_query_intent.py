@@ -67,22 +67,21 @@ def test_colloquial_finance_query_requests_rewrite_without_model(monkeypatch):
 
 
 @pytest.mark.unit
-def test_multi_facet_colloquial_query_can_build_three_parallel_steps(
+def test_multi_facet_colloquial_query_preserves_relative_time(
     monkeypatch,
 ):
     monkeypatch.setenv("RAG_QUERY_INTENT_ENABLED", "true")
     completions = FakeCompletions(
         '{"intent":"complex_lookup","need_rewrite":true,'
         '"need_decompose":true,"retrieval_mode":"parallel",'
-        '"reason":"盈利、每股收益和市盈率可分别检索",'
+        '"reason":"盈利预测和估值可分别检索",'
         '"subqueries":['
-        '{"id":"profit","query":"国电电力2025至2027年归母净利润预测是多少？",'
+        '{"id":"earnings_forecast",'
+        '"query":"国电电力未来三年归母净利润和每股收益预测是多少？",'
         '"query_template":"","depends_on":[],"output_slot":null,'
         '"required_slots":[],"inherit_document_scope":false},'
-        '{"id":"eps","query":"国电电力2025至2027年EPS预测是多少？",'
-        '"query_template":"","depends_on":[],"output_slot":null,'
-        '"required_slots":[],"inherit_document_scope":false},'
-        '{"id":"pe","query":"国电电力2025至2027年PE估值是多少？",'
+        '{"id":"valuation",'
+        '"query":"国电电力未来三年对应的市盈率和PE估值是多少？",'
         '"query_template":"","depends_on":[],"output_slot":null,'
         '"required_slots":[],"inherit_document_scope":false}'
         ']}'
@@ -93,14 +92,77 @@ def test_multi_facet_colloquial_query_can_build_three_parallel_steps(
         client=fake_client(completions),
     )
 
-    assert decision.need_rewrite is True
     assert decision.retrieval_mode == "parallel"
     assert [step.id for step in decision.subqueries] == [
-        "profit",
-        "eps",
-        "pe",
+        "earnings_forecast",
+        "valuation",
     ]
+    assert all(
+        "未来三年" in step.query
+        for step in decision.subqueries
+    )
 
+@pytest.mark.unit
+def test_parallel_plan_that_invents_years_uses_safe_fallback(
+    monkeypatch,
+):
+    monkeypatch.setenv("RAG_QUERY_INTENT_ENABLED", "true")
+    completions = FakeCompletions(
+        '{"intent":"complex_lookup","need_rewrite":true,'
+        '"need_decompose":true,"retrieval_mode":"parallel",'
+        '"reason":"盈利和估值分别检索",'
+        '"subqueries":['
+        '{"id":"earnings_forecast",'
+        '"query":"国电电力2024至2026年归母净利润预测是多少？",'
+        '"query_template":"","depends_on":[],"output_slot":null,'
+        '"required_slots":[],"inherit_document_scope":false},'
+        '{"id":"valuation",'
+        '"query":"国电电力2024至2026年PE估值是多少？",'
+        '"query_template":"","depends_on":[],"output_slot":null,'
+        '"required_slots":[],"inherit_document_scope":false}'
+        ']}'
+    )
+
+    decision = query_intent.analyze_query_intent(
+        "研报觉得国电电力未来三年能赚多少钱，对应估值贵不贵？",
+        client=fake_client(completions),
+    )
+
+    assert decision.source == "fallback"
+    assert decision.retrieval_mode == "single"
+    assert decision.need_decompose is False
+    assert decision.need_rewrite is True
+    assert decision.subqueries == []
+
+@pytest.mark.unit
+def test_parallel_plan_may_reuse_years_from_original_question(
+    monkeypatch,
+):
+    monkeypatch.setenv("RAG_QUERY_INTENT_ENABLED", "true")
+    completions = FakeCompletions(
+        '{"intent":"complex_lookup","need_rewrite":false,'
+        '"need_decompose":true,"retrieval_mode":"parallel",'
+        '"reason":"两个时间口径分别检索",'
+        '"subqueries":['
+        '{"id":"actual_rate",'
+        '"query":"国电电力2025年上半年财务费用率是多少？",'
+        '"query_template":"","depends_on":[],"output_slot":null,'
+        '"required_slots":[],"inherit_document_scope":false},'
+        '{"id":"forecast_amount",'
+        '"query":"国电电力2026E财务费用金额是多少？",'
+        '"query_template":"","depends_on":[],"output_slot":null,'
+        '"required_slots":[],"inherit_document_scope":false}'
+        ']}'
+    )
+
+    decision = query_intent.analyze_query_intent(
+        "国电电力2025年上半年财务费用率是多少，"
+        "2026E财务费用金额是多少？",
+        client=fake_client(completions),
+    )
+
+    assert decision.retrieval_mode == "parallel"
+    assert decision.source == "model"
 
 @pytest.mark.unit
 def test_unmatched_query_uses_model_structured_decision(monkeypatch):

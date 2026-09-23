@@ -648,6 +648,7 @@ def test_parallel_retrieval_reserves_coverage_for_every_subquery(monkeypatch):
         "国电电力2025E每股收益是多少？",
         "国电电力2025E每股红利是多少？",
     ]
+    assert all(call["options"].page_size == 10 for call in calls)
     result_ids = [chunk["chunk_id"] for chunk in result["chunks"]]
     assert "dividend-1" in result_ids
     assert "dividend-2" in result_ids
@@ -680,6 +681,179 @@ def test_parallel_retrieval_reserves_coverage_for_every_subquery(monkeypatch):
     assert dividend["parallel_subqueries"][0]["subquery_id"] == (
         "dividend_lookup"
     )
+
+
+@pytest.mark.unit
+def test_parallel_retrieval_prefers_exact_distinct_metric_evidence(
+    monkeypatch,
+):
+    monkeypatch.setenv("RAG_PARALLEL_RETRIEVAL_ENABLED", "true")
+    original_question = (
+        "国电电力2025年上半年财务费用率是多少，"
+        "2026E财务费用金额是多少？"
+    )
+
+    chunks_by_query = {
+        "费用率": [
+            {
+                "chunk_id": "approximate-figure",
+                "evidence_type_kwd": "figure",
+                "content_with_weight": (
+                    "图6：财务费用率约3.5%，视觉模型提取事实"
+                    "（未经人工核验）。"
+                ),
+            },
+            {
+                "chunk_id": "wrong-margin",
+                "evidence_type_kwd": "figure",
+                "content_with_weight": "2025年上半年毛利率16.27%，净利率9%。",
+            },
+            {
+                "chunk_id": "exact-rate",
+                "content_with_weight": (
+                    "2025年上半年公司财务费用率为3.71%，"
+                    "管理费用率为1.18%。"
+                ),
+            },
+        ],
+        "费用金额": [
+            {
+                "chunk_id": "amount-cash-flow",
+                "evidence_type_kwd": "table",
+                "content_with_weight": (
+                    "| 现金流量表（百万元） | 2025E | 2026E | 2027E |\n"
+                    "| 财务费用 | 8389 | 10049 | 10216 |"
+                ),
+            },
+            {
+                "chunk_id": "amount-profit-table",
+                "evidence_type_kwd": "table",
+                "content_with_weight": (
+                    "| 利润表（百万元） | 2025E | 2026E | 2027E |\n"
+                    "| 财务费用 | 8389 | 10049 | 10216 |"
+                ),
+            },
+            {
+                "chunk_id": "wrong-profit",
+                "content_with_weight": (
+                    "2025-2027年归母净利润分别为70.50、78.95、87.17亿元。"
+                ),
+            },
+            {
+                "chunk_id": "neutral-context",
+                "content_with_weight": "报告说明了预测数据的口径与单位。",
+            },
+        ],
+    }
+
+    class FakeDealer:
+        @staticmethod
+        def retrieval(**kwargs):
+            key = "费用率" if "费用率" in kwargs["question"] else "费用金额"
+            chunks = []
+            for source in chunks_by_query[key]:
+                chunk = {
+                    "doc_id": "doc-1",
+                    "docnm_kwd": "国电电力.pdf",
+                    "rerank_score": 0.9,
+                    "rrf_score": 0.02,
+                    "final_ranking": {"final_fusion_score": 0.08},
+                    **source,
+                }
+                chunk["constraint_compatibility"] = (
+                    retrieval.evaluate_constraint_compatibility(
+                        kwargs["question"],
+                        chunk["content_with_weight"],
+                        document_name=chunk["docnm_kwd"],
+                    ).to_dict()
+                )
+                chunks.append(chunk)
+            return {
+                "total": len(chunks),
+                "chunks": chunks,
+                "doc_aggs": [],
+                "retrieval_fusion": {"method": "weighted_rrf"},
+            }
+
+    intent = QueryIntentDecision(
+        intent="complex_lookup",
+        need_rewrite=False,
+        need_decompose=True,
+        reason="费用率和费用金额需独立检索",
+        source="model",
+        retrieval_mode="parallel",
+        subqueries=[
+            QuerySubqueryPlan(
+                id="rate",
+                query="国电电力2025年上半年财务费用率是多少？",
+            ),
+            QuerySubqueryPlan(
+                id="amount",
+                query="国电电力2026E财务费用金额是多少？",
+            ),
+        ],
+    )
+    scores = {
+        "approximate-figure": 0.99,
+        "wrong-margin": 0.98,
+        "exact-rate": 0.7,
+        "amount-cash-flow": 0.95,
+        "amount-profit-table": 0.94,
+        "wrong-profit": 0.97,
+        "neutral-context": 0.6,
+    }
+    score_by_content = {
+        chunk["content_with_weight"]: scores[chunk["chunk_id"]]
+        for chunks in chunks_by_query.values()
+        for chunk in chunks
+    }
+
+    monkeypatch.setattr(retrieval, "get_retrieval_dealer", FakeDealer)
+    monkeypatch.setattr(retrieval, "analyze_query_intent", lambda _q: intent)
+    monkeypatch.setattr(
+        retrieval,
+        "rerank_similarity",
+        lambda _question, documents: (
+            [score_by_content[document] for document in documents],
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        retrieval,
+        "check_evidence_sufficiency",
+        lambda _question, chunks: EvidenceSufficiencyDecision(
+            sufficient=True,
+            reason="费用率和费用金额均有精确证据",
+            missing_requirements=[],
+            supporting_chunk_indices=[1, 2],
+            source="model",
+            evaluated_chunk_count=len(chunks),
+            evaluated_chunk_ids=[chunk["chunk_id"] for chunk in chunks],
+        ),
+    )
+
+    result = retrieval.retrieve_raw_results(
+        "42",
+        original_question,
+        page_size=4,
+    )
+
+    result_ids = [chunk["chunk_id"] for chunk in result["chunks"]]
+    assert result_ids[:2] == ["amount-cash-flow", "exact-rate"]
+    assert "exact-rate" in result_ids
+    assert "amount-cash-flow" in result_ids
+    assert "wrong-margin" not in result_ids
+    assert "wrong-profit" not in result_ids
+    assert not {
+        "amount-cash-flow",
+        "amount-profit-table",
+    }.issubset(result_ids)
+    assert result["retrieval_fusion"]["final_rerank"][
+        "coverage_chunk_ids_by_subquery"
+    ] == {
+        "rate": ["exact-rate", "approximate-figure"],
+        "amount": ["amount-cash-flow"],
+    }
 
 
 # 用例功能：验证 RRF 只使用各路排名，并让多路共同命中的 chunk 优先。

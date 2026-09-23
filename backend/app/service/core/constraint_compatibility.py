@@ -117,6 +117,33 @@ _FORECAST_PATTERN = re.compile(
 )
 _TARGET_PATTERN = re.compile(r"目标|规划目标|计划达到|力争")
 
+# Keep this vocabulary deliberately narrow: metric conflicts are only useful
+# when both sides state comparable financial/operating measures explicitly.
+# In particular, a rate and its same-named amount are different metrics.
+_METRIC_PATTERNS = {
+    "financial_expense_rate": re.compile(r"财务费用率"),
+    "financial_expense_amount": re.compile(r"财务费用(?!率)"),
+    "management_expense_rate": re.compile(r"管理费用率"),
+    "management_expense_amount": re.compile(r"管理费用(?!率)"),
+    "sales_expense_rate": re.compile(r"销售费用率"),
+    "sales_expense_amount": re.compile(r"销售费用(?!率)"),
+    "gross_margin": re.compile(r"毛利率"),
+    "net_margin": re.compile(r"净利率"),
+    "revenue": re.compile(r"营业收入"),
+    "adjusted_attributable_net_profit": re.compile(r"扣非归母净利润"),
+    "attributable_net_profit": re.compile(r"(?<!扣非)归母净利润"),
+    "operating_cash_flow": re.compile(
+        r"经营性净现金流|经营活动(?:产生的)?现金流"
+    ),
+    "eps": re.compile(r"每股收益|(?<![A-Za-z])EPS(?![A-Za-z])", re.IGNORECASE),
+    "dividend_per_share": re.compile(r"每股(?:红利|股利)"),
+    "pe": re.compile(r"市盈率|(?<![A-Za-z])PE(?![A-Za-z])", re.IGNORECASE),
+    "fixed_assets": re.compile(r"固定资产"),
+    "power_generation": re.compile(r"发电量"),
+    "on_grid_energy": re.compile(r"上网电量"),
+    "installed_capacity": re.compile(r"装机容量|控股装机|新增装机"),
+}
+
 
 @dataclass(frozen=True)
 class ConstraintCategoryDecision:
@@ -250,6 +277,16 @@ def extract_fact_statuses(
     return statuses
 
 
+def extract_metrics(text: str) -> set[str]:
+    """Extract high-confidence metric identities used for hard mismatches."""
+    value = unicodedata.normalize("NFKC", str(text or ""))
+    return {
+        metric
+        for metric, pattern in _METRIC_PATTERNS.items()
+        if pattern.search(value)
+    }
+
+
 def extract_organizations(text: str) -> set[str]:
     organizations = set()
     for match in _ORGANIZATION_PATTERN.finditer(str(text or "")):
@@ -361,6 +398,10 @@ def evaluate_constraint_compatibility(
         "locator": _compare_sets(
             extract_locators(question),
             extract_locators(candidate_text),
+        ),
+        "metric": _compare_sets(
+            extract_metrics(question),
+            extract_metrics(candidate_text),
         ),
     }
     for category, decision in comparisons.items():

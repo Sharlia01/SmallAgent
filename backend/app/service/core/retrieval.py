@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 import time
 from dataclasses import replace
 from functools import lru_cache
@@ -37,6 +38,7 @@ DEFAULT_RRF_K = 60
 DEFAULT_FINAL_RERANKER_WEIGHT = 0.7
 DEFAULT_FINAL_RRF_K = 10
 DEFAULT_PARALLEL_COVERAGE_PER_SUBQUERY = 2
+DEFAULT_PARALLEL_CANDIDATE_MULTIPLIER = 2
 
 
 logger = logging.getLogger(__name__)
@@ -129,6 +131,65 @@ def _document_aggregations(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]
     )
 
 
+def _metric_compatibility_priority(chunk: dict[str, Any]) -> int:
+    metric = (
+        (chunk.get("constraint_compatibility") or {})
+        .get("categories", {})
+        .get("metric", {})
+    )
+    return {
+        "compatible": 0,
+        "unknown": 1,
+        "conflict": 2,
+    }.get(str(metric.get("level") or ""), 1)
+
+# 偏好精确的表格/文本数值，而不是图表中的近似估计值
+def _approximate_figure_penalty(
+    question: str,
+    chunk: dict[str, Any],
+) -> int:
+    """Prefer exact prose/table values over approximate visual estimates."""
+    if str(chunk.get("evidence_type_kwd") or "") != "figure":
+        return 0
+    if not re.search(r"多少|具体数值|精确|分别是", question):
+        return 0
+    if re.search(r"图\s*\d+|图表|柱|曲线|折线", question):
+        return 0
+    content = str(chunk.get("content_with_weight") or "")
+    return int(bool(re.search(r"约|左右|未经人工核验", content)))
+
+
+def _numeric_fact_signatures(chunk: dict[str, Any]) -> set[str]:
+    """Return exact metric rows shared by semantically duplicate evidence."""
+    signatures = set()
+    content = str(chunk.get("content_with_weight") or "")
+    for line in content.splitlines():
+        if len(re.findall(r"\d+(?:\.\d+)?", line)) < 2:
+            continue
+        compact = re.sub(
+            r"[^0-9A-Za-z\u4e00-\u9fff]+",
+            "",
+            line,
+        ).casefold()
+        if len(compact) >= 8:
+            signatures.add(compact)
+    return signatures
+
+
+def _duplicates_numeric_fact(
+    key: str,
+    selected_keys: set[str],
+    chunks_by_key: dict[str, dict[str, Any]],
+) -> bool:
+    signatures = _numeric_fact_signatures(chunks_by_key[key])
+    if not signatures:
+        return False
+    return any(
+        signatures & _numeric_fact_signatures(chunks_by_key[selected_key])
+        for selected_key in selected_keys
+    )
+
+
 def _merge_parallel_subqueries(
     *,
     original_question: str,
@@ -160,6 +221,8 @@ def _merge_parallel_subqueries(
                     source_chunk.get("constraint_compatibility") or {}
                 ),
             }
+            # 同一个chunk可能被多个子查询召回，这里去重
+            # parallel_subqueries表示这个chunk是被哪些子查询召回的
             if key not in chunks_by_key:
                 chunk = dict(source_chunk)
                 chunk["parallel_subqueries"] = [subquery_metadata]
@@ -176,6 +239,7 @@ def _merge_parallel_subqueries(
     ranking_source = "model"
     ranking_method = "original_question_rerank"
     fallback_reason = None
+    # 对全部候选做统一重排，用原始问题使用reranker模型进行重排
     if candidate_keys:
         try:
             scores, _ = rerank_similarity(
@@ -215,6 +279,7 @@ def _merge_parallel_subqueries(
                 name: keys for name, keys in rankings.items() if keys
             }
             if active_rankings:
+                # 使用rrf把子查询内部的排名融合
                 scores_by_key = reciprocal_rank_fusion(
                     active_rankings,
                     {
@@ -229,6 +294,7 @@ def _merge_parallel_subqueries(
         ranking_source = "skipped"
 
     for key, chunk in chunks_by_key.items():
+        # 约束，判断chunk内容是否满足问题里的硬性约束和条件，比如时间、地点
         chunk["constraint_compatibility"] = evaluate_constraint_compatibility(
             original_question,
             str(
@@ -255,6 +321,11 @@ def _merge_parallel_subqueries(
         candidate_keys,
         key=lambda key: (
             chunks_by_key[key]["constraint_compatibility"]["conflict_count"],
+            _metric_compatibility_priority(chunks_by_key[key]),
+            _approximate_figure_penalty(
+                original_question,
+                chunks_by_key[key],
+            ),
             -scores_by_key[key],
             key,
         ),
@@ -269,24 +340,55 @@ def _merge_parallel_subqueries(
     )
     reserved_keys: set[str] = set()
     coverage_by_subquery: dict[str, list[str]] = {}
+    # 为每个子查询保留最强结果的名额，保证并行检索的时候，没有任何一个子查询的结果被淹没
     for step, _result in subquery_results:
         coverage = []
-        for key in subquery_keys.get(step.id, []):
+        # 子查询的chunk经过重排后的顺序
+        coverage_candidates = sorted(
+            subquery_keys.get(step.id, []),
+            key=lambda key: (
+                _metric_compatibility_priority(chunks_by_key[key]),
+                _approximate_figure_penalty(step.query, chunks_by_key[key]),
+                subquery_keys.get(step.id, []).index(key),
+            ),
+        )
+        has_metric_match = any(
+            _metric_compatibility_priority(chunks_by_key[key]) == 0
+            for key in coverage_candidates
+        )
+        for key in coverage_candidates:
             if len(coverage) >= per_subquery_quota:
                 break
-            if key not in reserved_keys and len(reserved_keys) >= options.page_size:
+            metric_priority = _metric_compatibility_priority(
+                chunks_by_key[key]
+            )
+            if metric_priority == 2:
+                continue
+            if has_metric_match and metric_priority != 0:
+                continue
+            if _duplicates_numeric_fact(key, reserved_keys, chunks_by_key):
+                continue
+            if (
+                key not in reserved_keys
+                and len(reserved_keys) >= options.page_size
+            ):
                 break
             reserved_keys.add(key)
             coverage.append(key)
+        # 每个子查询最终保留的chunk id列表，保证每个子查询都有一定的覆盖率
         coverage_by_subquery[step.id] = coverage
 
     selected_keys = set(reserved_keys)
     for key in ranked_keys:
         if len(selected_keys) >= options.page_size:
             break
+        if chunks_by_key[key]["constraint_compatibility"]["conflict_count"]:
+            continue
+        # 跳过和已选chunk重复数值事实的候选
+        if _duplicates_numeric_fact(key, selected_keys, chunks_by_key):
+            continue
         selected_keys.add(key)
     ordered_keys = [key for key in ranked_keys if key in selected_keys]
-    ordered_keys.extend(key for key in ranked_keys if key not in selected_keys)
 
     coverage_owners: dict[str, list[str]] = {}
     for subquery_id, keys in coverage_by_subquery.items():
@@ -380,7 +482,11 @@ def _execute_parallel_retrieval(
     subquery_page_size = min(
         options.rerank_candidate_size,
         max(
-            options.page * options.page_size,
+            (
+                options.page
+                * options.page_size
+                * DEFAULT_PARALLEL_CANDIDATE_MULTIPLIER
+            ),
             _parallel_coverage_per_subquery(),
         ),
     )

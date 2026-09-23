@@ -9,6 +9,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from typing import Any, Literal
+from service.core.query_expansion import validate_query_preservation
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -101,6 +102,8 @@ intent 只能取以下值之一：
 10. single 的 subqueries 必须为空。只返回 JSON 对象，不输出其他文字。
 11. parallel 必须给出两个或三个可独立执行的 subqueries；每个子查询都要保留原问题中与它相关的公司、时间、指标、图表号和限定条件。不要把纯计算步骤拆成新的检索查询。
 12. 同一问题同时指定多个表号或图号，并分别询问它们的内容时，应判为 parallel，为每个图表分别生成子查询。
+13. 不得把“未来三年、近两年、今年、明年”等相对时间转换为具体年份。除非用户原问题已经明确提供基准年份，否则子查询必须原样保留相对时间表达，不得猜测或新增年份、日期、数字、实体和事实。
+14. 通常位于同一个段落或同一张表中的相关指标不要过度拆分。例如“未来三年的归母净利润和EPS”应放在同一个盈利预测子查询中，不应拆成两个独立查询。
 
 返回格式：
 {
@@ -365,6 +368,40 @@ def _validate_parallel_plan(subqueries: list[QuerySubqueryPlan]) -> None:
         if step.inherit_document_scope:
             raise ValueError("parallel retrieval cannot inherit a prior scope")
 
+def _validate_parallel_subquery_drift(
+    original_question: str,
+    decision: QueryIntentDecision,
+) -> None:
+    """Reject parallel plans that invent exact constraints."""
+
+    if decision.retrieval_mode != "parallel":
+        return
+
+    drifted_steps = []
+
+    for step in decision.subqueries:
+        validation = validate_query_preservation(
+            original_question,
+            step.query,
+        )
+
+        # 不检查 missing_anchors，因为每个并行子查询只负责一个子意图，
+        # 不需要保留原问题中的全部指标。
+        #
+        # 这里只禁止增加原问题不存在的年份、数字、实体、表图编号等。
+        if validation.added_risky_terms:
+            drifted_steps.append(
+                {
+                    "subquery_id": step.id,
+                    "added_risky_terms": validation.added_risky_terms,
+                }
+            )
+
+    if drifted_steps:
+        raise ValueError(
+            f"parallel subqueries invented exact constraints: "
+            f"{drifted_steps}"
+        )
 
 def _rule_based_decision(question: str) -> QueryIntentDecision | None:
     precise_locators = {
@@ -508,6 +545,11 @@ def analyze_query_intent(
             extra_body={"enable_thinking": False},
         )
         decision = _parse_intent_decision(_response_content(completion))
+        _validate_parallel_subquery_drift(
+            normalized_question,
+            decision,
+        )
+
         logger.info(
             "RAG query intent analyzed: intent=%s need_rewrite=%s need_decompose=%s source=%s",
             decision.intent,
@@ -518,13 +560,29 @@ def analyze_query_intent(
         return decision
     except Exception as error:
         logger.warning(
-            "RAG query intent analysis failed; skipping rewrite: %s",
+            "RAG query intent analysis or plan validation failed: %s",
             type(error).__name__,
         )
+
+        has_colloquial_language = any(
+            pattern.search(normalized_question)
+            for pattern in COLLOQUIAL_PATTERNS
+        )
+
         return QueryIntentDecision(
-            intent="general_lookup",
-            need_rewrite=False,
+            intent=(
+                "colloquial_lookup"
+                if has_colloquial_language
+                else "general_lookup"
+            ),
+            need_rewrite=has_colloquial_language,
             need_decompose=False,
-            reason="意图识别失败，保守使用原查询",
+            reason=(
+                "意图识别或子查询保真校验失败；"
+                "口语问题回退为受保真校验的单查询改写"
+                if has_colloquial_language
+                else "意图识别失败，保守使用原查询"
+            ),
             source="fallback",
         )
+    
