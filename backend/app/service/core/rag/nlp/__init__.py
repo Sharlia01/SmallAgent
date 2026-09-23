@@ -6,7 +6,8 @@ import logging
 import chardet
 from service.core.rag.utils import num_tokens_from_string
 from PIL import Image
-from service.core.table_evidence import table_evidence
+from service.core.table_evidence import parse_table_object
+from service.core.table_models import build_table_chunks
 from service.core.figure_evidence import figure_evidence
 
 def is_english(texts):
@@ -217,14 +218,55 @@ def tokenize_table(tbls, doc, eng, batch_size=10):
     rows  # 表格识别出来的文本
     poss  # 表格所在页码和坐标
     """
-    for (img, rows), poss in tbls:
+    for table_ordinal, ((img, rows), poss) in enumerate(tbls, start=1):
         if not rows:
             continue
         if isinstance(rows, dict) and rows.get("kind") == "figure":
             records = [figure_evidence(img, rows.get("text", ""))]
         # 如果识别的表格是HTML字符串，则解析出表格的行和列
         elif isinstance(rows, str) and re.search(r"<table\b", rows, re.I):
-            records = table_evidence(img, rows)
+            location = {}
+            add_positions(location, poss)
+            table_object = parse_table_object(
+                img,
+                rows,
+                provenance={
+                    "document_name": str(doc.get("docnm_kwd") or ""),
+                    "table_ordinal": table_ordinal,
+                    "page_num_int": location.get("page_num_int") or [],
+                    "position_int": location.get("position_int") or [],
+                },
+            )
+            table_object_payload = table_object.to_dict()
+            # 将表格对象拆分为多个块，每个块包含一定数量的行，以便后续处理
+            for table_chunk in build_table_chunks(table_object):
+                d = copy.deepcopy(doc)
+                # Only semantic_text participates in keyword search and
+                # embedding.  The LLM-facing content is deterministic Markdown.
+                tokenize(d, table_chunk.semantic_text, eng)
+                d["content_with_weight"] = table_chunk.markdown_excerpt
+                d.update(table_chunk.to_record())
+                d.update({
+                    "evidence_type_kwd": "table",
+                    "locator_kwd": table_object.cells_json.get("caption") or "",
+                    "table_binding_kwd": table_object.cells_json.get("binding_status"),
+                    "table_binding_source_kwd": table_object.cells_json.get("binding_source"),
+                    "table_model_kwd": table_object.cells_json.get("binding_model"),
+                })
+                slice_rows = table_chunk.cells_slice.get("rows") or []
+                if len(slice_rows) == 1:
+                    row = slice_rows[0]
+                    d["table_headers_kwd"] = row.get("headers") or []
+                    d["table_cells_kwd"] = row.get("cells") or []
+                    d["table_row_int"] = row.get("row_index")
+                # All child chunks share one in-memory parent payload; the
+                # persistence layer writes it once per table_id.
+                d["_table_object"] = table_object_payload
+                if img is not None:
+                    d["image"] = img
+                add_positions(d, poss)
+                res.append(d)
+            continue
         else:
             records = []
         if records:

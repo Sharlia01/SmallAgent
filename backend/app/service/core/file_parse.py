@@ -2,9 +2,11 @@ import datetime
 import hashlib
 import json
 import os
+import re
 from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, List
+from uuid import uuid4
 
 import xxhash
 
@@ -13,21 +15,79 @@ from service.core.rag.nlp.model import EMBEDDING_VECTOR_FIELD, generate_embeddin
 from service.core.rag.utils.es_conn import ESConnection
 from service.core.api.utils.file_utils import get_project_base_directory
 from service.core.evidence_metadata import evidence_metadata
+from service.core.table_models import TABLE_PARSER_VERSION
 
-PARSER_VERSION = "table-figure-v4"
+PARSER_VERSION = TABLE_PARSER_VERSION
+
+
+def _tenant_storage_key(index_name: str) -> str:
+    return hashlib.sha256(index_name.encode()).hexdigest()[:24]
 
 def _save_evidence_image(image, index_name: str, doc_id: str) -> str:
     buffer = BytesIO()
     image.save(buffer, format="PNG")
     data = buffer.getvalue()
     # Hash tenant and document identifiers instead of accepting path fragments.
-    tenant = hashlib.sha256(index_name.encode()).hexdigest()[:24]
+    tenant = _tenant_storage_key(index_name)
     relative = Path("storage/evidence") / tenant / doc_id / (hashlib.sha256(data).hexdigest() + ".png")
     path = Path(get_project_base_directory()) / relative
     path.parent.mkdir(parents=True, exist_ok=True)
     if not path.exists():
         path.write_bytes(data)
     return relative.as_posix()
+
+
+def _save_table_object(
+    table_object: dict[str, Any],
+    index_name: str,
+    doc_id: str,
+    file_name: str,
+    image_ref: str | None,
+) -> str:
+    """Persist a content-addressed parent object outside the chunk index."""
+    table_id = str(table_object.get("table_id") or "")
+    if not re.fullmatch(r"[0-9a-f]{64}", table_id):
+        raise ValueError("Table object requires a SHA-256 table_id")
+
+    payload = json.loads(json.dumps(table_object, ensure_ascii=False))
+    provenance = payload.setdefault("provenance", {})
+    provenance.update({
+        "doc_id": doc_id,
+        "kb_id": index_name,
+        "document_name": file_name,
+        "parser_version": PARSER_VERSION,
+    })
+    if image_ref:
+        provenance["image_ref_kwd"] = image_ref
+
+    relative = (
+        Path("storage/table_objects")
+        / _tenant_storage_key(index_name)
+        / doc_id
+        / f"{table_id}.json"
+    )
+    path = Path(get_project_base_directory()) / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+    if not path.exists() or path.read_text(encoding="utf-8") != serialized:
+        temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+        try:
+            temporary.write_text(serialized, encoding="utf-8")
+            os.replace(temporary, path)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+    return relative.as_posix()
+
+
+def load_table_object(reference: str) -> dict[str, Any]:
+    """Load a saved parent object while rejecting paths outside storage."""
+    base = Path(get_project_base_directory()).resolve()
+    path = (base / reference).resolve()
+    table_root = (base / "storage/table_objects").resolve()
+    if table_root not in path.parents or path.suffix != ".json":
+        raise ValueError("Invalid table object reference")
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def dummy(prog=None, msg=""):
@@ -79,7 +139,11 @@ def process_items(
         处理后的数据项列表
     """
     # 准备批量处理的数据
-    texts = [item["content_with_weight"] for item in items]
+    texts = [
+        item.get("table_semantic_text_with_weight")
+        or item["content_with_weight"]
+        for item in items
+    ]
     # 使用当前配置的本地或远程 provider 批量生成向量
     embeddings = batch_generate_embeddings(texts)
 
@@ -87,10 +151,14 @@ def process_items(
     results = []
     doc_id = xxhash.xxh64(file_name.encode("utf-8")).hexdigest()
     image_refs = {}
+    table_object_refs = {}
     for ordinal, (item, embedding) in enumerate(zip(items, embeddings)):
         # 生成 chunk_id
         identity = [PARSER_VERSION, index_name, doc_id, ordinal,
-                    item.get("position_int", []), item["content_with_weight"]]
+                    item.get("position_int", []), item.get("table_id_kwd", ""),
+                    item.get("table_row_start_int"), item.get("table_row_end_int"),
+                    item.get("table_semantic_text_with_weight")
+                    or item["content_with_weight"]]
         chunck_id = hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
 
         # 构建数据字典
@@ -114,11 +182,28 @@ def process_items(
         d["title_tks"] = item["title_tks"]
         d["doc_id"] = doc_id
         d["docnm"] = file_name
+        image_ref = None
         if item.get("image") is not None:
             image_key = id(item["image"])
             if image_key not in image_refs:
                 image_refs[image_key] = _save_evidence_image(item["image"], index_name, doc_id)
-            d["image_ref_kwd"] = image_refs[image_key]
+            image_ref = image_refs[image_key]
+            d["image_ref_kwd"] = image_ref
+
+        table_object = item.get("_table_object")
+        if isinstance(table_object, dict):
+            table_id = str(table_object.get("table_id") or "")
+            if table_id != str(item.get("table_id_kwd") or ""):
+                raise ValueError("Table chunk and table object IDs do not match")
+            if table_id not in table_object_refs:
+                table_object_refs[table_id] = _save_table_object(
+                    table_object,
+                    index_name,
+                    doc_id,
+                    file_name,
+                    image_ref,
+                )
+            d["table_object_ref_kwd"] = table_object_refs[table_id]
 
         d[EMBEDDING_VECTOR_FIELD] = embedding
 

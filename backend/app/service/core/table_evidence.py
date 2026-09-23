@@ -2,13 +2,21 @@
 
 import base64
 from dataclasses import dataclass
-from html import escape
+from html import escape, unescape
 from html.parser import HTMLParser
 from io import BytesIO
 import json
 import logging
 import os
 import re
+
+from service.core.table_models import (
+    TableObject,
+    TABLE_PARSER_VERSION,
+    build_semantic_summary,
+    build_table_markdown,
+    make_table_id,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -274,6 +282,10 @@ def bind_table_rows(html: str) -> list[dict]:
             "table_headers_kwd": labels,
             "table_cells_kwd": values,
             "table_row_int": r + 1,
+            "table_context_kwd": "；".join(
+                part for part in [*context, section] if part
+            ),
+            "table_preamble_kwd": preamble,
         })
     return result or fallback
 
@@ -350,6 +362,7 @@ def extract_visual_table(image, html: str, *, client=None) -> list[dict]:
                 "table_headers_kwd": row["headers"],
                 "table_cells_kwd": row["cells"],
                 "table_row_int": index,
+                "table_context_kwd": row["context"],
             }
             for index, row in enumerate(rows, start=1)
         ]
@@ -358,7 +371,7 @@ def extract_visual_table(image, html: str, *, client=None) -> list[dict]:
         return []
 
 
-def table_evidence(image, html: str, *, client=None) -> list[dict]:
+def _select_table_records(image, html: str, *, client=None) -> list[dict]:
     deterministic = bind_table_rows(html)
 
     # 普通HTML表格已经绑定成功，不调用多模态模型
@@ -382,3 +395,131 @@ def table_evidence(image, html: str, *, client=None) -> list[dict]:
         client=client,
     )
     return visual_records or deterministic
+
+
+def table_evidence(image, html: str, *, client=None) -> list[dict]:
+    """Compatibility API returning the searchable row evidence only."""
+    return _select_table_records(image, html, client=client)
+
+
+def _normalized_parser_cells(html: str) -> dict:
+    """Serialize the parser grid, including explicit merged-cell references."""
+    raw_text = " ".join(unescape(re.sub(r"<[^>]+>", " ", html)).split())
+    parser = TableParser()
+    try:
+        parser.feed(html)
+        grid = _grid(parser.rows)
+    except (ValueError, TypeError):
+        return {
+            "caption": " ".join(parser.caption.split()),
+            "cells": [],
+            "cell_refs": [],
+            "raw_grid": [],
+            "raw_text": raw_text,
+        }
+
+    cell_ids: dict[int, str] = {}
+    cells = []
+    for row_index, row in enumerate(grid):
+        for column_index, cell in enumerate(row):
+            if cell is None or id(cell) in cell_ids:
+                continue
+            cell_id = f"r{row_index}c{column_index}"
+            cell_ids[id(cell)] = cell_id
+            cells.append({
+                "cell_id": cell_id,
+                "row": row_index,
+                "column": column_index,
+                "rowspan": cell.rowspan,
+                "colspan": cell.colspan,
+                "role": "header" if cell.header else "data",
+                "scope": cell.scope,
+                "text": cell.text,
+            })
+
+    return {
+        "caption": " ".join(parser.caption.split()),
+        "cells": cells,
+        "cell_refs": [
+            [cell_ids.get(id(cell), "") if cell is not None else "" for cell in row]
+            for row in grid
+        ],
+        "raw_grid": [
+            [cell.text if cell is not None else "" for cell in row]
+            for row in grid
+        ],
+        "raw_text": raw_text,
+    }
+
+
+def parse_table_object(
+    image,
+    html: str,
+    *,
+    table_id: str | None = None,
+    provenance: dict,
+    client=None,
+) -> TableObject:
+    """Build the complete fact object before deriving searchable chunks."""
+    records = _select_table_records(image, html, client=client)
+    parser_cells = _normalized_parser_cells(html)
+    first = records[0] if records else {}
+    caption = str(first.get("locator_kwd") or parser_cells["caption"] or "")
+    binding_status = str(first.get("table_binding_kwd") or "unbound")
+    binding_source = str(
+        first.get("table_binding_source_kwd") or "deterministic"
+    )
+
+    data_rows = []
+    for sequence, record in enumerate(records, start=1):
+        headers = record.get("table_headers_kwd")
+        cells = record.get("table_cells_kwd")
+        if not isinstance(headers, list) or not isinstance(cells, list):
+            continue
+        if not headers or len(headers) != len(cells):
+            continue
+        data_rows.append({
+            "row_index": int(record.get("table_row_int") or sequence),
+            "context": str(record.get("table_context_kwd") or ""),
+            "preamble": str(record.get("table_preamble_kwd") or ""),
+            "headers": [str(value) for value in headers],
+            "cells": [str(value) for value in cells],
+        })
+
+    cells_json = {
+        "schema_version": "1.0",
+        "caption": caption,
+        "binding_status": binding_status,
+        "binding_source": binding_source,
+        "binding_model": first.get("table_model_kwd"),
+        "cells": parser_cells["cells"],
+        "cell_refs": parser_cells["cell_refs"],
+        "raw_grid": parser_cells["raw_grid"],
+        "raw_text": parser_cells["raw_text"],
+        "data_rows": data_rows,
+    }
+    object_provenance = {
+        **provenance,
+        "parser_version": TABLE_PARSER_VERSION,
+        "binding_status": binding_status,
+        "binding_source": binding_source,
+    }
+    if first.get("table_model_kwd"):
+        object_provenance["table_model"] = first["table_model_kwd"]
+
+    resolved_table_id = table_id or make_table_id(
+        str(provenance.get("document_name") or ""),
+        int(provenance.get("table_ordinal") or 0),
+        list(provenance.get("position_int") or []),
+        html,
+        cells_json,
+    )
+
+    return TableObject(
+        table_id=resolved_table_id,
+        parser_html=html,
+        cells_json=cells_json,
+        markdown=build_table_markdown(cells_json),
+        semantic_summary=build_semantic_summary(cells_json),
+        provenance=object_provenance,
+    )

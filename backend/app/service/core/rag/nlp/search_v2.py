@@ -17,7 +17,11 @@ import logging
 from collections import defaultdict
 #数据类，类似于其他语言中的结构体
 from dataclasses import dataclass, field as dataclass_field
-from service.core.evidence_metadata import EVIDENCE_FIELDS, evidence_metadata
+from service.core.evidence_metadata import (
+    EVIDENCE_FIELDS,
+    evidence_metadata,
+    ranking_text,
+)
 
 from service.core.rag.settings import TAG_FLD, PAGERANK_FLD
 from service.core.rag.utils import rmSpace
@@ -714,10 +718,7 @@ class Dealer:
         documents = []
         for chunk_id in search_result.ids:
             source = search_result.field[chunk_id]
-            content = source.get("content_with_weight")
-            if not content:
-                content = rmSpace(source.get("content_ltks", ""))
-            documents.append(str(content))
+            documents.append(str(ranking_text(source)))
 
         semantic_scores, _ = rerank_similarity(query, documents)
         return np.asarray(semantic_scores, dtype=float)
@@ -793,9 +794,7 @@ class Dealer:
         compatibility_by_id = {}
         for chunk_id in search_result.ids:
             source = search_result.field[chunk_id]
-            content = source.get("content_with_weight")
-            if not content:
-                content = rmSpace(source.get("content_ltks", ""))
+            content = ranking_text(source)
             # 计算约束兼容性
             decision = evaluate_constraint_compatibility(
                 question,

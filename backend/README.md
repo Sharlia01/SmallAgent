@@ -129,9 +129,24 @@ CLI 请求默认关闭回答后的推荐问题生成；会话标题直接取首�
 
 ### 表格、图表与重新入库
 
-表格解析不需要新增大模型：识别出的 HTML 按行生成证据，每行携带多级表头、
-行标签、表标题及表内单位说明。`rowspan/colspan` 会先展开，空白值不会变成 0；
-无法可靠绑定的表格默认保留原始 HTML，并标为 `table_binding_kwd=unbound`。
+表格解析采用两层结构。`Table Object` 保存解析器原始 HTML、规范化单元格网格、
+合并关系、完整 Markdown、表级摘要和来源信息，是可审计、可重建的事实源；
+`Table Chunk` 默认按数据行生成，只负责关键词召回、embedding 和 reranker。
+Chunk 的 `semantic_text` 用于检索，返回给 LLM 的内容则是从 `cells_json`
+确定性生成的 Markdown，精确值另存于 `cells_slice`。父子通过 `table_id` 关联。
+
+Table Object 以内容寻址 JSON 保存在 `app/service/core/storage/table_objects`，
+不与可检索 chunk 混入同一 ES 索引。识别出的多级表头、行标签、表标题及表内
+单位说明会进入子块；`rowspan/colspan` 会展开并在父对象中保留合并关系，空白值
+不会变成 0。无法可靠绑定的表格保留原始 HTML 和网格，并标为
+`table_binding_kwd=unbound`。
+
+表格行完成召回和重排后，回答阶段会按 `table_id` 加载父对象：不超过 5 行的
+小表返回整表；普通表返回命中行前后各 2 行；带分区上下文的表优先扩展到同一
+分区，并受 512 token 限制；超过 8 列的表按列窗口裁剪并始终保留行标题列。
+`unbound` 表仍返回整表并标记为不可靠。相关阈值可通过
+`RAG_TABLE_SMALL_TABLE_ROWS`、`RAG_TABLE_NEIGHBOR_RADIUS`、
+`RAG_TABLE_CONTEXT_MAX_TOKENS` 和 `RAG_TABLE_CONTEXT_MAX_COLUMNS` 调整。
 开启下述视觉模块后，这类表格会尝试结合截图重新绑定；失败时仍回退到原始 HTML。
 上游 OCR 或行列识别错误仍需核对原文，模型提取结果也需要人工核验。
 

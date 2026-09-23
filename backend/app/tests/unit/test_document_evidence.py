@@ -5,7 +5,13 @@ from unittest.mock import Mock
 from PIL import Image
 import pytest
 
-from service.core.table_evidence import bind_table_rows, extract_visual_table, table_evidence
+from service.core.table_evidence import (
+    bind_table_rows,
+    extract_visual_table,
+    parse_table_object,
+    table_evidence,
+)
+from service.core.table_models import build_table_chunks, make_table_id
 from service.core.figure_evidence import figure_evidence
 from service.core.rag.nlp import tokenize_table
 from service.core.rag.nlp import rag_tokenizer
@@ -40,6 +46,54 @@ def test_multilevel_headers_rowspans_units_blank_and_zero():
     ]
     assert rows[0]["table_cells_kwd"] == ["发电", "境内", "0", "-12.5"]
     assert rows[1]["table_row_int"] == 5
+
+
+def test_table_object_is_fact_source_and_chunks_are_search_children():
+    html = """<table><caption>表1 收入</caption>
+    <tr><th rowspan="2">业务</th><th colspan="2">收入</th></tr>
+    <tr><th>2023年</th><th>2024年</th></tr>
+    <tr><td>发电</td><td>100</td><td>120</td></tr></table>"""
+    table_id = make_table_id("report.pdf", 1, [(2, 1, 10, 5, 20)], html)
+    table = parse_table_object(
+        None,
+        html,
+        table_id=table_id,
+        provenance={"document_name": "report.pdf", "page_num_int": [2]},
+    )
+
+    assert table.table_id == table_id
+    assert table.parser_html == html
+    assert table.cells_json["cell_refs"][0][0] == table.cells_json["cell_refs"][1][0]
+    assert any(cell["rowspan"] == 2 for cell in table.cells_json["cells"])
+    assert "| 业务 | 收入 / 2023年 | 收入 / 2024年 |" in table.markdown
+    assert "字段：业务、收入 / 2023年、收入 / 2024年" in table.semantic_summary
+
+    chunks = build_table_chunks(table)
+    assert len(chunks) == 1
+    assert chunks[0].table_id == table_id
+    assert chunks[0].semantic_text.endswith(
+        "业务：发电；收入 / 2023年：100；收入 / 2024年：120"
+    )
+    assert "<table>" not in chunks[0].markdown_excerpt
+    assert chunks[0].cells_slice["rows"][0]["cells"] == ["发电", "100", "120"]
+
+
+def test_unbound_table_keeps_raw_fact_source_without_inventing_headers():
+    html = "<table><tr><td>收入</td><td>100</td></tr></table>"
+    table = parse_table_object(
+        None,
+        html,
+        provenance={"document_name": "report.pdf", "table_ordinal": 1},
+    )
+
+    assert table.parser_html == html
+    assert table.cells_json["binding_status"] == "unbound"
+    assert table.cells_json["data_rows"] == []
+    assert table.cells_json["raw_grid"] == [["收入", "100"]]
+    assert "第1行：收入 | 100" in table.markdown
+    chunks = build_table_chunks(table)
+    assert chunks[0].chunk_kind == "unbound_table"
+    assert "不得猜测表头与数值的对应关系" in chunks[0].semantic_text
 
 
 def test_repeated_headers_and_row_header_do_not_swallow_data():
@@ -283,6 +337,33 @@ def test_tokenization_retains_positions_and_figure_type(monkeypatch):
     assert "未提取视觉事实" in records[0]["content_with_weight"]
 
 
+def test_table_tokenization_separates_search_text_from_llm_markdown(monkeypatch):
+    monkeypatch.setattr(rag_tokenizer, "tokenize", lambda text: text)
+    monkeypatch.setattr(rag_tokenizer, "fine_grained_tokenize", lambda text: text)
+    html = (
+        "<table><caption>估值表</caption>"
+        "<tr><th>公司</th><th>PE / 25E</th></tr>"
+        "<tr><td>龙源电力</td><td>19.6</td></tr></table>"
+    )
+    records = tokenize_table(
+        [((None, html), [(0, 10, 80, 20, 100)])],
+        {"docnm_kwd": "report.pdf", "title_tks": "report"},
+        False,
+    )
+
+    assert len(records) == 1
+    assert records[0]["table_chunk_kind_kwd"] == "row"
+    assert records[0]["table_semantic_text_with_weight"].endswith(
+        "公司：龙源电力；PE / 25E：19.6"
+    )
+    assert records[0]["content_with_weight"].startswith("### 估值表\n| 公司 | PE / 25E |")
+    assert records[0]["table_cells_slice_obj"]["rows"][0]["cells"] == [
+        "龙源电力", "19.6",
+    ]
+    assert records[0]["_table_object"]["table_id"] == records[0]["table_id_kwd"]
+    assert records[0]["page_num_int"] == [1]
+
+
 def test_chunk_ids_include_document_and_position_and_images_are_saved(monkeypatch, tmp_path):
     monkeypatch.setattr(file_parse, "batch_generate_embeddings", lambda texts: [[0.1] * 512 for _ in texts])
     monkeypatch.setattr(file_parse, "get_project_base_directory", lambda: str(tmp_path))
@@ -297,6 +378,39 @@ def test_chunk_ids_include_document_and_position_and_images_are_saved(monkeypatc
     assert first[0]["docnm_kwd"] == "a.pdf"
     assert (tmp_path / first[0]["image_ref_kwd"]).is_file()
     json.dumps(first)
+
+
+def test_process_items_persists_parent_and_embeds_semantic_text(monkeypatch, tmp_path):
+    monkeypatch.setattr(rag_tokenizer, "tokenize", lambda text: text)
+    monkeypatch.setattr(rag_tokenizer, "fine_grained_tokenize", lambda text: text)
+    captured = []
+    monkeypatch.setattr(
+        file_parse,
+        "batch_generate_embeddings",
+        lambda texts: captured.extend(texts) or [[0.1] * 512 for _ in texts],
+    )
+    monkeypatch.setattr(file_parse, "get_project_base_directory", lambda: str(tmp_path))
+    html = (
+        "<table><caption>估值表</caption>"
+        "<tr><th>公司</th><th>PE</th></tr>"
+        "<tr><td>龙源电力</td><td>19.6</td></tr></table>"
+    )
+    item = tokenize_table(
+        [((Image.new("RGB", (2, 2)), html), [(0, 1, 10, 5, 20)])],
+        {"docnm_kwd": "report.pdf", "title_tks": "report"},
+        False,
+    )[0]
+
+    processed = file_parse.process_items([item], "report.pdf", "tenant-1")
+
+    assert captured == [item["table_semantic_text_with_weight"]]
+    assert processed[0]["content_with_weight"] == item["table_markdown_excerpt_with_weight"]
+    reference = processed[0]["table_object_ref_kwd"]
+    parent = file_parse.load_table_object(reference)
+    assert parent["table_id"] == processed[0]["table_id_kwd"]
+    assert parent["provenance"]["document_name"] == "report.pdf"
+    assert parent["provenance"]["parser_version"] == file_parse.PARSER_VERSION
+    assert parent["provenance"]["image_ref_kwd"] == processed[0]["image_ref_kwd"]
 
 
 def test_reindex_writes_before_deleting_only_superseded_ids(monkeypatch):
@@ -366,7 +480,17 @@ def test_retrieval_keeps_structured_table_metadata():
         "table_binding_kwd": "bound",
         "table_headers_kwd": ["公司", "PE / 25E"],
         "table_cells_kwd": ["龙源电力", "19.6"],
+        "table_id_kwd": "table-parent",
+        "table_chunk_kind_kwd": "row",
+        "table_row_start_int": 2,
+        "table_row_end_int": 2,
+        "table_cells_slice_obj": {
+            "rows": [{"headers": ["公司"], "cells": ["龙源电力"]}],
+        },
     }, 1)
 
     assert formatted["table_headers_kwd"] == ["公司", "PE / 25E"]
     assert formatted["table_cells_kwd"] == ["龙源电力", "19.6"]
+    assert formatted["table_id_kwd"] == "table-parent"
+    assert formatted["table_row_start_int"] == 2
+    assert formatted["table_cells_slice_obj"]["rows"][0]["cells"] == ["龙源电力"]

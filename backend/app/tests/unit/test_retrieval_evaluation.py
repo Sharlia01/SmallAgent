@@ -90,6 +90,48 @@ def test_structured_table_cell_mismatch_cannot_be_hidden_by_duplicate_text():
     assert table_row_chunk_match_score(evidence, retrieved) == 0.0
 
 
+def test_reliable_parent_expansion_matches_a_neighboring_table_row():
+    evidence = {
+        "document_name": "国电电力.pdf",
+        "evidence_type": "table",
+        "row_cells": ["每股收益", "0.40", "0.44", "0.49"],
+    }
+    retrieved = {
+        "docnm_kwd": "国电电力.pdf",
+        "table_cells_kwd": ["归母净利润", "7050", "7895", "8717"],
+        "table_context_obj": {
+            "reliable": True,
+            "rows": [{
+                "row_index": 8,
+                "headers": ["指标", "2025E", "2026E", "2027E"],
+                "cells": ["每股收益", "0.40", "0.44", "0.49"],
+            }],
+        },
+        "content_with_weight": "扩展后的 Markdown",
+    }
+
+    assert table_row_chunk_match_score(evidence, retrieved) == 1.0
+
+
+def test_unreliable_parent_expansion_cannot_override_atomic_cell_mismatch():
+    evidence = {
+        "document_name": "国电电力.pdf",
+        "evidence_type": "table",
+        "row_cells": ["每股收益", "0.40"],
+    }
+    retrieved = {
+        "docnm_kwd": "国电电力.pdf",
+        "table_cells_kwd": ["每股收益", "0.41"],
+        "table_context_obj": {
+            "reliable": False,
+            "rows": [{"cells": ["每股收益", "0.40"]}],
+        },
+        "content_with_weight": "每股收益 0.40",
+    }
+
+    assert table_row_chunk_match_score(evidence, retrieved) == 0.0
+
+
 def test_canonical_html_table_remains_compatible_with_legacy_gold_text():
     evidence = {
         "document_name": "国电电力.pdf",

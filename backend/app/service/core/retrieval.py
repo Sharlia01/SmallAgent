@@ -5,7 +5,7 @@ import os
 from dataclasses import replace
 from functools import lru_cache
 from typing import Any
-from service.core.evidence_metadata import evidence_metadata
+from service.core.evidence_metadata import evidence_metadata, ranking_text
 
 from service.core.constraint_compatibility import evaluate_constraint_compatibility
 from service.core.evidence_sufficiency import check_evidence_sufficiency
@@ -24,6 +24,7 @@ from service.core.sequential_retrieval import (
     extract_bridge_value,
     resolve_query_template,
 )
+from service.core.table_context import expand_table_contexts
 
 
 DEFAULT_PAGE_SIZE = 5
@@ -163,8 +164,7 @@ def _merge_sequential_hops(
             scores, _ = rerank_similarity(
                 original_question,
                 [
-                    str(chunks_by_key[key].get("content_with_weight")
-                        or chunks_by_key[key].get("content_ltks") or "")
+                    str(ranking_text(chunks_by_key[key]))
                     for key in candidate_keys
                 ],
             )
@@ -450,6 +450,14 @@ def retrieve_raw_results(
                 "applied": False,
                 "fallback_reason": sequential_fallback_reason,
             }
+
+    # Retrieval and reranking use atomic row chunks.  Only after ranking do we
+    # expand table hits into bounded parent-table context for sufficiency and
+    # the answering LLM.
+    result["chunks"] = expand_table_contexts(
+        list(result.get("chunks") or []),
+        original_question,
+    )
 
     # 保留检查前的结果，离线评测分别统计检索质量和拒答表现。
     result["chunks_before_sufficiency"] = list(result.get("chunks") or [])

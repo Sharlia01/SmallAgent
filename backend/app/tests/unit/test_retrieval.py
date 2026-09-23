@@ -303,6 +303,63 @@ def test_retrieve_raw_results_keeps_sufficient_evidence(monkeypatch):
 
 
 @pytest.mark.unit
+def test_table_context_expands_before_sufficiency_check(monkeypatch):
+    class FakeDealer:
+        @staticmethod
+        def retrieval(**_kwargs):
+            return {
+                "total": 1,
+                "chunks": [{
+                    "chunk_id": "table-row",
+                    "content_with_weight": "原子行",
+                }],
+                "doc_aggs": [],
+            }
+
+    monkeypatch.setattr(retrieval, "get_retrieval_dealer", lambda: FakeDealer())
+    monkeypatch.setattr(
+        retrieval,
+        "analyze_query_intent",
+        lambda _question: QueryIntentDecision(
+            intent="precise_lookup",
+            need_rewrite=False,
+            need_decompose=False,
+            reason="精确查询",
+            source="rule",
+        ),
+    )
+    monkeypatch.setattr(
+        retrieval,
+        "expand_table_contexts",
+        lambda chunks, _question: [{
+            **chunks[0],
+            "content_with_weight": "扩展后的表格上下文",
+        }],
+    )
+
+    def check(_question, chunks):
+        assert chunks[0]["content_with_weight"] == "扩展后的表格上下文"
+        return EvidenceSufficiencyDecision(
+            sufficient=True,
+            reason="上下文完整",
+            missing_requirements=[],
+            supporting_chunk_indices=[1],
+            source="model",
+            evaluated_chunk_count=1,
+            evaluated_chunk_ids=["table-row"],
+        )
+
+    monkeypatch.setattr(retrieval, "check_evidence_sufficiency", check)
+
+    result = retrieval.retrieve_raw_results("42", "表格问题")
+
+    assert result["chunks"][0]["content_with_weight"] == "扩展后的表格上下文"
+    assert result["chunks_before_sufficiency"][0]["content_with_weight"] == (
+        "扩展后的表格上下文"
+    )
+
+
+@pytest.mark.unit
 def test_sequential_retrieval_extracts_bridge_and_preserves_each_hop(
     monkeypatch,
 ):
@@ -760,6 +817,39 @@ def test_rerank_preserves_semantic_order_without_constraints(monkeypatch):
             "retrieval_rrf": 0.3 / 11,
         }
     )
+
+
+@pytest.mark.unit
+def test_table_reranker_prefers_semantic_text_over_llm_markdown(monkeypatch):
+    captured = []
+    dealer = object.__new__(search_v2.Dealer)
+    search_result = search_v2.Dealer.SearchResult(
+        total=1,
+        ids=["table-row"],
+        field={
+            "table-row": {
+                "content_with_weight": "| 公司 | PE |\n| --- | --- |\n| 龙源电力 | 19.6 |",
+                "table_semantic_text_with_weight": "公司：龙源电力；PE：19.6",
+            },
+        },
+        rrf_scores={"table-row": 0.03},
+    )
+    monkeypatch.setattr(
+        search_v2,
+        "rerank_similarity",
+        lambda query, documents: (
+            captured.append((query, documents)) or search_v2.np.array([0.9]),
+            None,
+        ),
+    )
+
+    dealer._rerank_results(
+        search_result,
+        "龙源电力估值",
+        search_v2.Dealer.RetrievalOptions(page_size=1),
+    )
+
+    assert captured == [("龙源电力估值", ["公司：龙源电力；PE：19.6"])]
 
 
 @pytest.mark.unit

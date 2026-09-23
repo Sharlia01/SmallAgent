@@ -505,18 +505,18 @@ def _parse_pdf(filename, binary, from_page, to_page, parser_config, callback):
 
 
 def _parse_excel(filename, binary, parser_config, callback):
-    """解析 XLS/XLSX；html4excel=True 时把每块表格保存成 HTML。"""
+    """Parse each worksheet as one table object instead of plain text rows."""
     callback(0.1, "Start to parse.")
     file_content = _load_binary(filename, binary)
     excel_parser = ExcelParser()
 
-    if parser_config.get("html4excel"):
-        raw_sections = excel_parser.html(file_content, 12)
-    else:
-        raw_sections = excel_parser(file_content)
-
-    sections = [(section, "") for section in raw_sections if section]
-    return ParsedDocument(sections=sections, tables=[])
+    # The object layer owns the complete worksheet; row-level chunking happens
+    # later in tokenize_table.  A very large chunk_rows value prevents the old
+    # Excel adapter from splitting one sheet into unrelated pseudo-tables.
+    raw_tables = excel_parser.html(file_content, 1_000_000)
+    tables = [((None, table), "") for table in raw_tables if table]
+    callback(0.8, "Finish parsing.")
+    return ParsedDocument(sections=[], tables=tables)
 
 
 def _parse_text(filename, binary, parser_config, callback):
