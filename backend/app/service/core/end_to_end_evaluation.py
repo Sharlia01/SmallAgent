@@ -36,6 +36,155 @@ def _mean(values: Iterable[float]) -> float | None:
     return round(sum(values) / len(values), 6)
 
 
+def _sample_ids(
+    results: Iterable[dict[str, Any]],
+    predicate,
+) -> list[str]:
+    """Return stable, unique IDs for samples matching ``predicate``."""
+    sample_ids = []
+    seen = set()
+    for result in results:
+        sample_id = str(result.get("id") or "").strip()
+        if not sample_id or sample_id in seen or not predicate(result):
+            continue
+        seen.add(sample_id)
+        sample_ids.append(sample_id)
+    return sample_ids
+
+
+def _non_perfect_sample_ids(
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Map directional E2E metrics to samples that miss their ideal value."""
+    successful = [result for result in results if not result.get("error")]
+    answered = [
+        result for result in successful if result.get("response_mode") == "answer"
+    ]
+
+    def below_one(result: dict[str, Any], group: str, key: str) -> bool:
+        value = (result.get(group) or {}).get(key)
+        return value is not None and float(value) < 1.0
+
+    return {
+        "answer_correctness": _sample_ids(
+            successful,
+            lambda result: below_one(
+                result,
+                "answer_metrics",
+                "correctness_score",
+            ),
+        ),
+        "answer_completeness": _sample_ids(
+            successful,
+            lambda result: below_one(
+                result,
+                "answer_metrics",
+                "completeness_score",
+            ),
+        ),
+        "faithfulness": _sample_ids(
+            successful,
+            lambda result: below_one(
+                result,
+                "faithfulness_metrics",
+                "faithfulness_score",
+            ),
+        ),
+        "faithfulness_coverage": _sample_ids(
+            answered,
+            lambda result: (result.get("faithfulness_metrics") or {}).get(
+                "faithfulness_score",
+            ) is None,
+        ),
+        "faithfulness_micro": _sample_ids(
+            successful,
+            lambda result: int(
+                (result.get("faithfulness_metrics") or {}).get(
+                    "unsupported_claim_count",
+                ) or 0
+            ) > 0,
+        ),
+        "citation_validity": _sample_ids(
+            successful,
+            lambda result: below_one(
+                result,
+                "citation_metrics",
+                "citation_validity",
+            ),
+        ),
+        "citation_precision": _sample_ids(
+            successful,
+            lambda result: below_one(
+                result,
+                "citation_metrics",
+                "citation_precision",
+            ),
+        ),
+        "citation_recall": _sample_ids(
+            successful,
+            lambda result: below_one(
+                result,
+                "citation_metrics",
+                "citation_recall",
+            ),
+        ),
+        "refusal_metrics": {
+            "refusal_precision": _sample_ids(
+                successful,
+                lambda result: (
+                    (result.get("refusal_metrics") or {}).get(
+                        "actual_behavior",
+                    ) == "refuse"
+                    and (result.get("refusal_metrics") or {}).get("correct")
+                    is not True
+                ),
+            ),
+            "refusal_recall": _sample_ids(
+                successful,
+                lambda result: (
+                    (result.get("refusal_metrics") or {}).get(
+                        "expected_behavior",
+                    ) == "refuse"
+                    and (result.get("refusal_metrics") or {}).get("correct")
+                    is not True
+                ),
+            ),
+            "unsafe_answer_rate": _sample_ids(
+                successful,
+                lambda result: (result.get("refusal_metrics") or {}).get(
+                    "unsafe_answer",
+                ) is True,
+            ),
+            "over_refusal_rate": _sample_ids(
+                successful,
+                lambda result: (result.get("refusal_metrics") or {}).get(
+                    "over_refusal",
+                ) is True,
+            ),
+        },
+        "sufficiency_metrics": {
+            "accuracy": _sample_ids(
+                successful,
+                lambda result: (result.get("sufficiency_metrics") or {}).get(
+                    "correct",
+                ) is False,
+            ),
+            "unsafe_accept_rate": _sample_ids(
+                successful,
+                lambda result: (result.get("sufficiency_metrics") or {}).get(
+                    "unsafe_accept",
+                ) is True,
+            ),
+            "false_rejection_rate": _sample_ids(
+                successful,
+                lambda result: (result.get("sufficiency_metrics") or {}).get(
+                    "false_rejection",
+                ) is True,
+            ),
+        },
+    }
+
+
 def _safe_score(value: Any) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ValueError("judge score must be numeric")
@@ -238,7 +387,7 @@ def aggregate_e2e_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         and item["actual_behavior"] == "refuse"
         for item in refusal
     )
-    return {
+    aggregated = {
         "query_count": len(results),
         "successful_query_count": len(successful),
         "error_count": len(results) - len(successful),
@@ -350,6 +499,8 @@ def aggregate_e2e_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             ),
         },
     }
+    aggregated["non_perfect_sample_ids"] = _non_perfect_sample_ids(results)
+    return aggregated
 
 
 def build_e2e_summary(results: list[dict[str, Any]]) -> dict[str, Any]:

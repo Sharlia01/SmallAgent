@@ -74,7 +74,7 @@ v2 校验还会检查证据 ID 唯一性、claim 到 evidence 的引用关系、
 
 检索层现已通过 `retrieve_raw_results()` 保留完整结果，包括 `chunk_id`、各召回分支的原始排名与分数、RRF 分数和最终语义重排分数。当前评测集尚未把标准证据映射到 ES 中的稳定 `chunk_id`，因此评测脚本先校验文档名，再对返回片段和 `relevant_evidence[].text` 做规范化文本匹配。完成第一轮基线并确认切块稳定后，可以把标准 chunk ID 补入证据对象，进一步减少模糊匹配。
 
-检索入口默认先执行 RAG 查询意图识别，再只对确有需要的口语、简称或上下文查询进行规范化和关键词扩展。结果中的 `retrieval.query_intent` 记录意图、`single/parallel/sequential` 检索模式、原因及可执行子查询计划；`retrieval.query_rewrite` 记录原问题和规范化结果；`retrieval.query_transform` 记录扩展查询、最终生效查询及两级保留校验。只有 `sequential` 会执行递进式二跳：第一跳证据中经过原文校验的桥接值用于生成第二跳查询，同文档问题还会继承文档范围。结果中的 `retrieval.sequential_retrieval` 保存桥接值、来源 chunk 和每跳 query，chunk 的 `sequential_subqueries` 保存它覆盖的步骤。普通检索仍分别执行原问题关键词、扩展查询关键词和原问题向量召回，使用加权 RRF 合并后截取候选；没有有效扩展时只执行原问题关键词和原问题向量两路召回。所有检索跳完成后统一执行证据充分性检查，不能完整覆盖问题时清空 `chunks`，并在 `retrieval.evidence_sufficiency` 中记录缺失条件和判定来源。若要恢复原来的全量改写策略，可设置 `RAG_QUERY_INTENT_ENABLED=false`；若只关闭递进式检索并回退单跳，可设置 `RAG_SEQUENTIAL_RETRIEVAL_ENABLED=false`；若要跑完全不含改写与扩展的对照基线，可设置 `QUERY_REWRITE_ENABLED=false`；若只关闭扩展，可设置 `QUERY_EXPANSION_ENABLED=false`；若要关闭充分性检查，可设置 `RAG_EVIDENCE_SUFFICIENCY_ENABLED=false`。
+检索入口默认先执行 RAG 查询意图识别，再只对确有需要的口语、简称或上下文查询进行规范化和关键词扩展。结果中的 `retrieval.query_intent` 记录意图、`single/parallel/sequential` 检索模式、原因及可执行子查询计划；`retrieval.query_rewrite` 记录原问题和规范化结果；`retrieval.query_transform` 记录扩展查询、最终生效查询及两级保留校验。`parallel` 会独立执行 2–3 个互不依赖的子查询，默认为每个子查询在首页保留 2 条候选（页容量不足时自动压缩），去重后使用原问题统一重排。`sequential` 会执行递进式二跳：第一跳证据中经过原文校验的桥接值用于生成第二跳查询，同文档问题还会继承文档范围。结果中的 `retrieval.parallel_retrieval` 和 `retrieval.sequential_retrieval` 分别保存子查询执行与桥接诊断，chunk 的 `parallel_subqueries` 或 `sequential_subqueries` 保存来源步骤。普通检索仍分别执行原问题关键词、扩展查询关键词和原问题向量召回，使用加权 RRF 合并后截取候选；没有有效扩展时只执行原问题关键词和原问题向量两路召回。所有检索跳完成后统一执行证据充分性检查，不能完整覆盖问题时清空 `chunks`，并在 `retrieval.evidence_sufficiency` 中记录缺失条件和判定来源。可通过 `RAG_PARALLEL_RETRIEVAL_ENABLED=false` 或 `RAG_SEQUENTIAL_RETRIEVAL_ENABLED=false` 分别关闭并行或递进检索并回退单次查询。若要恢复原来的全量改写策略，可设置 `RAG_QUERY_INTENT_ENABLED=false`；若要跑完全不含改写与扩展的对照基线，可设置 `QUERY_REWRITE_ENABLED=false`；若只关闭扩展，可设置 `QUERY_EXPANSION_ENABLED=false`；若要关闭充分性检查，可设置 `RAG_EVIDENCE_SUFFICIENCY_ENABLED=false`。
 
 每一跳的语义重排后都会进行第二阶段加权 RRF：语义重排名次权重为 `0.4`，第一阶段检索 RRF 名次权重为 `0.6`，默认平滑常数为 `10`。这种做法只融合两边的名次，不直接混合量纲不同的原始分数。再执行确定性的限定条件兼容性检查，当前覆盖时间范围、实际值/预测值/目标、表图定位符和明确实体；候选未出现可比限定时记为 `unknown`，只有出现明确互斥限定时才记为 `conflict`。明确冲突先降级，其余候选按第二阶段融合分排序。
 
@@ -156,7 +156,7 @@ docker compose exec LS_api \
   --run-name retrieval_smoke
 ```
 
-再运行完整的 Top 10 基线，同时得到 `@1/@3/@5/@10` 指标：
+再运行完整的 Top 10 基线，输出 `@10` 指标：
 
 ```bash
 docker compose exec LS_api \
@@ -184,7 +184,7 @@ docker compose exec LS_api \
 
 同名结果默认不会被覆盖。需要明确覆盖时添加 `--overwrite`，或通过 `--run-name` 使用一个新名称。
 
-新结果使用 `result_schema_version: "2.1"`，将指标分为三组：
+新结果使用 `result_schema_version: "2.4"`，将指标分为三组：
 
 | 分组 | 数据来源 | 用途 |
 | --- | --- | --- |
@@ -211,8 +211,9 @@ docker compose exec LS_api \
 - `duplicate_rate@K`：返回结果中，同文档且规范化文本完全相同的重复 chunk 比例；空结果
   记为 `null`，避免把没有返回任何内容误算成零重复。
 - 若样本使用 `evidence_requirements`，Hit 要求全部要求满足，MRR 使用完成全部要求时的排名。
-- 指标默认在不超过本次 `top_k` 的 `1/3/5/10` 上计算，并始终包含实际 `top_k`；例如
-  `--top-k 5` 产生 `@1/@3/@5`，`--top-k 10` 产生 `@1/@3/@5/@10`。
+- 指标默认只在实际 `top_k` 上计算；例如 `--top-k 5` 只产生 `@5`，避免 summary
+  重复展示多个 cutoff。需要排查排序问题时，逐题结果中的 `first_relevant_rank` 会保留
+  首次命中的具体位置，内部调用也仍可显式请求多个 cutoff。
 - `empty_rate`、`answerable_empty_rate`、`unanswerable_empty_rate`：对应阶段的空结果比例，不能直接视为拒答比例。
 
 汇总结果还包含 `error_rate`、`average_latency_ms`、`latency_p50_ms` 和
@@ -220,19 +221,57 @@ docker compose exec LS_api \
 单独体现。建议始终结合 `by_question_type`、`by_source_modality` 和 `by_split` 查看切片，
 不要只比较整体均值。
 
+逐题 `retrieval.stage_latency_ms` 记录不重叠的阶段耗时：
+
+- `query_transform`：意图识别、查询改写和扩展。
+- `initial_retrieval`：关键词/向量召回及 RRF 融合；多查询或多跳时为各次召回之和。
+- `rerank`：语义重排、约束排序和最终融合；多查询或多跳时包括统一重排。
+- `multi_hop`：仅递进式检索有值，记录桥接值抽取、第二跳构造和多跳编排开销，
+  不重复计算各跳召回与重排。
+- `gate`：证据充分性判定。
+- `other`：表格父上下文扩展、结果组装等未归入上述阶段的耗时。
+- `total`：完整检索流程耗时。
+
+汇总中的 `stage_latency_ms.<stage>` 分别提供 `sample_count`、`average_ms`、
+`p50_ms` 和 `p95_ms`。未执行的多跳阶段记为 `null`，因此只在实际多跳样本上聚合。
+
+每个整体或切片汇总还包含 `non_perfect_sample_ids`。它按原指标的层级和名称列出未达到
+理想值的样本，例如
+`non_perfect_sample_ids.retrieval_metrics.hit_at_5`。Hit、Recall、Precision、MRR、
+AllRequirementsHit、拒答召回率等指标以 `1` 为理想值；`error_rate`、`duplicate_rate`、
+`fallback_rate`、可回答题拒绝率等指标以 `0` 为理想值。指标为 `null` 的样本不作为零分
+列入；原有数值字段保持不变，已有汇总读取逻辑无需迁移。
+
 拒答统计以显式的 `sufficient=false` 为依据，不根据 chunks 是否为空推断：
 
 - `answerable_rejection_rate`：被拒绝的可回答题数 / 有有效判定的可回答题数。
 - `unanswerable_rejection_rate`：被拒绝的不可回答题数 / 有有效判定的不可回答题数。
 - `rejection_rate`：全部有效判定中的拒绝比例。
+- `correct_rejection_after_insufficient_evidence_rate`：门控前标准证据不完整时，
+  被正确拒绝的比例；计数由 `correct_rejection_after_insufficient_evidence_count`
+  给出。这部分损失归因于上游检索，而不是门控误杀。
+- `false_rejection_with_sufficient_evidence_rate`：门控前标准证据已经完整时，
+  仍被错误拒绝的比例；计数由 `false_rejection_with_sufficient_evidence_count`
+  给出。这才是门控自身的误拒率。
 - `fallback_rate`：有效判定中因模型调用或响应校验失败而进入 fallback 的比例。
   fail-open 和 fail-closed 的实际放行或拒绝结果仍计入对应拒答率。
 - 同时记录各项计数及分母 `decision_query_count`、`answerable_decision_count`、
-  `unanswerable_decision_count`。检查关闭、缺少判定或检索报错的样本分别计入
+  `unanswerable_decision_count`。归因分母分别由
+  `evidence_sufficient_answerable_decision_count` 和
+  `evidence_insufficient_answerable_decision_count` 给出；没有门控前快照的历史样本
+  计入 `evidence_attribution_unavailable_answerable_decision_count`。被拒可回答题中，
+  可归因和无法归因的数量分别记录在
+  `answerable_rejected_evidence_attribution_count` 和
+  `answerable_rejected_evidence_attribution_unavailable_count`。检查关闭、缺少判定或
+  检索报错的样本分别计入
   `disabled_query_count`、`unavailable_query_count`、`error_count`，不进入拒答率分母。
 
-可回答题拒答率不等同于误拒率：原文有答案，不代表召回片段足以回答。
-若要统计误拒率，还需要标注检查前的证据是否充分。
+可回答题拒答率不等同于误拒率：原文有答案，不代表召回片段足以回答。2.3 使用
+门控前 `Recall@K=1`（全部标准证据或 requirements 已命中）自动完成这层归因。
+逐题 `gate_metrics` 记录
+`pre_gate_evidence_sufficient` 和 `rejection_attribution`；后者可能为
+`correct_rejection_after_insufficient_evidence`、
+`false_rejection_with_sufficient_evidence` 或 `correct_unanswerable_rejection`。
 
 逐题结果保存 `retrieval.chunks_before_sufficiency`、
 `retrieval.retrieved_count_before_sufficiency`、`retrieval.empty_before_sufficiency`，
@@ -240,11 +279,14 @@ docker compose exec LS_api \
 `retrieval.total_before_evidence_sufficiency` 保存检查前的候选总数，
 与 Top K 片段数不同。检查前后的片段均通过同一序列化逻辑去除 embedding 向量。
 
-兼容性说明：原有逐题 `metrics`、`evidence_matches`、`retrieval.chunks` 及汇总的
-平铺指标继续表示检查后的结果。旧汇总字段 `unanswerable_rejection_rate` 保留原先
-按空结果计算的口径；新的拒答分析应读取 `gate_metrics.unanswerable_rejection_rate`。
-旧 `evidence_sufficiency_fallback_rate` 也保留原口径，新分析读取 `gate_metrics.fallback_rate`。
-`average_latency_ms` 仍是完整检索流程的平均耗时，包含充分性检查，并非某一阶段的耗时。
+2.2 不再写出与 `post_gate_metrics` 完全重复的逐题 `metrics`，也移除了汇总中重复平铺的
+Hit、Recall、MRR、空结果率、旧拒答率和旧 fallback 率。新结果统一读取上述三组指标；
+`evidence_matches`、`retrieval.chunks` 等诊断字段不变。汇总最外层的 `metrics` 仍作为
+`overall`、`by_question_type`、`by_source_modality` 和 `by_split` 的容器保留。
+聚合器仍可读取带旧 `metrics` 字段的 2.1 历史逐题结果。
+2.3 在保持上述字段兼容的基础上增加门控拒绝归因指标。
+2.4 增加逐题阶段耗时及其整体和切片聚合。
+`average_latency_ms` 是完整检索流程的平均耗时，包含充分性检查，并非某一阶段的耗时。
 
 历史结果没有检查前快照时，检查前指标及片段标为 `null`，计入 `unavailable_query_count`，
 不补成零分，也不从最终输出推测。已记录的空列表则是实际空检索，会计入评分。
@@ -303,6 +345,11 @@ faithfulness_score = 被全部最终证据支持的事实主张数 / 事实主�
 事实主张合并后的微平均；同时记录参与评分的样本数、评分覆盖率、judge 失败数和
 支持/不支持主张总数。该指标衡量回答是否忠于检索证据，不判断检索证据本身是否
 真实，也不替代答案正确性。
+汇总中的 `non_perfect_sample_ids` 同样按指标层级列出未达到理想值的样本；例如
+`non_perfect_sample_ids.faithfulness`、
+`non_perfect_sample_ids.refusal_metrics.refusal_recall` 和
+`non_perfect_sample_ids.sufficiency_metrics.accuracy`。危险作答、过度拒答、危险放行和
+错误拒绝等反向指标以 `0` 为理想值。
 端到端结果结构版本已更新为 `1.1`。
 
 证据不充分时，runner 与线上知识库工具共用确定性拒答策略，不调用回答模型。

@@ -48,6 +48,12 @@ EVIDENCE_SUFFICIENCY_SYSTEM_PROMPT = """
 6. 只返回 JSON 对象，不输出其他文字。
 7. evidence_type_kwd=figure 且 visual_status_kwd 不是 extracted 时，仅有图表OCR和题注，不包含视觉事实。标题命中不代表能回答柱高、正负、趋势、图例对应关系等问题；必须有其他明确的文字证据或已提取的视觉事实支持。OCR中孤立的年份、数字不能自行配对。
 8. table_binding_kwd=unbound 的表格尚未可靠绑定表头。只有原始内容明确、无歧义地对应问题时才能作为证据，不得猜测错位或缺失的列关系。
+9. 先根据问题和候选证据确定对象范围，不得擅自扩大。问题未明确出现“全行业”“全市场”“各公司”“可比公司”等跨主体限定时，不得自行要求行业或多公司数据。如果候选证据明确在同一公司、同一报告或同一已限定主体内列出多个分类，则“最高/最低的板块”指这些已列分类之间的比较。
+10. “该板块”“该类”“它”等后续指代必须继承问题前文或证据已确定的对象与主体范围。对递进问题，允许先用一个片段确定桥接值，再用另一个片段支持该桥接值对应的后续事实。
+
+范围判定示例：
+- 问题要求“找出归母净利润最高的电源板块，再说明该类电源的发电量”，候选证据列出同一公司的煤电、气电、水电、风电和光伏板块时，应在这些公司内部板块中比较；不得要求全行业各公司数据。
+- 只有当问题明确要求“全行业哪家公司”或“可比公司中”时，才应要求跨公司的完整比较证据。
 
 返回格式：
 {
@@ -65,13 +71,13 @@ sufficient 为 true 时，missing_requirements 必须为空数组。索引从 1 
 class EvidenceSufficiencyDecision:
     """Structured answerability decision for the final retrieved chunks."""
 
-    sufficient: bool
-    reason: str
-    missing_requirements: list[str]
-    supporting_chunk_indices: list[int]
-    source: EvidenceSufficiencySource
-    evaluated_chunk_count: int
-    evaluated_chunk_ids: list[str]
+    sufficient: bool    # 现有证据是否完整
+    reason: str         # 简短说明判定原因
+    missing_requirements: list[str]    #还差什么要求
+    supporting_chunk_indices: list[int] #支撑结论的chunk下标
+    source: EvidenceSufficiencySource   # 判定不充分的来源 无证据/功能关闭/LLM判定
+    evaluated_chunk_count: int           #评估的候选证据数量，这次校验实际看了多少个chunk
+    evaluated_chunk_ids: list[str]       #被评估的chunk ID列表
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -250,6 +256,8 @@ def check_evidence_sufficiency(
     client: Any | None = None,
 ) -> EvidenceSufficiencyDecision:
     """Return whether the final chunks explicitly cover the whole question."""
+
+    # 规范化问题，把chunks整理成规整的证据列表，并抽出chunk_ids用于后续记录。
     normalized_question = question.strip() if isinstance(question, str) else ""
     evidence = _prepare_evidence(chunks if isinstance(chunks, list) else [])
     chunk_ids = [item["chunk_id"] for item in evidence]
@@ -277,6 +285,7 @@ def check_evidence_sufficiency(
         )
 
     # A disabled/failed verifier must not promote OCR-only figures to visual facts.
+    # 如果问题明显是问图表视觉事实，而候选证据中只有图表OCR和题注，没有提取的视觉事实，则判定为不充分。
     visual_question = bool(re.search(
         r"柱|曲线|折线|饼图|图例|颜色|零轴|正负|为负|负值|趋势|增速|最高|最低|"
         r"展示.*季度|哪.*(?:年|季度)|bar|curve|legend|trend|negative",
@@ -313,6 +322,8 @@ def check_evidence_sufficiency(
 
     try:
         resolved_client = client or get_evidence_sufficiency_client()
+        # 调用LLM做JSON判定，返回是否充分、缺失的要求和支持的证据索引。
+        # 这里输入是结构化JSON输入，输出也是结构化JSON，避免模型生成不规范文本。
         completion = resolved_client.chat.completions.create(
             model=os.getenv(
                 "RAG_EVIDENCE_SUFFICIENCY_MODEL",

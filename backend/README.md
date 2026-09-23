@@ -26,6 +26,8 @@ BGE_MODEL_HOST_PATH=../../models/bge-small-zh-v1.5
 RERANKER_BACKEND=local
 RERANKER_MODEL_HOST_PATH=../../models/bge-reranker-v2-m3
 RAG_QUERY_INTENT_ENABLED=true
+RAG_PARALLEL_RETRIEVAL_ENABLED=true
+RAG_PARALLEL_COVERAGE_PER_SUBQUERY=2
 QUERY_REWRITE_ENABLED=true
 QUERY_EXPANSION_ENABLED=true
 RAG_EVIDENCE_SUFFICIENCY_ENABLED=true
@@ -64,9 +66,11 @@ docker compose up -d --build
 Embedding 必须使用相同模型版本、归一化方式和 512 维输出，否则必须重新入库。
 完整 GPU 主机部署说明见 `gpu_inference/README.md`。
 
-RAG 检索入口会先识别查询类型和检索模式。明确的表号、图号、章节或页码查询直接检索；口语、简称和上下文指代查询先规范化，再生成一条包含专业字段和同义词的关键词扩展查询。扩展结果必须通过实体、时间、数字、单位、否定词和定位信息保留校验，否则自动回退到规范化查询或原查询。普通问题使用 `single` 模式；只有后一个子问题依赖第一步证据中的术语或实体时才使用 `sequential` 模式。递进式检索最多执行两跳，桥接值必须逐字存在于第一跳来源 chunk；“这份研报/该报告”场景会把第二跳限定在同一文档。检索器内部仍分别执行原问题关键词、扩展查询关键词和原问题向量召回，在 Python 层通过第一阶段加权 RRF 合并候选，再只使用当前跳的问题进行语义重排；每跳以语义重排名次 `0.4`、第一阶段检索 RRF 名次 `0.6` 做第二阶段加权 RRF。
+RAG 检索入口会先识别查询类型和检索模式。明确的单个表号、图号、章节或页码查询直接检索；口语、简称和上下文指代查询先规范化，再生成一条包含专业字段和同义词的关键词扩展查询。扩展结果必须通过实体、时间、数字、单位、否定词和定位信息保留校验，否则自动回退到规范化查询或原查询。普通问题使用 `single` 模式；互不依赖的多个子问题使用 `parallel` 模式，每个子查询独立召回，默认在首页为每个子问题保留 2 条候选，再用原问题统一重排和去重；只有后一个子问题依赖第一步证据中的术语或实体时才使用 `sequential` 模式。递进式检索最多执行两跳，桥接值必须逐字存在于第一跳来源 chunk；“这份研报/该报告”场景会把第二跳限定在同一文档。检索器内部仍分别执行原问题关键词、扩展查询关键词和原问题向量召回，在 Python 层通过第一阶段加权 RRF 合并候选，再只使用当前跳的问题进行语义重排；每跳以语义重排名次 `0.4`、第一阶段检索 RRF 名次 `0.6` 做第二阶段加权 RRF。
 
 两跳结果去重合并后，额外使用用户原始问题统一重排一次，并重新检查原问题的限定条件。首页在容量允许时保留经过校验的桥接来源片段和第二跳的独立证据，其余位置按统一排名补齐；保留证据也按统一排名展示，不固定置顶。最终重排只决定顺序，不再次用原问题分数过滤辅助证据。统一重排失败时保留两跳结果，回退到各跳名次的等权 RRF，并记录失败来源。设置 `RAG_SEQUENTIAL_RETRIEVAL_ENABLED=false` 可关闭整个递进式检索并回退单跳。
+
+`RAG_PARALLEL_RETRIEVAL_ENABLED=false` 可关闭并行检索并回退到原问题单次检索；`RAG_PARALLEL_COVERAGE_PER_SUBQUERY` 控制每个子问题在首页的保底候选数，默认为 2，并会根据页容量自动压缩。并行与递进检索的额外统一重排失败时，均按各子查询名次做等权 RRF 回退。
 
 重排后的最终 Top 片段会再经过证据充分性检查：只有当所有时间范围、指标、限定条件和子问题都有直接证据时才保留结果，否则返回空结果并记录 `evidence_sufficiency`诊断。设置 `RAG_EVIDENCE_SUFFICIENCY_ENABLED=false` 可关闭该检查。调用异常默认保守拒绝返回；只有在可用性优先于证据保证时才设置 `RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN=true`。
 

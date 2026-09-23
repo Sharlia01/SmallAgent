@@ -45,6 +45,7 @@ def test_e2e_aggregation_reports_unsafe_answers_and_over_refusals():
     results = [
         {
             **base,
+            "id": "unsafe-answer",
             "response_mode": "answer",
             "faithfulness_metrics": {
                 "faithfulness_score": 0.5,
@@ -69,6 +70,7 @@ def test_e2e_aggregation_reports_unsafe_answers_and_over_refusals():
         },
         {
             **base,
+            "id": "over-refusal",
             "response_mode": "refuse",
             "faithfulness_metrics": {
                 "faithfulness_score": None,
@@ -106,6 +108,19 @@ def test_e2e_aggregation_reports_unsafe_answers_and_over_refusals():
     assert summary["faithfulness_unsupported_claim_count"] == 1
     assert summary["sufficiency_metrics"]["unsafe_accept_count"] == 1
     assert summary["sufficiency_metrics"]["false_rejection_count"] == 1
+    sample_ids = summary["non_perfect_sample_ids"]
+    assert sample_ids["faithfulness"] == ["unsafe-answer"]
+    assert sample_ids["faithfulness_micro"] == ["unsafe-answer"]
+    assert sample_ids["refusal_metrics"]["refusal_precision"] == [
+        "over-refusal",
+    ]
+    assert sample_ids["refusal_metrics"]["refusal_recall"] == [
+        "unsafe-answer",
+    ]
+    assert sample_ids["sufficiency_metrics"]["accuracy"] == [
+        "unsafe-answer",
+        "over-refusal",
+    ]
 
     results[0]["split"] = "test"
     results[1]["split"] = "challenge"
@@ -117,6 +132,9 @@ def test_e2e_aggregation_reports_unsafe_answers_and_over_refusals():
     assert sliced["by_split"]["challenge"]["refusal_metrics"][
         "over_refusal_count"
     ] == 1
+    assert sliced["by_split"]["challenge"]["non_perfect_sample_ids"][
+        "refusal_metrics"
+    ]["refusal_precision"] == ["over-refusal"]
 
 
 @pytest.mark.unit

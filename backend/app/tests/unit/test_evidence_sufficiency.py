@@ -72,6 +72,46 @@ def test_model_accepts_evidence_that_covers_every_requirement(monkeypatch):
 
 
 @pytest.mark.unit
+def test_system_prompt_preserves_company_internal_entity_scope(monkeypatch):
+    monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_ENABLED", "true")
+    completions = FakeCompletions(
+        '{"sufficient":true,"reason":"公司内部板块比较与后续事实均有证据",'
+        '"missing_requirements":[],"supporting_chunk_indices":[1,2]}'
+    )
+    company_segments = [
+        {
+            "chunk_id": "segment-profit",
+            "docnm_kwd": "report.pdf",
+            "content_with_weight": (
+                "2025年上半年，公司煤电板块归母净利润19.67亿元，"
+                "气电板块0.0018亿元，水电板块8.83亿元。"
+            ),
+        },
+        {
+            "chunk_id": "thermal-generation",
+            "docnm_kwd": "report.pdf",
+            "content_with_weight": (
+                "2025年上半年火电发电量1614.67亿千瓦时，"
+                "同比下降7.40%。"
+            ),
+        },
+    ]
+
+    decision = evidence_sufficiency.check_evidence_sufficiency(
+        "先找出归母净利润最高的电源板块，再说明该类电源的发电量。",
+        company_segments,
+        client=fake_client(completions),
+    )
+
+    assert decision.sufficient is True
+    system_prompt = completions.calls[0]["messages"][0]["content"]
+    assert "不得擅自扩大" in system_prompt
+    assert "同一公司" in system_prompt
+    assert "不得要求全行业各公司数据" in system_prompt
+    assert "该板块" in system_prompt
+
+
+@pytest.mark.unit
 def test_model_rejects_partial_evidence_and_names_missing_requirement(
     monkeypatch,
 ):

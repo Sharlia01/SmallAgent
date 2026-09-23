@@ -23,7 +23,7 @@ DEFAULT_QUERY_INTENT_TIMEOUT_SECONDS = 6.0
 MAX_QUERY_INTENT_INPUT_CHARS = 2000
 MAX_QUERY_INTENT_REASON_CHARS = 200
 MAX_SUBQUERY_CHARS = 300
-MAX_SUBQUERIES = 2
+MAX_SUBQUERIES = 3
 
 QueryIntentName = Literal[
     "precise_lookup",
@@ -70,6 +70,9 @@ CONTEXTUAL_PATTERN = re.compile(
 RATING_SEQUENTIAL_PATTERN = re.compile(
     r"(?=.*评级)(?=.*(?:看多|看空|含义|意思|定义|标准|代表|意味))"
 )
+COLLOQUIAL_MULTI_FACET_PATTERN = re.compile(
+    r"(?:，|,|；|;).*(?:对应|另外|同时|以及)"
+)
 
 QUERY_INTENT_SYSTEM_PROMPT = """
 你是知识库 RAG 的查询分析器。你的任务是判断用户问题的检索意图，以及是否需要在检索前改写；不要回答问题。
@@ -96,6 +99,8 @@ intent 只能取以下值之一：
 8. 用户提到“这份研报、该报告、同一文档”时，第二步 inherit_document_scope 应为 true。
 9. ambiguous_query 不得通过猜测补全，因此 need_rewrite 为 false。
 10. single 的 subqueries 必须为空。只返回 JSON 对象，不输出其他文字。
+11. parallel 必须给出两个或三个可独立执行的 subqueries；每个子查询都要保留原问题中与它相关的公司、时间、指标、图表号和限定条件。不要把纯计算步骤拆成新的检索查询。
+12. 同一问题同时指定多个表号或图号，并分别询问它们的内容时，应判为 parallel，为每个图表分别生成子查询。
 
 返回格式：
 {
@@ -186,7 +191,7 @@ def get_query_intent_client() -> OpenAI:
         )
     return OpenAI(api_key=api_key, base_url=base_url)
 
-
+# 从LLM返回的completion对象中提取content字段，并进行基本验证，确保有choices和message.content
 def _response_content(completion: Any) -> str:
     choices = getattr(completion, "choices", None) or []
     if not choices:
@@ -234,6 +239,8 @@ def _parse_intent_decision(content: str) -> QueryIntentDecision:
 
     if retrieval_mode == "single" and subqueries:
         raise ValueError("single retrieval cannot contain subqueries")
+    if retrieval_mode == "parallel":
+        _validate_parallel_plan(subqueries)
     if retrieval_mode == "sequential":
         _validate_sequential_plan(subqueries)
     need_decompose = retrieval_mode != "single"
@@ -339,8 +346,32 @@ def _validate_sequential_plan(subqueries: list[QuerySubqueryPlan]) -> None:
         raise ValueError("second query template does not reference the output slot")
 
 
+def _validate_parallel_plan(subqueries: list[QuerySubqueryPlan]) -> None:
+    # Keep accepting the older boolean-only provider contract. It cannot be
+    # executed as parallel retrieval and will safely fall back to one query.
+    if not subqueries:
+        return
+    # 并行至少有两个子查询才有意义
+    if not 2 <= len(subqueries) <= MAX_SUBQUERIES:
+        raise ValueError("parallel retrieval must contain two or three steps")
+    if len({step.id for step in subqueries}) != len(subqueries):
+        raise ValueError("parallel retrieval step ids must be unique")
+    # 并行子查询必须是独立的，不能依赖其他步骤或共享槽位
+    for step in subqueries:
+        if not step.query or step.query_template:
+            raise ValueError("parallel retrieval steps must use direct queries")
+        if step.depends_on or step.output_slot or step.required_slots:
+            raise ValueError("parallel retrieval steps must be independent")
+        if step.inherit_document_scope:
+            raise ValueError("parallel retrieval cannot inherit a prior scope")
+
+
 def _rule_based_decision(question: str) -> QueryIntentDecision | None:
-    if PRECISE_LOCATOR_PATTERN.search(question):
+    precise_locators = {
+        "".join(match.group(0).split()).casefold()
+        for match in PRECISE_LOCATOR_PATTERN.finditer(question)
+    }
+    if len(precise_locators) == 1:
         return QueryIntentDecision(
             intent="precise_lookup",
             need_rewrite=False,
@@ -381,7 +412,19 @@ def _rule_based_decision(question: str) -> QueryIntentDecision | None:
             ],
         )
 
-    if any(pattern.search(question) for pattern in COLLOQUIAL_PATTERNS):
+    has_colloquial_language = any(
+        pattern.search(question) for pattern in COLLOQUIAL_PATTERNS
+    )
+    # Multi-facet colloquial questions still need the model to decide whether
+    # their facets are independent. A deterministic colloquial shortcut would
+    # otherwise hide an executable parallel plan (for example profit + EPS + PE).
+    if (
+        has_colloquial_language
+        and COLLOQUIAL_MULTI_FACET_PATTERN.search(question)
+    ):
+        return None
+
+    if has_colloquial_language:
         return QueryIntentDecision(
             intent="colloquial_lookup",
             need_rewrite=True,

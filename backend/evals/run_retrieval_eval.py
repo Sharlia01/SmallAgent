@@ -64,6 +64,15 @@ def environment_flag(name: str, default: bool) -> bool:
     return raw_value.strip().casefold() not in {"0", "false", "no", "off"}
 
 
+def environment_positive_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name, str(default))
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -626,6 +635,10 @@ def main() -> int:
             retrieval_hit = result["retrieval_metrics"][hit_key]
             post_gate_hit = result["post_gate_metrics"][hit_key]
             rejected = result["gate_metrics"]["rejected"]
+            rejection_attribution = result["gate_metrics"][
+                "rejection_attribution"
+            ]
+            stage_latency = result["retrieval"]["stage_latency_ms"]
             print(
                 f"[{position}/{len(samples)}] {sample['id']} "
                 f"retrieved_before_gate="
@@ -634,6 +647,8 @@ def main() -> int:
                 f"retrieval_hit={retrieval_hit if retrieval_hit is not None else 'N/A'} "
                 f"post_gate_hit={post_gate_hit if post_gate_hit is not None else 'N/A'} "
                 f"rejected={rejected if rejected is not None else 'N/A'} "
+                f"rejection_attribution={rejection_attribution or 'N/A'} "
+                f"stages_ms={stage_latency} "
                 f"latency_ms={result['latency_ms']:.3f}",
                 flush=True,
             )
@@ -715,6 +730,14 @@ def main() -> int:
             "bridge_extraction_model": os.getenv(
                 "RAG_BRIDGE_EXTRACTION_MODEL",
                 DEFAULT_BRIDGE_EXTRACTION_MODEL,
+            ),
+            "parallel_retrieval_enabled": environment_flag(
+                "RAG_PARALLEL_RETRIEVAL_ENABLED",
+                True,
+            ),
+            "parallel_coverage_per_subquery": environment_positive_int(
+                "RAG_PARALLEL_COVERAGE_PER_SUBQUERY",
+                2,
             ),
             "sequential_retrieval_enabled": environment_flag(
                 "RAG_SEQUENTIAL_RETRIEVAL_ENABLED",

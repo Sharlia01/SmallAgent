@@ -14,6 +14,7 @@
 #  limitations under the License.
 #
 import logging
+import time
 from collections import defaultdict
 #数据类，类似于其他语言中的结构体
 from dataclasses import dataclass, field as dataclass_field
@@ -1067,6 +1068,7 @@ class Dealer:
             keyword_question,
         )
 
+        initial_retrieval_started = time.perf_counter()
         search_result = self.search(
             request,
             self._build_index_names(tenant_ids),
@@ -1074,19 +1076,28 @@ class Dealer:
             options.highlight,
             rank_feature=options.rank_feature, #关键字参数，python可以只传一部分参数
         )
+        initial_retrieval_ms = (
+            time.perf_counter() - initial_retrieval_started
+        ) * 1000
 
-
+        rerank_started = time.perf_counter()
         ranked_results = self._rerank_results(
             search_result,
             question,
             options,
         )
+        rerank_ms = (time.perf_counter() - rerank_started) * 1000
 
-        return self._build_retrieval_result(
+        result = self._build_retrieval_result(
             search_result,
             ranked_results,
             options,
         )
+        result["stage_latency_ms"] = {
+            "initial_retrieval": round(initial_retrieval_ms, 3),
+            "rerank": round(rerank_ms, 3),
+        }
+        return result
 
     def sql_retrieval(self, sql, fetch_size=128, format="json"):
         tbl = self.dataStore.sql(sql, fetch_size, format)

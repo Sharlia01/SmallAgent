@@ -38,6 +38,40 @@ def test_get_vector_always_targets_the_bge_vector_field(monkeypatch):
     assert expression.extra_options == {"similarity": 0.25}
 
 
+@pytest.mark.unit
+def test_dealer_retrieval_times_initial_retrieval_and_rerank(monkeypatch):
+    dealer = object.__new__(search_v2.Dealer)
+    search_result = object()
+    ranked_results = object()
+    clock = iter([1.0, 1.012, 2.0, 2.034])
+
+    monkeypatch.setattr(search_v2.time, "perf_counter", lambda: next(clock))
+    monkeypatch.setattr(dealer, "_build_search_request", lambda *_args: {})
+    monkeypatch.setattr(dealer, "_build_index_names", lambda _ids: ["42"])
+    monkeypatch.setattr(dealer, "search", lambda *_args, **_kwargs: search_result)
+    monkeypatch.setattr(
+        dealer,
+        "_rerank_results",
+        lambda *_args, **_kwargs: ranked_results,
+    )
+    monkeypatch.setattr(
+        dealer,
+        "_build_retrieval_result",
+        lambda *_args, **_kwargs: {"total": 0, "chunks": []},
+    )
+
+    result = dealer.retrieval(
+        "问题",
+        "42",
+        search_v2.Dealer.RetrievalOptions(),
+    )
+
+    assert result["stage_latency_ms"] == {
+        "initial_retrieval": pytest.approx(12.0),
+        "rerank": pytest.approx(34.0),
+    }
+
+
 # 用例功能：验证原始检索入口会将生产检索参数完整传给 Dealer。
 # 执行步骤：
 # 1. 用可记录调用参数的 FakeDealer 替换真实检索器。
@@ -134,6 +168,16 @@ def test_retrieve_raw_results_reuses_production_options(monkeypatch):
         "测试问题 规范化 扩展"
     )
     assert result["query_transform"]["expansion_applied"] is True
+    assert set(result["stage_latency_ms"]) == {
+        "query_transform",
+        "initial_retrieval",
+        "rerank",
+        "multi_hop",
+        "gate",
+        "other",
+        "total",
+    }
+    assert result["stage_latency_ms"]["multi_hop"] is None
 
 
 @pytest.mark.unit
@@ -504,6 +548,138 @@ def test_sequential_retrieval_extracts_bridge_and_preserves_each_hop(
     assert len(sufficiency_calls) == 1
     assert len(sufficiency_calls[0][1]) == 2
     assert result["chunks_before_sufficiency"] == sufficiency_calls[0][1]
+    assert result["stage_latency_ms"]["multi_hop"] is not None
+    assert result["stage_latency_ms"]["rerank"] >= 0
+
+
+@pytest.mark.unit
+def test_parallel_retrieval_reserves_coverage_for_every_subquery(monkeypatch):
+    monkeypatch.setenv("RAG_PARALLEL_RETRIEVAL_ENABLED", "true")
+    monkeypatch.setenv("RAG_PARALLEL_COVERAGE_PER_SUBQUERY", "2")
+    calls = []
+    original_question = (
+        "国电电力2025E每股收益和每股红利分别是多少？"
+    )
+
+    class FakeDealer:
+        @staticmethod
+        def retrieval(**kwargs):
+            calls.append(kwargs)
+            if "每股收益" in kwargs["question"]:
+                chunk_ids = ["eps-1", "eps-2", "eps-3", "shared"]
+            else:
+                chunk_ids = ["dividend-1", "dividend-2", "shared"]
+            return {
+                "total": len(chunk_ids),
+                "chunks": [
+                    {
+                        "chunk_id": chunk_id,
+                        "doc_id": "doc-1",
+                        "docnm_kwd": "国电电力.pdf",
+                        "content_with_weight": f"{chunk_id} content",
+                        "rerank_score": 0.9,
+                        "rrf_score": 0.02,
+                        "final_ranking": {"final_fusion_score": 0.08},
+                    }
+                    for chunk_id in chunk_ids
+                ],
+                "doc_aggs": [],
+                "retrieval_fusion": {"method": "weighted_rrf"},
+            }
+
+    intent = QueryIntentDecision(
+        intent="complex_lookup",
+        need_rewrite=False,
+        need_decompose=True,
+        reason="两个独立指标",
+        source="model",
+        retrieval_mode="parallel",
+        subqueries=[
+            QuerySubqueryPlan(
+                id="eps_lookup",
+                query="国电电力2025E每股收益是多少？",
+            ),
+            QuerySubqueryPlan(
+                id="dividend_lookup",
+                query="国电电力2025E每股红利是多少？",
+            ),
+        ],
+    )
+    original_scores = {
+        "eps-1 content": 0.99,
+        "eps-2 content": 0.98,
+        "eps-3 content": 0.97,
+        "shared content": 0.96,
+        "dividend-1 content": 0.2,
+        "dividend-2 content": 0.1,
+    }
+
+    monkeypatch.setattr(retrieval, "get_retrieval_dealer", FakeDealer)
+    monkeypatch.setattr(retrieval, "analyze_query_intent", lambda _q: intent)
+    monkeypatch.setattr(
+        retrieval,
+        "rerank_similarity",
+        lambda _question, documents: (
+            [original_scores[document] for document in documents],
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        retrieval,
+        "check_evidence_sufficiency",
+        lambda _question, chunks: EvidenceSufficiencyDecision(
+            sufficient=True,
+            reason="两个指标均有证据",
+            missing_requirements=[],
+            supporting_chunk_indices=[1, 2],
+            source="model",
+            evaluated_chunk_count=len(chunks),
+            evaluated_chunk_ids=[chunk["chunk_id"] for chunk in chunks],
+        ),
+    )
+
+    result = retrieval.retrieve_raw_results(
+        "42",
+        original_question,
+        page_size=5,
+    )
+
+    assert [call["question"] for call in calls] == [
+        "国电电力2025E每股收益是多少？",
+        "国电电力2025E每股红利是多少？",
+    ]
+    result_ids = [chunk["chunk_id"] for chunk in result["chunks"]]
+    assert "dividend-1" in result_ids
+    assert "dividend-2" in result_ids
+    assert len(result_ids) == 5
+    assert result["parallel_retrieval"] == {
+        "applied": True,
+        "coverage_per_subquery": 2,
+        "steps": [
+            {
+                "id": "eps_lookup",
+                "query": "国电电力2025E每股收益是多少？",
+            },
+            {
+                "id": "dividend_lookup",
+                "query": "国电电力2025E每股红利是多少？",
+            },
+        ],
+    }
+    assert result["retrieval_fusion"]["final_rerank"][
+        "coverage_chunk_ids_by_subquery"
+    ] == {
+        "eps_lookup": ["eps-1", "eps-2"],
+        "dividend_lookup": ["dividend-1", "dividend-2"],
+    }
+    dividend = next(
+        chunk for chunk in result["chunks"]
+        if chunk["chunk_id"] == "dividend-1"
+    )
+    assert dividend["final_ranking"]["coverage_reserved"] is True
+    assert dividend["parallel_subqueries"][0]["subquery_id"] == (
+        "dividend_lookup"
+    )
 
 
 # 用例功能：验证 RRF 只使用各路排名，并让多路共同命中的 chunk 优先。
@@ -1174,9 +1350,10 @@ def test_retrieve_content_preserves_ranking_metadata(monkeypatch):
                 "semantic_reranker_rank": 1,
                 "retrieval_rrf_rank": 2,
                 "final_fusion_score": 0.08,
-            },
-            "sequential_subqueries": [],
-            "positions": [[5, 10]],
+                },
+                "sequential_subqueries": [],
+                "parallel_subqueries": [],
+                "positions": [[5, 10]],
             "kb_id": "42",
             "image_id": "image-1",
         }
@@ -1267,10 +1444,10 @@ def test_multi_hop_case_computes_hit_recall_and_mrr():
         match_threshold=0.8,
     )
 
-    assert result["metrics"]["hit_at_5"] is True
-    assert result["metrics"]["recall_at_5"] == 1.0
-    assert result["metrics"]["precision_at_5"] == 0.4
-    assert result["metrics"]["mrr_at_5"] == 1.0
+    assert result["post_gate_metrics"]["hit_at_5"] is True
+    assert result["post_gate_metrics"]["recall_at_5"] == 1.0
+    assert result["post_gate_metrics"]["precision_at_5"] == 0.4
+    assert result["post_gate_metrics"]["mrr_at_5"] == 1.0
     assert result["matched_evidence_count"] == 2
     assert result["first_relevant_rank"] == 1
     assert [match["matched_rank"] for match in result["evidence_matches"]] == [2, 1]
@@ -1389,13 +1566,14 @@ def test_multi_chunk_requirement_uses_completion_rank():
         latency_ms=10,
         top_k=5,
         match_threshold=0.8,
+        metric_ks=(3, 5),
     )
 
-    assert result["metrics"]["hit_at_5"] is True
-    assert result["metrics"]["recall_at_5"] == 1.0
-    assert result["metrics"]["mrr_at_5"] == pytest.approx(0.2)
-    assert result["metrics"]["all_requirements_hit_at_3"] is False
-    assert result["metrics"]["all_requirements_hit_at_5"] is True
+    assert result["post_gate_metrics"]["hit_at_5"] is True
+    assert result["post_gate_metrics"]["recall_at_5"] == 1.0
+    assert result["post_gate_metrics"]["mrr_at_5"] == pytest.approx(0.2)
+    assert result["post_gate_metrics"]["all_requirements_hit_at_3"] is False
+    assert result["post_gate_metrics"]["all_requirements_hit_at_5"] is True
     assert result["first_relevant_rank"] == 5
 
 # 用例功能：验证评测器能够按表格标题和完整数据行匹配 HTML 表格证据。
@@ -1485,9 +1663,9 @@ def test_table_row_requirement_matches_html_table():
         match_threshold=0.8,
     )
 
-    assert result["metrics"]["hit_at_5"] is True
-    assert result["metrics"]["recall_at_5"] == 1.0
-    assert result["metrics"]["mrr_at_5"] == 1.0
+    assert result["post_gate_metrics"]["hit_at_5"] is True
+    assert result["post_gate_metrics"]["recall_at_5"] == 1.0
+    assert result["post_gate_metrics"]["mrr_at_5"] == 1.0
     assert result["first_relevant_rank"] == 1
 
 # 用例功能：验证不可回答问题不会被计入正向检索指标，但会计算空结果率。
@@ -1515,16 +1693,19 @@ def test_unanswerable_case_is_excluded_from_positive_retrieval_metrics():
         match_threshold=0.8,
     )
 
-    assert result["metrics"]["hit_at_5"] is None
-    assert result["metrics"]["recall_at_5"] is None
-    assert result["metrics"]["precision_at_5"] is None
-    assert result["metrics"]["mrr_at_5"] is None
+    assert result["post_gate_metrics"]["hit_at_5"] is None
+    assert result["post_gate_metrics"]["recall_at_5"] is None
+    assert result["post_gate_metrics"]["precision_at_5"] is None
+    assert result["post_gate_metrics"]["mrr_at_5"] is None
     summary = build_summary([result], top_k=5)
     assert summary["overall"]["answerable_query_count"] == 0
-    assert summary["overall"]["unanswerable_empty_rate"] == 1.0
-    assert summary["overall"]["unanswerable_rejection_rate"] == 1.0
-    assert summary["overall"]["answerable_empty_rate"] is None
-    assert summary["overall"]["evidence_sufficiency_fallback_rate"] is None
+    post_gate = summary["overall"]["post_gate_metrics"]
+    assert post_gate["unanswerable_empty_rate"] == 1.0
+    assert post_gate["answerable_empty_rate"] is None
+    assert summary["overall"]["gate_metrics"][
+        "unanswerable_rejection_rate"
+    ] is None
+    assert summary["overall"]["gate_metrics"]["fallback_rate"] is None
 
 
 @pytest.mark.unit
@@ -1586,9 +1767,9 @@ def test_relevant_table_evidence_uses_table_parser():
         match_threshold=0.8,
     )
 
-    assert result["metrics"]["hit_at_5"] is True
-    assert result["metrics"]["recall_at_5"] == 1.0
-    assert result["metrics"]["mrr_at_5"] == 1.0
+    assert result["post_gate_metrics"]["hit_at_5"] is True
+    assert result["post_gate_metrics"]["recall_at_5"] == 1.0
+    assert result["post_gate_metrics"]["mrr_at_5"] == 1.0
     assert result["first_relevant_rank"] == 1
 
 
@@ -1655,9 +1836,9 @@ def test_relevant_figure_evidence_uses_locator(
         match_threshold=0.8,
     )
 
-    assert result["metrics"]["hit_at_5"] is True
-    assert result["metrics"]["recall_at_5"] == 1.0
-    assert result["metrics"]["mrr_at_5"] == 1.0
+    assert result["post_gate_metrics"]["hit_at_5"] is True
+    assert result["post_gate_metrics"]["recall_at_5"] == 1.0
+    assert result["post_gate_metrics"]["mrr_at_5"] == 1.0
     assert result["first_relevant_rank"] == 1
 
 
@@ -1700,9 +1881,9 @@ def test_relevant_figure_evidence_rejects_a_different_figure():
         match_threshold=0.8,
     )
 
-    assert result["metrics"]["hit_at_5"] is False
-    assert result["metrics"]["recall_at_5"] == 0.0
-    assert result["metrics"]["mrr_at_5"] == 0.0
+    assert result["post_gate_metrics"]["hit_at_5"] is False
+    assert result["post_gate_metrics"]["recall_at_5"] == 0.0
+    assert result["post_gate_metrics"]["mrr_at_5"] == 0.0
     assert result["first_relevant_rank"] is None
 
 
@@ -1748,7 +1929,7 @@ def test_relevant_table_evidence_falls_back_to_flattened_text():
         match_threshold=0.8,
     )
 
-    assert result["metrics"]["hit_at_5"] is True
-    assert result["metrics"]["recall_at_5"] == 1.0
-    assert result["metrics"]["mrr_at_5"] == 1.0
+    assert result["post_gate_metrics"]["hit_at_5"] is True
+    assert result["post_gate_metrics"]["recall_at_5"] == 1.0
+    assert result["post_gate_metrics"]["mrr_at_5"] == 1.0
     assert result["first_relevant_rank"] == 1

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import unicodedata
+from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 from collections import Counter, defaultdict
 from typing import Any, Iterable
@@ -12,19 +14,27 @@ from typing import Any, Iterable
 from service.core.evidence_metadata import evidence_metadata
 
 
-RESULT_SCHEMA_VERSION = "2.1"
-DEFAULT_METRIC_KS = (1, 3, 5, 10)
+RESULT_SCHEMA_VERSION = "2.4"
+RETRIEVAL_LATENCY_STAGES = (
+    "query_transform",
+    "initial_retrieval",
+    "rerank",
+    "multi_hop",
+    "gate",
+    "other",
+    "total",
+)
 
 
 def resolve_metric_ks(
     top_k: int,
     metric_ks: Iterable[int] | None = None,
 ) -> tuple[int, ...]:
-    """Return useful metric cutoffs that can be scored from Top K results."""
+    """Return requested cutoffs, defaulting to the actual retrieval Top K."""
     if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
         raise ValueError("top_k must be a positive integer")
 
-    requested = DEFAULT_METRIC_KS if metric_ks is None else tuple(metric_ks)
+    requested = (top_k,) if metric_ks is None else tuple(metric_ks)
     cutoffs = {
         cutoff
         for cutoff in requested
@@ -47,12 +57,125 @@ def normalize_document_name(name: Any) -> str:
     normalized = unicodedata.normalize("NFKC", str(name or ""))
     return os.path.basename(normalized.replace("\\", "/")).casefold()
 
+
+# Keep this map deliberately narrow: only equivalent financial labels belong
+# here. Broad synonyms could incorrectly merge distinct metrics such as PE/PB.
+_TABLE_FIELD_ALIASES = {
+    "pe": {"pe", "市盈率", "市盈率pe"},
+    "pb": {"pb", "市净率", "市净率pb"},
+    "eps": {
+        "eps",
+        "eps元",
+        "eps元股",
+        "每股收益",
+        "每股收益元",
+        "每股收益元股",
+    },
+    "dps": {
+        "dps",
+        "dps元",
+        "dps元股",
+        "每股红利",
+        "每股红利元",
+        "每股红利元股",
+        "每股股利",
+        "每股股利元",
+        "每股股利元股",
+    },
+    "roe": {"roe", "净资产收益率", "净资产收益率roe"},
+}
+_TABLE_ALIAS_LOOKUP = {
+    alias: canonical
+    for canonical, aliases in _TABLE_FIELD_ALIASES.items()
+    for alias in aliases
+}
+_TABLE_NUMBER_RE = re.compile(
+    r"^(?P<number>[+-]?(?:\d+(?:\.\d*)?|\.\d+))"
+    r"(?P<unit>人民币元|百万元|千万元|亿元|万元|千元|元|%|倍|x)?$",
+    re.IGNORECASE,
+)
+_CURRENCY_MULTIPLIERS = {
+    "人民币元": Decimal("1"),
+    "元": Decimal("1"),
+    "千元": Decimal("1000"),
+    "万元": Decimal("10000"),
+    "百万元": Decimal("1000000"),
+    "千万元": Decimal("10000000"),
+    "亿元": Decimal("100000000"),
+}
+
+
+def _normalize_decimal(value: Decimal) -> str:
+    """Render equal decimal values identically without scientific notation."""
+    if value == 0:
+        return "0"
+    rendered = format(value.normalize(), "f")
+    return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
+
+
+def _table_field_alias(value: str) -> str | None:
+    """Return the canonical id of an equivalent financial field label."""
+    key = normalize_text(value)
+    canonical = _TABLE_ALIAS_LOOKUP.get(key)
+    if canonical:
+        return canonical
+
+    # Preserve forecast/actual period suffixes in compound headers, e.g.
+    # ``P/E 25E`` and ``市盈率（PE）25E``.
+    period_match = re.fullmatch(r"(.+?)((?:19|20)?\d{2}[ae])", key)
+    if period_match:
+        canonical = _TABLE_ALIAS_LOOKUP.get(period_match.group(1))
+        if canonical:
+            return f"{canonical}:{period_match.group(2)}"
+    return None
+
+
+def _match_table_number(value: Any) -> tuple[Decimal, str | None] | None:
+    """Parse a standalone number and its optional display unit."""
+    normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    normalized = re.sub(r"\s+", "", normalized).replace(",", "")
+    if (
+        len(normalized) >= 2
+        and normalized.startswith("(")
+        and normalized.endswith(")")
+    ):
+        normalized = f"-{normalized[1:-1]}"
+
+    match = _TABLE_NUMBER_RE.fullmatch(normalized)
+    if not match:
+        return None
+    try:
+        number = Decimal(match.group("number"))
+    except InvalidOperation:
+        return None
+    return number, (match.group("unit") or "").casefold() or None
+
+
+def _parse_table_number(value: Any) -> tuple[Decimal, str | None] | None:
+    """Parse a table quantity and convert explicit currency scales."""
+    matched = _match_table_number(value)
+    if not matched:
+        return None
+    number, unit = matched
+    if unit in _CURRENCY_MULTIPLIERS:
+        return number * _CURRENCY_MULTIPLIERS[unit], "currency"
+    if unit == "%":
+        return number, "percent"
+    if unit in {"倍", "x"}:
+        return number, "multiple"
+    return number, None
+
+
 def normalize_table_cell(value: Any) -> str:
-    """Normalize table cells while preserving numeric signs and decimals."""
+    """Normalize table cells, including equivalent financial field labels."""
     normalized = unicodedata.normalize(
         "NFKC",
         str(value or ""),
     ).casefold().strip()
+
+    field_alias = _table_field_alias(normalized)
+    if field_alias:
+        return f"field:{field_alias}"
 
     # 财务表格通常使用括号表示负数，例如 (23181)。
     if (
@@ -65,10 +188,55 @@ def normalize_table_cell(value: Any) -> str:
     # 千位分隔符不影响数值含义。
     normalized = normalized.replace(",", "")
 
+    parsed_number = _parse_table_number(normalized)
+    if parsed_number:
+        number, dimension = parsed_number
+        suffix = f":{dimension}" if dimension else ""
+        return f"number:{_normalize_decimal(number)}{suffix}"
+
     return "".join(
         character
         for character in normalized
         if character.isalnum() or character in ".%+-"
+    )
+
+
+def _table_cells_equivalent(expected: Any, actual: Any) -> bool:
+    """Compare cells with controlled alias and unit-aware numeric handling."""
+    if normalize_table_cell(expected) == normalize_table_cell(actual):
+        return True
+
+    expected_number = _parse_table_number(expected)
+    actual_number = _parse_table_number(actual)
+    if not expected_number or not actual_number:
+        return False
+
+    expected_value, expected_dimension = expected_number
+    actual_value, actual_dimension = actual_number
+    if expected_dimension == actual_dimension:
+        return expected_value == actual_value
+
+    # Gold rows often omit a unit declared by the table header while parsed
+    # cells repeat it (for example 0.40 versus 0.40元). Only one implicit-unit
+    # side is relaxed; two explicit incompatible dimensions never match.
+    if expected_dimension is None or actual_dimension is None:
+        expected_raw = _match_table_number(expected)
+        actual_raw = _match_table_number(actual)
+        return bool(
+            expected_raw
+            and actual_raw
+            and expected_raw[0] == actual_raw[0]
+        )
+    return False
+
+
+def _table_cell_sequences_equal(
+    expected_cells: list[Any],
+    actual_cells: list[Any],
+) -> bool:
+    return len(expected_cells) == len(actual_cells) and all(
+        _table_cells_equivalent(expected, actual)
+        for expected, actual in zip(expected_cells, actual_cells)
     )
 
 
@@ -202,18 +370,18 @@ def table_row_chunk_match_score(evidence, chunk):
     if not evidence_document or evidence_document != chunk_document:
         return 0.0
 
-    expected_cells = [
-        normalize_table_cell(cell)
-        for cell in evidence.get("row_cells") or []
-    ]
+    expected_cells = list(evidence.get("row_cells") or [])
 
     def cells_match(values):
-        actual_cells = [normalize_table_cell(cell) for cell in values or []]
-        if actual_cells == expected_cells:
+        actual_cells = list(values or [])
+        if _table_cell_sequences_equal(expected_cells, actual_cells):
             return True
         expected_length = len(expected_cells)
         return bool(expected_length) and any(
-            actual_cells[start:start + expected_length] == expected_cells
+            _table_cell_sequences_equal(
+                expected_cells,
+                actual_cells[start:start + expected_length],
+            )
             for start in range(len(actual_cells) - expected_length + 1)
         )
 
@@ -254,22 +422,19 @@ def table_row_chunk_match_score(evidence, chunk):
         for row in table.get("rows") or []:
 
             # 兼容原来的row_cells精确匹配
-            actual_cells = [
-                normalize_table_cell(cell)
-                for cell in row
-            ]
+            actual_cells = list(row)
 
             if expected_cells:
-                if actual_cells == expected_cells:
+                if _table_cell_sequences_equal(expected_cells, actual_cells):
                     return 1.0
 
                 expected_length = len(expected_cells)
                 for start in range(
                     len(actual_cells) - expected_length + 1
                 ):
-                    if (
-                        actual_cells[start:start + expected_length]
-                        == expected_cells
+                    if _table_cell_sequences_equal(
+                        expected_cells,
+                        actual_cells[start:start + expected_length],
                     ):
                         return 1.0
 
@@ -455,6 +620,19 @@ def _optional_float(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _stage_latency_snapshot(raw_result: dict[str, Any]) -> dict[str, float | None]:
+    timings = raw_result.get("stage_latency_ms") or {}
+    return {
+        stage: (
+            round(value, 3)
+            if (value := _optional_float(timings.get(stage))) is not None
+            and value >= 0
+            else None
+        )
+        for stage in RETRIEVAL_LATENCY_STAGES
+    }
+
+
 def _json_safe(value: Any) -> Any:
     """Recursively convert NumPy-like values without importing NumPy."""
     if value is None or isinstance(value, (str, int, float, bool)):
@@ -506,6 +684,9 @@ def serialize_retrieved_chunk(
         "final_ranking": _json_safe(chunk.get("final_ranking") or {}),
         "sequential_subqueries": _json_safe(
             chunk.get("sequential_subqueries") or []
+        ),
+        "parallel_subqueries": _json_safe(
+            chunk.get("parallel_subqueries") or []
         ),
         "positions": _json_safe(chunk.get("positions") or []),
         "kb_id": str(chunk.get("kb_id", "")),
@@ -770,7 +951,44 @@ def _unavailable_metrics(
     return metrics
 
 
-def _gate_metrics(decision: dict[str, Any]) -> dict[str, Any]:
+def _with_gate_attribution(
+    gate: dict[str, Any],
+    *,
+    answerable: bool | None = None,
+    pre_gate_evidence_sufficient: bool | None = None,
+) -> dict[str, Any]:
+    """Attribute a rejection to upstream retrieval or the gate itself."""
+    attributed = dict(gate)
+    evidence_sufficient = (
+        pre_gate_evidence_sufficient
+        if answerable is True
+        and isinstance(pre_gate_evidence_sufficient, bool)
+        else None
+    )
+    rejection_attribution = None
+    if attributed.get("rejected") is True:
+        if answerable is False:
+            rejection_attribution = "correct_unanswerable_rejection"
+        elif evidence_sufficient is True:
+            rejection_attribution = "false_rejection_with_sufficient_evidence"
+        elif evidence_sufficient is False:
+            rejection_attribution = (
+                "correct_rejection_after_insufficient_evidence"
+            )
+
+    attributed.update({
+        "pre_gate_evidence_sufficient": evidence_sufficient,
+        "rejection_attribution": rejection_attribution,
+    })
+    return attributed
+
+
+def _gate_metrics(
+    decision: dict[str, Any],
+    *,
+    answerable: bool | None = None,
+    pre_gate_evidence_sufficient: bool | None = None,
+) -> dict[str, Any]:
     """Use the recorded decision, never empty chunks, to identify rejection."""
     source = decision.get("source")
     sufficient = decision.get("sufficient")
@@ -780,12 +998,16 @@ def _gate_metrics(decision: dict[str, Any]) -> dict[str, Any]:
         and source in {"model", "rule", "fallback"}
         and isinstance(sufficient, bool)
     )
-    return {
-        "rejected": not sufficient if available else None,
-        "source": source,
-        "fallback": source == "fallback" if available else None,
-        "enabled": False if disabled else (True if available else None),
-    }
+    return _with_gate_attribution(
+        {
+            "rejected": not sufficient if available else None,
+            "source": source,
+            "fallback": source == "fallback" if available else None,
+            "enabled": False if disabled else (True if available else None),
+        },
+        answerable=answerable,
+        pre_gate_evidence_sufficient=pre_gate_evidence_sufficient,
+    )
 
 
 def evaluate_retrieval_case(
@@ -829,6 +1051,15 @@ def evaluate_retrieval_case(
             for rank, chunk in enumerate(before_chunks, start=1)
         ]
 
+    answerable = bool(sample.get("answerable"))
+    recall_key = f"recall_at_{top_k}"
+    pre_gate_recall = (
+        before["metrics"].get(recall_key) if before is not None else None
+    )
+    pre_gate_evidence_sufficient = (
+        pre_gate_recall == 1.0 if pre_gate_recall is not None else None
+    )
+
     return {
         "result_schema_version": RESULT_SCHEMA_VERSION,
         "id": sample.get("id"),
@@ -839,7 +1070,7 @@ def evaluate_retrieval_case(
             (sample.get("metadata") or {}).get("split") or "unknown"
         ),
         "source_modality": get_source_modality(sample),
-        "answerable": bool(sample.get("answerable")),
+        "answerable": answerable,
         "error": None,
         "latency_ms": round(float(latency_ms), 3),
         "retrieval": {
@@ -854,6 +1085,7 @@ def evaluate_retrieval_case(
             "empty_before_sufficiency": (
                 not serialized_before if serialized_before is not None else None
             ),
+            "stage_latency_ms": _stage_latency_snapshot(raw_result),
             "query_rewrite": _json_safe(
                 raw_result.get("query_rewrite") or {}
             ),
@@ -869,6 +1101,9 @@ def evaluate_retrieval_case(
             "sequential_retrieval": _json_safe(
                 raw_result.get("sequential_retrieval") or {}
             ),
+            "parallel_retrieval": _json_safe(
+                raw_result.get("parallel_retrieval") or {}
+            ),
             "evidence_sufficiency": _json_safe(
                 raw_result.get("evidence_sufficiency") or {}
             ),
@@ -877,8 +1112,10 @@ def evaluate_retrieval_case(
             ),
             "chunks": serialized_chunks,
         },
-        # Existing fields retain their post-gate meaning for old consumers.
-        **post_gate,
+        "gold_evidence_count": post_gate["gold_evidence_count"],
+        "matched_evidence_count": post_gate["matched_evidence_count"],
+        "first_relevant_rank": post_gate["first_relevant_rank"],
+        "evidence_matches": post_gate["evidence_matches"],
         "retrieval_metrics": (
             before["metrics"]
             if before is not None
@@ -888,7 +1125,11 @@ def evaluate_retrieval_case(
             before["evidence_matches"] if before is not None else None
         ),
         "post_gate_metrics": dict(post_gate["metrics"]),
-        "gate_metrics": _gate_metrics(raw_result.get("evidence_sufficiency") or {}),
+        "gate_metrics": _gate_metrics(
+            raw_result.get("evidence_sufficiency") or {},
+            answerable=answerable,
+            pre_gate_evidence_sufficient=pre_gate_evidence_sufficient,
+        ),
     }
 
 
@@ -924,15 +1165,20 @@ def build_error_case(
             "chunks_before_sufficiency": None,
             "retrieved_count_before_sufficiency": None,
             "empty_before_sufficiency": None,
+            "stage_latency_ms": {
+                stage: None for stage in RETRIEVAL_LATENCY_STAGES
+            },
         },
         "gold_evidence_count": len(sample.get("relevant_evidence") or []),
         "matched_evidence_count": 0,
         "first_relevant_rank": None,
         "evidence_matches": [],
-        "metrics": _unavailable_metrics(top_k, resolved_metric_ks),
         "retrieval_metrics": _unavailable_metrics(top_k, resolved_metric_ks),
         "post_gate_metrics": _unavailable_metrics(top_k, resolved_metric_ks),
-        "gate_metrics": _gate_metrics({}),
+        "gate_metrics": _gate_metrics(
+            {},
+            answerable=bool(sample.get("answerable")),
+        ),
         "evidence_matches_before_sufficiency": None,
     }
 
@@ -948,6 +1194,176 @@ def _rate(numerator: int, denominator: int) -> float | None:
     if not denominator:
         return None
     return round(numerator / denominator, 6)
+
+
+def _sample_ids(
+    results: Iterable[dict[str, Any]],
+    predicate,
+) -> list[str]:
+    """Return stable, unique IDs for samples matching ``predicate``."""
+    sample_ids = []
+    seen = set()
+    for result in results:
+        sample_id = str(result.get("id") or "").strip()
+        if not sample_id or sample_id in seen or not predicate(result):
+            continue
+        seen.add(sample_id)
+        sample_ids.append(sample_id)
+    return sample_ids
+
+
+def _result_gate_metrics(
+    result: dict[str, Any],
+    *,
+    top_k: int,
+) -> dict[str, Any]:
+    """Read a gate decision and derive evidence-based attribution if possible."""
+    stored = result.get("gate_metrics")
+    if isinstance(stored, dict) and (
+        isinstance(stored.get("rejected"), bool)
+        or stored.get("enabled") is False
+    ):
+        gate = stored
+    else:
+        gate = _gate_metrics(
+            result.get("retrieval", {}).get("evidence_sufficiency") or {}
+        )
+
+    retrieval_metrics = result.get("retrieval_metrics")
+    pre_gate_recall = (
+        retrieval_metrics.get(f"recall_at_{top_k}")
+        if isinstance(retrieval_metrics, dict)
+        else None
+    )
+    return _with_gate_attribution(
+        gate,
+        answerable=result.get("answerable"),
+        pre_gate_evidence_sufficient=(
+            pre_gate_recall == 1.0
+            if pre_gate_recall is not None
+            else None
+        ),
+    )
+
+
+def _stage_non_perfect_sample_ids(
+    results: list[dict[str, Any]],
+    *,
+    top_k: int,
+    before_sufficiency: bool,
+    metric_ks: Iterable[int] | None = None,
+) -> dict[str, list[str]]:
+    """Map directional stage metrics to samples that miss their ideal value."""
+    resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
+    empty_key = "empty_before_sufficiency" if before_sufficiency else "empty"
+
+    def stage_metrics(result: dict[str, Any]) -> dict[str, Any] | None:
+        if before_sufficiency:
+            metrics = result.get("retrieval_metrics")
+        else:
+            # Keep historical 2.1 rows readable without emitting the alias in 2.2.
+            metrics = result.get("post_gate_metrics") or result.get("metrics")
+        return metrics if isinstance(metrics, dict) else None
+
+    successful = [result for result in results if not result.get("error")]
+    available = [
+        result
+        for result in successful
+        if isinstance(result.get("retrieval", {}).get(empty_key), bool)
+        and stage_metrics(result) is not None
+    ]
+    answerable = [result for result in available if result.get("answerable")]
+    failures: dict[str, list[str]] = {
+        "error_rate": _sample_ids(results, lambda result: bool(result.get("error"))),
+    }
+    for cutoff in resolved_metric_ks:
+        for metric_name in (
+            "hit",
+            "recall",
+            "precision",
+            "mrr",
+            "all_requirements_hit",
+        ):
+            key = f"{metric_name}_at_{cutoff}"
+            failures[key] = _sample_ids(
+                answerable,
+                lambda result, key=key: (
+                    stage_metrics(result).get(key) is not None
+                    and float(stage_metrics(result)[key]) < 1.0
+                ),
+            )
+
+        duplicate_key = f"duplicate_rate_at_{cutoff}"
+        failures[duplicate_key] = _sample_ids(
+            available,
+            lambda result, key=duplicate_key: (
+                stage_metrics(result).get(key) is not None
+                and float(stage_metrics(result)[key]) > 0.0
+            ),
+        )
+    return failures
+
+
+def _gate_non_perfect_sample_ids(
+    results: list[dict[str, Any]],
+    *,
+    top_k: int,
+) -> dict[str, list[str]]:
+    """Return samples behind gate metrics whose ideal direction is defined."""
+    successful = [result for result in results if not result.get("error")]
+    decisions = [
+        (result, _result_gate_metrics(result, top_k=top_k))
+        for result in successful
+    ]
+    available = [
+        (result, gate)
+        for result, gate in decisions
+        if gate["rejected"] is not None
+    ]
+    answerable = [result for result, _gate in available if result.get("answerable")]
+    unanswerable = [
+        result for result, _gate in available if not result.get("answerable")
+    ]
+    gates_by_id = {
+        str(result.get("id") or ""): gate
+        for result, gate in available
+    }
+    return {
+        "error_rate": _sample_ids(results, lambda result: bool(result.get("error"))),
+        "answerable_rejection_rate": _sample_ids(
+            answerable,
+            lambda result: gates_by_id[str(result.get("id") or "")]["rejected"]
+            is True,
+        ),
+        "correct_rejection_after_insufficient_evidence_rate": _sample_ids(
+            answerable,
+            lambda result: (
+                gates_by_id[str(result.get("id") or "")][
+                    "pre_gate_evidence_sufficient"
+                ] is False
+                and gates_by_id[str(result.get("id") or "")]["rejected"]
+                is not True
+            ),
+        ),
+        "false_rejection_with_sufficient_evidence_rate": _sample_ids(
+            answerable,
+            lambda result: (
+                gates_by_id[str(result.get("id") or "")][
+                    "rejection_attribution"
+                ] == "false_rejection_with_sufficient_evidence"
+            ),
+        ),
+        "unanswerable_rejection_rate": _sample_ids(
+            unanswerable,
+            lambda result: gates_by_id[str(result.get("id") or "")]["rejected"]
+            is not True,
+        ),
+        "fallback_rate": _sample_ids(
+            (result for result, _gate in available),
+            lambda result: gates_by_id[str(result.get("id") or "")]["fallback"]
+            is True,
+        ),
+    }
 
 
 def _percentile(values: Iterable[float], quantile: float) -> float | None:
@@ -967,6 +1383,31 @@ def _percentile(values: Iterable[float], quantile: float) -> float | None:
     )
 
 
+def _aggregate_stage_latencies(
+    results: list[dict[str, Any]],
+) -> dict[str, dict[str, float | int | None]]:
+    """Aggregate independently available, non-overlapping stage timings."""
+    successful = [result for result in results if not result.get("error")]
+    aggregated = {}
+    for stage in RETRIEVAL_LATENCY_STAGES:
+        values = []
+        for result in successful:
+            value = _optional_float(
+                result.get("retrieval", {})
+                .get("stage_latency_ms", {})
+                .get(stage)
+            )
+            if value is not None and value >= 0:
+                values.append(value)
+        aggregated[stage] = {
+            "sample_count": len(values),
+            "average_ms": _mean(values),
+            "p50_ms": _percentile(values, 0.5),
+            "p95_ms": _percentile(values, 0.95),
+        }
+    return aggregated
+
+
 def _aggregate_stage_metrics(
     results: list[dict[str, Any]],
     *,
@@ -977,11 +1418,18 @@ def _aggregate_stage_metrics(
     resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
     successful = [result for result in results if not result.get("error")]
     empty_key = "empty_before_sufficiency" if before_sufficiency else "empty"
-    metrics_key = "retrieval_metrics" if before_sufficiency else "metrics"
+
+    def stage_metrics(result: dict[str, Any]) -> dict[str, Any] | None:
+        if before_sufficiency:
+            metrics = result.get("retrieval_metrics")
+        else:
+            metrics = result.get("post_gate_metrics") or result.get("metrics")
+        return metrics if isinstance(metrics, dict) else None
+
     available = [
         result for result in successful
         if isinstance(result["retrieval"].get(empty_key), bool)
-        and isinstance(result.get(metrics_key), dict)
+        and stage_metrics(result) is not None
     ]
     answerable = [result for result in available if result.get("answerable")]
     unanswerable = [result for result in available if not result.get("answerable")]
@@ -1012,33 +1460,74 @@ def _aggregate_stage_metrics(
         ):
             key = f"{metric_name}_at_{cutoff}"
             aggregated[key] = _mean(
-                float(result[metrics_key][key])
+                float(stage_metrics(result)[key])
                 for result in answerable
-                if result[metrics_key].get(key) is not None
+                if stage_metrics(result).get(key) is not None
             )
 
         duplicate_key = f"duplicate_rate_at_{cutoff}"
         aggregated[duplicate_key] = _mean(
-            float(result[metrics_key][duplicate_key])
+            float(stage_metrics(result)[duplicate_key])
             for result in available
-            if result[metrics_key].get(duplicate_key) is not None
+            if stage_metrics(result).get(duplicate_key) is not None
         )
     return aggregated
 
 
-def _aggregate_gate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
+def _aggregate_gate_metrics(
+    results: list[dict[str, Any]],
+    *,
+    top_k: int,
+) -> dict[str, Any]:
     successful = [result for result in results if not result.get("error")]
     decisions = [
         (
             result,
-            _gate_metrics(result["retrieval"].get("evidence_sufficiency") or {}),
+            _result_gate_metrics(result, top_k=top_k),
         )
         for result in successful
     ]
-    available = [(r, gate) for r, gate in decisions if gate["rejected"] is not None]
+    available = [
+        (result, gate)
+        for result, gate in decisions
+        if gate["rejected"] is not None
+    ]
     disabled_count = sum(gate["enabled"] is False for _, gate in decisions)
-    answerable = [gate for r, gate in available if r.get("answerable")]
+    answerable_pairs = [
+        (result, gate)
+        for result, gate in available
+        if result.get("answerable")
+    ]
+    answerable = [gate for _, gate in answerable_pairs]
     unanswerable = [gate for r, gate in available if not r.get("answerable")]
+    evidence_sufficient = [
+        gate for _, gate in answerable_pairs
+        if gate["pre_gate_evidence_sufficient"] is True
+    ]
+    evidence_insufficient = [
+        gate for _, gate in answerable_pairs
+        if gate["pre_gate_evidence_sufficient"] is False
+    ]
+    attribution_unavailable = [
+        gate for _, gate in answerable_pairs
+        if gate["pre_gate_evidence_sufficient"] is None
+    ]
+    correct_insufficient_rejections = sum(
+        gate["rejection_attribution"]
+        == "correct_rejection_after_insufficient_evidence"
+        for gate in evidence_insufficient
+    )
+    false_sufficient_rejections = sum(
+        gate["rejection_attribution"]
+        == "false_rejection_with_sufficient_evidence"
+        for gate in evidence_sufficient
+    )
+    attributed_answerable_rejections = (
+        correct_insufficient_rejections + false_sufficient_rejections
+    )
+    unattributed_answerable_rejections = sum(
+        gate["rejected"] is True for gate in attribution_unavailable
+    )
     error_count = len(results) - len(successful)
     return {
         "query_count": len(results),
@@ -1052,9 +1541,38 @@ def _aggregate_gate_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         "rejected_query_count": sum(gate["rejected"] for _, gate in available),
         "answerable_rejected_count": sum(gate["rejected"] for gate in answerable),
         "unanswerable_rejected_count": sum(gate["rejected"] for gate in unanswerable),
+        "answerable_rejected_evidence_attribution_count": (
+            attributed_answerable_rejections
+        ),
+        "answerable_rejected_evidence_attribution_unavailable_count": (
+            unattributed_answerable_rejections
+        ),
         "rejection_rate": _mean(float(gate["rejected"]) for _, gate in available),
         "answerable_rejection_rate": _mean(
             float(gate["rejected"]) for gate in answerable
+        ),
+        "evidence_sufficient_answerable_decision_count": len(
+            evidence_sufficient
+        ),
+        "evidence_insufficient_answerable_decision_count": len(
+            evidence_insufficient
+        ),
+        "evidence_attribution_unavailable_answerable_decision_count": len(
+            attribution_unavailable
+        ),
+        "correct_rejection_after_insufficient_evidence_count": (
+            correct_insufficient_rejections
+        ),
+        "correct_rejection_after_insufficient_evidence_rate": _rate(
+            correct_insufficient_rejections,
+            len(evidence_insufficient),
+        ),
+        "false_rejection_with_sufficient_evidence_count": (
+            false_sufficient_rejections
+        ),
+        "false_rejection_with_sufficient_evidence_rate": _rate(
+            false_sufficient_rejections,
+            len(evidence_sufficient),
         ),
         "unanswerable_rejection_rate": _mean(
             float(gate["rejected"]) for gate in unanswerable
@@ -1070,73 +1588,35 @@ def aggregate_results(
     top_k: int,
     metric_ks: Iterable[int] | None = None,
 ) -> dict[str, Any]:
-    """Keep legacy metrics and add separate stage metrics for one slice."""
+    """Aggregate run statistics and the three explicit metric stages."""
     resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
     successful = [result for result in results if not result.get("error")]
     answerable = [result for result in successful if result.get("answerable")]
     unanswerable = [
         result for result in successful if not result.get("answerable")
     ]
-    sufficiency_checked = [
-        result
-        for result in successful
-        if result["retrieval"].get("evidence_sufficiency")
-    ]
-    hit_key = f"hit_at_{top_k}"
-    recall_key = f"recall_at_{top_k}"
-    mrr_key = f"mrr_at_{top_k}"
     error_count = len(results) - len(successful)
     latencies = [float(result["latency_ms"]) for result in successful]
 
-    return {
+    aggregated = {
         "query_count": len(results),
         "successful_query_count": len(successful),
         "error_count": error_count,
         "error_rate": _rate(error_count, len(results)),
         "answerable_query_count": len(answerable),
         "unanswerable_query_count": len(unanswerable),
-        "empty_rate": _mean(
-            float(result["retrieval"]["empty"]) for result in successful
-        ),
-        "answerable_empty_rate": _mean(
-            float(result["retrieval"]["empty"])
-            for result in answerable
-        ),
-        "unanswerable_empty_rate": _mean(
-            float(result["retrieval"]["empty"])
-            for result in unanswerable
-        ),
-        "unanswerable_rejection_rate": _mean(
-            float(result["retrieval"]["empty"])
-            for result in unanswerable
-        ),
-        "evidence_sufficiency_fallback_rate": _mean(
-            float(
-                result["retrieval"]["evidence_sufficiency"].get("source")
-                == "fallback"
-            )
-            for result in sufficiency_checked
-        ),
         "latency_sample_count": len(latencies),
         "average_latency_ms": _mean(latencies),
         "latency_p50_ms": _percentile(latencies, 0.5),
         "latency_p95_ms": _percentile(latencies, 0.95),
-        hit_key: _mean(
-            float(result["metrics"][hit_key]) for result in answerable
-        ),
-        recall_key: _mean(
-            float(result["metrics"][recall_key]) for result in answerable
-        ),
-        mrr_key: _mean(
-            float(result["metrics"][mrr_key]) for result in answerable
-        ),
+        "stage_latency_ms": _aggregate_stage_latencies(results),
         "retrieval_metrics": _aggregate_stage_metrics(
             results,
             top_k=top_k,
             before_sufficiency=True,
             metric_ks=resolved_metric_ks,
         ),
-        "gate_metrics": _aggregate_gate_metrics(results),
+        "gate_metrics": _aggregate_gate_metrics(results, top_k=top_k),
         "post_gate_metrics": _aggregate_stage_metrics(
             results,
             top_k=top_k,
@@ -1144,6 +1624,27 @@ def aggregate_results(
             metric_ks=resolved_metric_ks,
         ),
     }
+    post_gate_failures = _stage_non_perfect_sample_ids(
+        results,
+        top_k=top_k,
+        before_sufficiency=False,
+        metric_ks=resolved_metric_ks,
+    )
+    aggregated["non_perfect_sample_ids"] = {
+        "error_rate": post_gate_failures["error_rate"],
+        "retrieval_metrics": _stage_non_perfect_sample_ids(
+            results,
+            top_k=top_k,
+            before_sufficiency=True,
+            metric_ks=resolved_metric_ks,
+        ),
+        "gate_metrics": _gate_non_perfect_sample_ids(
+            results,
+            top_k=top_k,
+        ),
+        "post_gate_metrics": post_gate_failures,
+    }
+    return aggregated
 
 
 def build_summary(

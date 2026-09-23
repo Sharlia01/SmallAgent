@@ -55,7 +55,7 @@ def test_colloquial_finance_query_requests_rewrite_without_model(monkeypatch):
     completions = FakeCompletions(error=AssertionError("must not be called"))
 
     decision = query_intent.analyze_query_intent(
-        "研报觉得国电电力未来三年能赚多少钱，对应估值贵不贵？",
+        "上半年卖电均价掉了多少？",
         client=fake_client(completions),
     )
 
@@ -64,6 +64,42 @@ def test_colloquial_finance_query_requests_rewrite_without_model(monkeypatch):
     assert decision.need_decompose is False
     assert decision.source == "rule"
     assert completions.calls == []
+
+
+@pytest.mark.unit
+def test_multi_facet_colloquial_query_can_build_three_parallel_steps(
+    monkeypatch,
+):
+    monkeypatch.setenv("RAG_QUERY_INTENT_ENABLED", "true")
+    completions = FakeCompletions(
+        '{"intent":"complex_lookup","need_rewrite":true,'
+        '"need_decompose":true,"retrieval_mode":"parallel",'
+        '"reason":"盈利、每股收益和市盈率可分别检索",'
+        '"subqueries":['
+        '{"id":"profit","query":"国电电力2025至2027年归母净利润预测是多少？",'
+        '"query_template":"","depends_on":[],"output_slot":null,'
+        '"required_slots":[],"inherit_document_scope":false},'
+        '{"id":"eps","query":"国电电力2025至2027年EPS预测是多少？",'
+        '"query_template":"","depends_on":[],"output_slot":null,'
+        '"required_slots":[],"inherit_document_scope":false},'
+        '{"id":"pe","query":"国电电力2025至2027年PE估值是多少？",'
+        '"query_template":"","depends_on":[],"output_slot":null,'
+        '"required_slots":[],"inherit_document_scope":false}'
+        ']}'
+    )
+
+    decision = query_intent.analyze_query_intent(
+        "研报觉得国电电力未来三年能赚多少钱，对应估值贵不贵？",
+        client=fake_client(completions),
+    )
+
+    assert decision.need_rewrite is True
+    assert decision.retrieval_mode == "parallel"
+    assert [step.id for step in decision.subqueries] == [
+        "profit",
+        "eps",
+        "pe",
+    ]
 
 
 @pytest.mark.unit
@@ -145,6 +181,37 @@ def test_model_sequential_plan_is_parsed_and_validated(monkeypatch):
     assert decision.retrieval_mode == "sequential"
     assert decision.subqueries[0].output_slot == "policy"
     assert decision.subqueries[1].required_slots == ["policy"]
+
+
+@pytest.mark.unit
+def test_multiple_figure_locators_are_planned_as_parallel_queries(monkeypatch):
+    monkeypatch.setenv("RAG_QUERY_INTENT_ENABLED", "true")
+    completions = FakeCompletions(
+        '{"intent":"complex_lookup","need_rewrite":false,'
+        '"need_decompose":true,"retrieval_mode":"parallel",'
+        '"reason":"需要分别查询图2和图3",'
+        '"subqueries":['
+        '{"id":"figure_3","query":"图3中2021年归母净利润是否为负？",'
+        '"query_template":"","depends_on":[],"output_slot":null,'
+        '"required_slots":[],"inherit_document_scope":false},'
+        '{"id":"figure_2","query":"图2中2025年显示了哪些季度的营业收入柱？",'
+        '"query_template":"","depends_on":[],"output_slot":null,'
+        '"required_slots":[],"inherit_document_scope":false}'
+        ']}'
+    )
+
+    decision = query_intent.analyze_query_intent(
+        "不要混淆图2和图3：哪张图显示2021年归母净利润为负，"
+        "哪张图显示2025年只有第一、第二季度营业收入柱？",
+        client=fake_client(completions),
+    )
+
+    assert decision.retrieval_mode == "parallel"
+    assert [step.id for step in decision.subqueries] == [
+        "figure_3",
+        "figure_2",
+    ]
+    assert len(completions.calls) == 1
 
 
 @pytest.mark.unit
