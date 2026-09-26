@@ -14,13 +14,14 @@ from typing import Any, Iterable
 from service.core.evidence_metadata import evidence_metadata
 
 
-RESULT_SCHEMA_VERSION = "2.4"
+RESULT_SCHEMA_VERSION = "2.5"
 RETRIEVAL_LATENCY_STAGES = (
     "query_transform",
     "initial_retrieval",
     "rerank",
     "multi_hop",
     "gate",
+    "repair",
     "other",
     "total",
 )
@@ -1086,11 +1087,25 @@ def evaluate_retrieval_case(
                 not serialized_before if serialized_before is not None else None
             ),
             "stage_latency_ms": _stage_latency_snapshot(raw_result),
+            "stage_latency_semantics": _json_safe(raw_result.get("stage_latency_semantics") or {}),
+            "expected_retrieval": _json_safe(sample.get("expected_retrieval") or {}),
             "query_rewrite": _json_safe(
                 raw_result.get("query_rewrite") or {}
             ),
             "query_intent": _json_safe(
                 raw_result.get("query_intent") or {}
+            ),
+            "query_contract": _json_safe(raw_result.get("query_contract") or {}),
+            "query_runtime": _json_safe(raw_result.get("query_runtime") or {}),
+            "plan_execution": _json_safe(raw_result.get("plan_execution") or {}),
+            "retrieval_graph": _json_safe(raw_result.get("retrieval_graph") or {}),
+            "query_repair": _json_safe(raw_result.get("query_repair") or {}),
+            "agent_execution": _json_safe(raw_result.get("agent_execution") or {}),
+            "retrieval_route": _json_safe(
+                raw_result.get("retrieval_route") or {}
+            ),
+            "retrieval_plan": _json_safe(
+                raw_result.get("retrieval_plan") or {}
             ),
             "query_transform": _json_safe(
                 raw_result.get("query_transform") or {}
@@ -1157,6 +1172,7 @@ def build_error_case(
         "error": f"{type(error).__name__}: {error}",
         "latency_ms": round(float(latency_ms), 3),
         "retrieval": {
+            "query_runtime": _json_safe(getattr(error, "query_runtime", {}) or {}),
             "metric_ks": list(resolved_metric_ks),
             "total_candidates": 0,
             "retrieved_count": 0,
@@ -1582,6 +1598,95 @@ def _aggregate_gate_metrics(
     }
 
 
+def _stage_outcome_metrics(events: list[dict[str, Any]]) -> dict[str, Any]:
+    """Attempt denominators exclude downstream stages that never ran."""
+    success_statuses = {"ok", "accepted", "succeeded"}
+    failure_statuses = {"error", "rejected", "failed", "partial", "budget_exhausted"}
+    succeeded = sum(e.get("status") in success_statuses for e in events)
+    failed = sum(e.get("status") in failure_statuses for e in events)
+    return {
+        "event_count": len(events), "attempt_count": succeeded + failed,
+        "success_count": succeeded, "failure_count": failed,
+        "success_rate": _rate(succeeded, succeeded + failed),
+        "skipped_count": sum(e.get("status") == "skipped" for e in events),
+        "blocked_count": sum(e.get("status") == "blocked" for e in events),
+        "failure_rules": dict(Counter(e["rule"] for e in events if e.get("rule") and e.get("status") in failure_statuses | {"blocked"})),
+        "failure_fields": dict(Counter(field for e in events for field in e.get("failure_fields", []))),
+        "end_reasons": dict(Counter(e["end_reason"] for e in events if e.get("end_reason"))),
+    }
+
+
+def aggregate_query_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Operational measurements with explicit denominators; no inferred costs.
+
+    Route agreement is a diagnostic against annotations, not answer quality.
+    Unknown token usage is not interpreted as zero tokens.
+    """
+    retrievals = [item.get("retrieval") or {} for item in results]
+    runtimes = [r["query_runtime"] for r in retrievals if r.get("query_runtime")]
+    plans = [r["retrieval_plan"] for r in retrievals if r.get("retrieval_plan")]
+    analyses = [r["query_intent"] for r in retrievals if r.get("query_intent")]
+    executions = [r["plan_execution"] for r in retrievals if r.get("plan_execution")]
+    executed_requests = [item for item in executions if type(item.get("requested_plan_execution_success")) is bool]
+    repair_cohorts = {}
+    for answerable in (True, False):
+        cohort = [(item.get("retrieval") or {}).get("query_repair") or {} for item in results
+                  if item.get("answerable") is answerable]
+        attempts = [item for item in cohort if item.get("attempted_goal_ids")]
+        repair_cohorts["answerable" if answerable else "unanswerable"] = {
+            "sample_count": len(cohort), "attempt_count": len(attempts),
+            "goals_satisfied_count": sum(item.get("stop_reason") == "goals_satisfied" for item in attempts),
+            "success_rate": _rate(sum(item.get("stop_reason") == "goals_satisfied" for item in attempts), len(attempts)),
+        }
+    annotated = [r for r in retrievals if (r.get("expected_retrieval") or {}).get("mode")
+                 and (r.get("retrieval_route") or {}).get("mode")]
+    repairs = [r["query_repair"] for r in retrievals if (r.get("query_repair") or {}).get("attempted_goal_ids")]
+    coverage = [goal for r in retrievals for goal in (r.get("evidence_sufficiency") or {}).get("goal_coverage", [])]
+    all_events = [event for runtime in runtimes for event in runtime.get("events", [])]
+    events = [event for event in all_events if "model" in event and event.get("request_sent") is not False]
+    token_events = [event for event in events if isinstance(event.get("total_tokens"), (int, float))]
+    observable_phases = ("request", "parse", "semantic_validation", "execution")
+    stage_events = defaultdict(list)
+    for event in all_events:
+        if event.get("phase") in observable_phases:
+            # Rule-compiled plans must not inflate model-plan acceptance rates.
+            stage_events[(event["stage"], event["phase"], event.get("source", "unspecified"))].append(event)
+    return {
+        "runtime_sample_count": len(runtimes),
+        "runtime_unavailable_count": len(results) - len(runtimes),
+        "average_model_calls": _mean(float(r.get("counts", {}).get("model", 0)) for r in runtimes),
+        "average_retrieval_calls": _mean(float(r.get("counts", {}).get("retrieval", 0)) for r in runtimes),
+        "model_event_count": len(events),
+        "blocked_model_request_count": sum(e.get("phase") == "request" and e.get("request_sent") is False for e in all_events),
+        "token_usage_event_count": len(token_events),
+        "reported_total_tokens": sum(e["total_tokens"] for e in token_events) if token_events else None,
+        "plan_sample_count": len(plans),
+        "analysis_sample_count": len(analyses),
+        "analysis_sources": dict(Counter(item.get("source", "unknown") for item in analyses)),
+        "analysis_fallback_rate": _rate(sum(item.get("source") == "fallback" for item in analyses), len(analyses)),
+        "requested_plan_sample_count": len(executed_requests),
+        "requested_plan_execution_unavailable_count": len(retrievals) - len(executed_requests),
+        "requested_plan_execution_success_rate": _rate(
+            sum(item.get("requested_plan_execution_success") is True for item in executed_requests), len(executed_requests)),
+        "plan_fallback_rate": _rate(sum(p.get("source") == "fallback" for p in plans), len(plans)),
+        "rule_plan_fallback_count": sum(p.get("source") == "rule" and bool(p.get("fallback_reason")) for p in plans),
+        "annotated_route_count": len(annotated),
+        "route_agreement": _mean(float(r["retrieval_route"]["mode"] == r["expected_retrieval"]["mode"]) for r in annotated),
+        "evaluated_goal_count": len(coverage),
+        "supported_goal_rate": _rate(sum(g.get("status") == "supported" for g in coverage), len(coverage)),
+        "repair_count": len(repairs),
+        "repair_success_rate": _rate(sum(r.get("stop_reason") == "goals_satisfied" for r in repairs), len(repairs)),
+        "repair_cohorts": repair_cohorts,
+        "verification_unavailable_count": sum((r.get("evidence_sufficiency") or {}).get("verification_status") == "unavailable" for r in retrievals),
+        "phase_metrics": {phase: _stage_outcome_metrics([e for e in all_events if e.get("phase") == phase])
+                          for phase in observable_phases},
+        "stage_metrics": [{"stage": stage, "phase": phase, "source": source, **_stage_outcome_metrics(items)}
+                          for (stage, phase, source), items in sorted(stage_events.items())],
+        "pipeline_end_reasons": dict(Counter(e["end_reason"] for e in all_events
+                                            if e.get("phase") == "pipeline" and e.get("end_reason"))),
+    }
+
+
 def aggregate_results(
     results: list[dict[str, Any]],
     *,
@@ -1609,7 +1714,9 @@ def aggregate_results(
         "average_latency_ms": _mean(latencies),
         "latency_p50_ms": _percentile(latencies, 0.5),
         "latency_p95_ms": _percentile(latencies, 0.95),
+        "latency_p99_ms": _percentile(latencies, 0.99),
         "stage_latency_ms": _aggregate_stage_latencies(results),
+        "query_metrics": aggregate_query_metrics(results),
         "retrieval_metrics": _aggregate_stage_metrics(
             results,
             top_k=top_k,

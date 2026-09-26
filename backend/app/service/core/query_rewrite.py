@@ -10,6 +10,7 @@ from typing import Any
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from service.core.query_runtime import model_completion
 
 
 load_dotenv()
@@ -33,10 +34,10 @@ QUERY_REWRITE_SYSTEM_PROMPT = """
 
 示例：
 用户问题：这家公司今年卖货赚了多少，和去年比怎么样？
-输出：{"query":"该公司本年度营业收入、归母净利润及同比变化"}
+输出：{"query":"这家公司今年的利润是多少，与去年相比如何变化？"}
 
 用户问题：这家公司接下来几年能赚多少，股票贵不贵？
-输出：{"query":"该公司未来几年盈利预测、归母净利润、每股收益 EPS 和市盈率 PE 估值"}
+输出：{"query":"这家公司接下来几年的盈利预测与股票估值"}
 """.strip()
 
 
@@ -118,7 +119,7 @@ def rewrite_query(question: str, *, client: Any | None = None) -> str:
 
     try:
         resolved_client = client or get_query_rewrite_client()
-        completion = resolved_client.chat.completions.create(
+        completion = model_completion(resolved_client, "query_rewrite",
             model=os.getenv(
                 "QUERY_REWRITE_MODEL",
                 DEFAULT_QUERY_REWRITE_MODEL,
@@ -137,6 +138,10 @@ def rewrite_query(question: str, *, client: Any | None = None) -> str:
         rewritten_query = _parse_rewritten_query(
             _response_content(completion)
         )
+        from service.core.query_expansion import validate_query_preservation
+        if not validate_query_preservation(original_question, rewritten_query).valid:
+            logger.info("Query rewrite rejected by preservation validation")
+            return original_question
         logger.info(
             "Query rewrite completed: changed=%s original_chars=%s rewritten_chars=%s",
             rewritten_query != original_question,

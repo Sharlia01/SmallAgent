@@ -2,6 +2,8 @@
 
 from typing import Any
 from service.core.evidence_metadata import evidence_metadata
+from service.core.query_contract import QueryRequest
+from service.core.query_expansion import validate_query_preservation
 
 from agent.schemas import ToolResult, ToolSource
 from service.core.retrieval import (
@@ -92,16 +94,18 @@ class RagSearchTool:
         "additionalProperties": False,
     }
 
-    def __init__(self, user_id: int):
+    def __init__(self, user_id: int, *, retriever=None):
         # Bind tenant context here instead of accepting it from model output.
         # This prevents an Agent tool call from selecting another user's index.
         self._user_id = user_id
+        self._retriever = retriever
 
     def run(
         self,
         *,
         query: str,
         top_k: int = DEFAULT_PAGE_SIZE,
+        _request: QueryRequest | None = None,
     ) -> ToolResult:
         """Search the bound user's knowledge base.
 
@@ -109,11 +113,11 @@ class RagSearchTool:
         an Agent can observe the failure and choose a fallback path.
         """
         normalized_query = query.strip() if isinstance(query, str) else ""
-        if not normalized_query:
+        if not normalized_query or len(normalized_query) > 12000:
             return ToolResult.failure(
                 tool_name=self.name,
                 query=normalized_query,
-                error="query 不能为空。",
+                error="query 必须为 1 到 12000 个字符。",
                 metadata={"error_type": "validation_error"},
             )
 
@@ -130,10 +134,13 @@ class RagSearchTool:
             )
 
         try:
-            chunks, diagnostics = retrieve_content_with_diagnostics(
+            context = {"request": _request} if _request is not None else {}
+            retrieve = self._retriever or retrieve_content_with_diagnostics
+            chunks, diagnostics = retrieve(
                 str(self._user_id),
                 normalized_query,
                 page_size=top_k,
+                **context,
             )
         except Exception as error:
             logger.exception(
@@ -152,10 +159,20 @@ class RagSearchTool:
             _chunk_to_source(chunk, rank)
             for rank, chunk in enumerate(chunks, start=1)
         ]
+        if _request is not None:
+            diagnostics["agent_query"] = {
+                "query": normalized_query,
+                "validation": validate_query_preservation(_request.resolved_question, normalized_query).__dict__,
+                "used_as_user_question": False,
+            }
+        if diagnostics.get("response_mode") == "clarify":
+            content = str(diagnostics.get("clarification") or "请补充查询对象。")
+        else:
+            content = _format_sources_for_agent(sources)
         return ToolResult(
             tool_name=self.name,
             query=normalized_query,
-            content=_format_sources_for_agent(sources),
+            content=content,
             sources=sources,
             metadata={
                 "result_count": len(sources),
@@ -163,6 +180,10 @@ class RagSearchTool:
                 **diagnostics,
             },
         )
+
+    def run_for_request(self, request: QueryRequest, *, query: str, top_k: int = DEFAULT_PAGE_SIZE) -> ToolResult:
+        """Server-only context injection, deliberately absent from tool schema."""
+        return self.run(query=query, top_k=top_k, _request=request)
 
 
 def search_knowledge_base(

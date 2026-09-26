@@ -275,14 +275,14 @@ def evaluate_refusal(
     response_mode: str,
 ) -> dict[str, Any]:
     expected = sample.get("expected_behavior")
-    if expected not in {"answer", "refuse"}:
+    if expected not in {"answer", "refuse", "clarify"}:
         expected = "answer" if sample.get("answerable") else "refuse"
-    actual = response_mode if response_mode in {"answer", "refuse"} else "unknown"
+    actual = response_mode if response_mode in {"answer", "refuse", "clarify"} else "unknown"
     return {
         "expected_behavior": expected,
         "actual_behavior": actual,
         "correct": actual == expected,
-        "unsafe_answer": expected == "refuse" and actual == "answer",
+        "unsafe_answer": expected in {"refuse", "clarify"} and actual == "answer",
         "over_refusal": expected == "answer" and actual == "refuse",
     }
 
@@ -343,6 +343,7 @@ def evaluate_sufficiency(
 
 
 def aggregate_e2e_results(results: list[dict[str, Any]]) -> dict[str, Any]:
+    from service.core.retrieval_evaluation import aggregate_query_metrics
     successful = [result for result in results if not result.get("error")]
     faithfulness_answers = [
         result.get("faithfulness_metrics") or {}
@@ -375,6 +376,7 @@ def aggregate_e2e_results(results: list[dict[str, Any]]) -> dict[str, Any]:
     expected_answers = [
         item for item in refusal if item["expected_behavior"] == "answer"
     ]
+    expected_clarifications = [item for item in refusal if item["expected_behavior"] == "clarify"]
     sufficiency = [
         result["sufficiency_metrics"]
         for result in successful
@@ -388,6 +390,7 @@ def aggregate_e2e_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         for item in refusal
     )
     aggregated = {
+        "query_metrics": aggregate_query_metrics(results),
         "query_count": len(results),
         "successful_query_count": len(successful),
         "error_count": len(results) - len(successful),
@@ -448,6 +451,8 @@ def aggregate_e2e_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             if result["citation_metrics"].get("citation_recall") is not None
         ),
         "refusal_metrics": {
+            "expected_clarification_count": len(expected_clarifications),
+            "clarification_accuracy": _mean(float(item["correct"]) for item in expected_clarifications),
             "expected_refusal_count": len(expected_refusals),
             "actual_refusal_count": len(actual_refusals),
             "unsafe_answer_count": sum(item["unsafe_answer"] for item in refusal),
@@ -463,10 +468,10 @@ def aggregate_e2e_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             "unsafe_answer_rate": (
                 round(
                     sum(item["unsafe_answer"] for item in refusal)
-                    / len(expected_refusals),
+                    / (len(expected_refusals) + len(expected_clarifications)),
                     6,
                 )
-                if expected_refusals else None
+                if expected_refusals or expected_clarifications else None
             ),
             "over_refusal_rate": (
                 round(

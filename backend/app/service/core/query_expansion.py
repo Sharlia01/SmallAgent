@@ -7,12 +7,17 @@ import logging
 import os
 import re
 import unicodedata
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from functools import lru_cache
 from typing import Any, Literal
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from service.core.query_runtime import model_completion
+from service.core.query_semantics import (
+    alias_expansions, canonical_text, explicit_named_terms, metric_terms,
+    semantic_conflicts, domain_policy,
+)
 
 
 load_dotenv()
@@ -25,7 +30,7 @@ DEFAULT_QUERY_EXPANSION_MAX_TERMS = 8
 MAX_QUERY_EXPANSION_INPUT_CHARS = 2000
 MAX_QUERY_EXPANSION_OUTPUT_CHARS = 400
 
-QueryExpansionSource = Literal["model", "fallback", "disabled", "skipped"]
+QueryExpansionSource = Literal["model", "rule", "fallback", "disabled", "skipped"]
 
 LOCATOR_PATTERN = re.compile(
     r"(?:表|图|附表|附图)\s*[A-Za-z]?\s*\d+(?:\s*[-－—.]\s*\d+)*"
@@ -35,9 +40,10 @@ YEAR_OR_DATE_PATTERN = re.compile(
     r"(?<!\d)(?:19|20)\d{2}\s*年\s*\d{1,2}\s*月(?:\s*\d{1,2}\s*日)?"
     r"|(?<!\d)(?:19|20)\d{2}\s*年?\s*(?:第\s*)?[一二三四1-4]\s*季度"
     r"|(?<!\d)(?:19|20)\d{2}\s*年?\s*(?:上半年|下半年|全年|年度)"
-    r"|(?<!\d)(?:19|20)\d{2}(?:\s*[-－—至到/]\s*(?:(?:19|20)?\d{2}))?\s*年?(?!\d)"
+    r"|(?<!\d)(?:19|20)\d{2}\s*年?\s*[-－—至到/]\s*(?:19|20)\d{2}\s*年?"
     r"|(?<!\d)(?:\d{2}|(?:19|20)\d{2})\s*H[12]"
-    r"|(?:\d{2}|(?:19|20)\d{2})?\s*Q[1-4]",
+    r"|(?:\d{2}|(?:19|20)\d{2})?\s*Q[1-4]"
+    r"|(?<!\d)(?:19|20)\d{2}\s*年?(?!\d)",
     re.IGNORECASE,
 )
 RELATIVE_TIME_PATTERN = re.compile(
@@ -46,11 +52,11 @@ RELATIVE_TIME_PATTERN = re.compile(
     r"|(?:第\s*)?[一二三四1-4]\s*季度"
 )
 NUMBER_WITH_UNIT_PATTERN = re.compile(
-    r"[-+]?\d+(?:\.\d+)?\s*(?:%|％|亿元|万元|元|倍|万吨|万千瓦|"
+    r"[-+]?\d+(?:\.\d+)?\s*(?:%|％|百万元|百万美元|亿美元|美元|亿元|万元|元|倍|万吨|万千瓦|"
     r"亿千瓦时|千瓦时|兆瓦时|GW|MW|kW|x)",
     re.IGNORECASE,
 )
-NUMBER_PATTERN = re.compile(r"(?<![A-Za-z])[-+]?\d+(?:\.\d+)?")
+NUMBER_PATTERN = re.compile(r"(?<![A-Za-z\d])[-+]?\d+(?:\.\d+)?")
 STOCK_CODE_PATTERN = re.compile(
     r"(?<!\d)\d{6}(?:\.(?:SH|SZ|BJ))?(?!\d)",
     re.IGNORECASE,
@@ -58,12 +64,12 @@ STOCK_CODE_PATTERN = re.compile(
 QUOTED_TERM_PATTERN = re.compile(r"[“‘\"']([^”’\"']{2,40})[”’\"']")
 NEGATION_PATTERN = re.compile(
     r"没有|并未|未能|未曾|未发生|未提供|未披露|未包含|不能|不含|"
-    r"不包括|不是|不高于|不低于|不超过|不少于|不支持|不考虑|"
+    r"不包括|(?<!是)不是|不高于|不低于|不超过|不少于|不支持|不考虑|"
     r"不计算|无法|无需"
 )
 
 ORGANIZATION_PATTERN = re.compile(
-    r"[\u4e00-\u9fffA-Za-z0-9·]{2,24}"
+    r"[\u4e00-\u9fffA-Za-z0-9·]{2,24}?"
     r"(?:股份有限公司|有限责任公司|集团有限公司|股份|集团|电力|能源|"
     r"银行|证券|科技|公司)"
 )
@@ -83,7 +89,9 @@ ENTITY_PREFIXES = (
 )
 ENTITY_LEADING_CONTEXT_PATTERN = re.compile(
     r"^(?:(?:这份|该|本)?(?:研报|研究报告|报告)(?:中|里)?"
-    r"(?:对|关于|认为|觉得)?|帮我查询|帮我查|想知道|请问|关于|根据|对)+"
+    r"(?:对|关于|认为|觉得)?|帮我查询|帮我查|想知道|请问|关于|根据|对|"
+    r"查询|查找|找出|获取|比较|说明|解释|分析|介绍|列出|预计|以及|请|先|再|和|与|"
+    r"(?:哪些|什么|具体)?(?:数据|信息|证据)?(?:来|用于)?支持)+"
 )
 GENERIC_ORGANIZATIONS = {
     "上市公司",
@@ -135,8 +143,8 @@ QUERY_EXPANSION_SYSTEM_PROMPT = """
 {{"expanded_query":"扩展查询","added_terms":["新增词1","新增词2"]}}
 
 示例：
-输入：{{"original_query":"研报觉得国电电力未来三年能赚多少钱，对应估值贵不贵？","normalized_query":"国电电力未来三年盈利预测与估值"}}
-输出：{{"expanded_query":"国电电力 未来三年 盈利预测 归母净利润 每股收益 EPS 市盈率 PE 估值","added_terms":["归母净利润","每股收益","EPS","市盈率","PE"]}}
+输入：{{"original_query":"国电电力未来三年的每股收益和市盈率？","normalized_query":"国电电力未来三年的每股收益和市盈率"}}
+输出：{{"expanded_query":"国电电力未来三年的每股收益和市盈率 EPS PE","added_terms":["EPS","PE"]}}
 
 输入：{{"original_query":"这份研报对国电电力到底是看多还是看空？给了什么评级？","normalized_query":"国电电力 研报 投资评级 看多 看空"}}
 输出：{{"expanded_query":"国电电力 研报 投资评级 看多 看空 评级定义 评级标准","added_terms":["评级定义","评级标准"]}}
@@ -149,6 +157,7 @@ class QueryValidationResult:
     required_anchors: list[str]
     missing_anchors: list[str]
     added_risky_terms: list[str]
+    semantic_conflicts: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -241,12 +250,7 @@ def get_query_expansion_client() -> OpenAI:
 
 
 def _normalize_for_match(value: str) -> str:
-    normalized = unicodedata.normalize("NFKC", value).casefold()
-    return "".join(
-        character
-        for character in normalized
-        if character.isalnum() or "\u4e00" <= character <= "\u9fff"
-    )
+    return canonical_text(value)
 
 
 def _unique_matches(pattern: re.Pattern, query: str) -> set[str]:
@@ -258,17 +262,24 @@ def _unique_matches(pattern: re.Pattern, query: str) -> set[str]:
 
 
 def _extract_organizations(query: str) -> set[str]:
+    # Financial field names such as 归属于母公司股东的净利润 are not new
+    # corporate entities. Mask known fields before applying the suffix guard.
+    field_names = [name for canonical, aliases in domain_policy()["aliases"].items()
+                   for name in [canonical, *aliases] if not name.isascii()]
+    original = query
+    for name in sorted(field_names, key=len, reverse=True):
+        query = query.replace(name, " ")
+    # Mask before matching; deleting a time from an already matched entity
+    # would fabricate a non-contiguous name such as “2025年国电电力”.
+    query = YEAR_OR_DATE_PATTERN.sub(" ", query)
+    query = RELATIVE_TIME_PATTERN.sub(" ", query)
     organizations = set()
     for match in ORGANIZATION_PATTERN.finditer(query):
         candidate = match.group(0).strip()
         candidate = ENTITY_LEADING_CONTEXT_PATTERN.sub("", candidate).strip()
-        for prefix in ENTITY_PREFIXES:
-            prefix_position = candidate.rfind(prefix)
-            if prefix_position >= 0:
-                candidate = candidate[prefix_position + len(prefix):]
-        candidate = RELATIVE_TIME_PATTERN.sub("", candidate).strip()
         if (
             candidate
+            and candidate in original
             and candidate not in GENERIC_ORGANIZATIONS
             and len(candidate) <= 20
         ):
@@ -287,6 +298,7 @@ def extract_query_anchors(query: str) -> list[str]:
         YEAR_OR_DATE_PATTERN,
         RELATIVE_TIME_PATTERN,
         NUMBER_WITH_UNIT_PATTERN,
+        NUMBER_PATTERN,
         STOCK_CODE_PATTERN,
         NEGATION_PATTERN,
         CANONICAL_TERM_PATTERN,
@@ -294,6 +306,8 @@ def extract_query_anchors(query: str) -> list[str]:
         anchors.update(_unique_matches(pattern, query))
 
     anchors.update(_extract_organizations(query))
+    anchors.update(explicit_named_terms(query))
+    anchors.update(metric_terms(query))
     anchors.update(
         match.group(1).strip()
         for match in QUOTED_TERM_PATTERN.finditer(query)
@@ -303,6 +317,7 @@ def extract_query_anchors(query: str) -> list[str]:
 
 
 def _extract_risky_additions(query: str) -> set[str]:
+    query = unicodedata.normalize("NFKC", query).replace("−", "-").replace("—", "-")
     risky_terms = set()
     for pattern in (
         LOCATOR_PATTERN,
@@ -314,6 +329,8 @@ def _extract_risky_additions(query: str) -> set[str]:
     ):
         risky_terms.update(_unique_matches(pattern, query))
     risky_terms.update(_extract_organizations(query))
+    risky_terms.update(explicit_named_terms(query))
+    risky_terms.update(scope for scope in domain_policy().get("business_scopes", []) if scope in query)
     return risky_terms
 
 
@@ -345,12 +362,20 @@ def validate_query_preservation(
         candidate_risky_terms,
         original_risky_terms,
     )
+    from service.core.query_semantics import reporting_periods
+    source_periods = reporting_periods(original)
+    added_risky_terms = [term for term in added_risky_terms if not (
+        YEAR_OR_DATE_PATTERN.fullmatch(term.strip()) and not re.search(r"月|日", term)
+        and reporting_periods(term) and reporting_periods(term) <= source_periods
+    )]
+    conflicts = semantic_conflicts(original, candidate)
 
     return QueryValidationResult(
-        valid=bool(candidate.strip()) and not missing_anchors and not added_risky_terms,
+        valid=bool(candidate.strip()) and not missing_anchors and not added_risky_terms and not conflicts,
         required_anchors=required_anchors,
         missing_anchors=missing_anchors,
         added_risky_terms=added_risky_terms,
+        semantic_conflicts=conflicts,
     )
 
 
@@ -488,6 +513,7 @@ def expand_query(
     rewritten: str,
     *,
     client: Any | None = None,
+    allow_model: bool = True,
 ) -> QueryExpansionResult:
     """Generate one expanded keyword query and validate intent preservation."""
     original_query = original.strip() if isinstance(original, str) else ""
@@ -495,11 +521,8 @@ def expand_query(
 
     if not original_query:
         return QueryExpansionResult.noop(original_query, reason="原查询为空")
-    if not rewritten_query or rewritten_query == original_query:
-        return QueryExpansionResult.noop(
-            original_query,
-            reason="规范化查询未发生变化，跳过扩展",
-        )
+    if not rewritten_query:
+        rewritten_query = original_query
     if not _environment_flag("QUERY_EXPANSION_ENABLED", True):
         return _fallback_result(
             original_query,
@@ -517,9 +540,30 @@ def expand_query(
             reason="查询过长，跳过扩展",
         )
 
+    rewrite_validation = validate_query_preservation(original_query, rewritten_query)
+    if not rewrite_validation.valid:
+        return _fallback_result(original_query, rewritten_query,
+                                reason="规范化查询未通过保真校验，保留原问题")
+    safe_query = rewritten_query if rewrite_validation.valid else original_query
+    terms = alias_expansions(safe_query, _max_expansion_terms())
+    if terms and (safe_query == original_query or not allow_model):
+        expanded = f"{safe_query} {' '.join(terms)}"
+        validation = validate_query_preservation(original_query, expanded)
+        if validation.valid and len(expanded) <= MAX_QUERY_EXPANSION_OUTPUT_CHARS:
+            return QueryExpansionResult(
+                original=original_query, rewritten=rewritten_query, expanded=expanded,
+                effective_query=expanded, changed=expanded != original_query,
+                expansion_applied=True, added_terms=terms, source="rule",
+                fallback_reason=None, rewrite_validation=rewrite_validation,
+                expansion_validation=validation,
+            )
+    if not allow_model:
+        return _fallback_result(original_query, rewritten_query, source="skipped",
+                                reason="没有可用的词表别名，跳过模型扩展")
+
     try:
         resolved_client = client or get_query_expansion_client()
-        completion = resolved_client.chat.completions.create(
+        completion = model_completion(resolved_client, "query_expansion",
             model=os.getenv(
                 "QUERY_EXPANSION_MODEL",
                 os.getenv("QUERY_REWRITE_MODEL", DEFAULT_QUERY_EXPANSION_MODEL),
@@ -536,7 +580,7 @@ def expand_query(
                     "content": json.dumps(
                         {
                             "original_query": original_query,
-                            "normalized_query": rewritten_query,
+                            "normalized_query": safe_query,
                         },
                         ensure_ascii=False,
                     ),

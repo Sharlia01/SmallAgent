@@ -592,6 +592,7 @@ class Dealer:
         branch_weights = self._rrf_branch_weights(req, has_expanded_query)
         branches = []
 
+        # 原始问题检索
         if "keyword_original" in branch_weights:
             branches.append(
                 self._search_text_branch(
@@ -605,6 +606,7 @@ class Dealer:
                 )
             )
 
+        # 扩展问题检索
         if "keyword_expanded" in branch_weights:
             branches.append(
                 self._search_text_branch(
@@ -618,6 +620,7 @@ class Dealer:
                 )
             )
 
+        # 原始问题向量检索
         query_vector = []
         if "vector_original" in branch_weights:
             vector_branch, query_vector = self._search_vector_branch(
@@ -1069,6 +1072,7 @@ class Dealer:
         )
 
         initial_retrieval_started = time.perf_counter()
+        # request中的question是原始问题，keyword_question是扩展后的问题，这里做多路召回
         search_result = self.search(
             request,
             self._build_index_names(tenant_ids),

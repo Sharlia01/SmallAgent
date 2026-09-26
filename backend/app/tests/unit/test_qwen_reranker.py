@@ -26,6 +26,10 @@ def test_rerank_uses_local_bge_in_batches_and_preserves_input_order(monkeypatch)
         lambda: (tokenizer, model, "cpu"),
     )
     monkeypatch.setenv("RERANKER_MAX_LENGTH", "512")
+    monkeypatch.setattr(
+        reranker, "get_reranker_provider",
+        lambda: reranker.LocalRerankerProvider(output_score_mode="raw_logits"),
+    )
 
     scores, metadata = reranker.rerank_similarity(
         "原始问题",

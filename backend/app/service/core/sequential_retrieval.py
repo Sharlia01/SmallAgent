@@ -13,6 +13,9 @@ from typing import Any, Literal
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from service.core.query_runtime import model_completion
+from service.core.query_expansion import _extract_organizations
+from service.core.query_semantics import canonical_text
 
 
 load_dotenv()
@@ -60,6 +63,8 @@ class BridgeExtraction:
     source_chunk_id: str
     document_id: str
     source: BridgeExtractionSource
+    source_quote: str = ""
+    subject: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -116,6 +121,8 @@ def _build_extraction(
     source_chunk_index: int,
     chunks: list[dict[str, Any]],
     source: BridgeExtractionSource,
+    subject: str = "",
+    source_quote: str = "",
 ) -> BridgeExtraction:
     normalized_value = " ".join(value.split()).strip()
     if not normalized_value or len(normalized_value) > MAX_BRIDGE_VALUE_CHARS:
@@ -133,6 +140,11 @@ def _build_extraction(
     ):
         raise ValueError("bridge value is not present in its source chunk")
 
+    if source_quote and _normalize_for_match(source_quote) not in _normalize_for_match(content):
+        raise ValueError("bridge quote is not present in source chunk")
+    if source_quote and _normalize_for_match(normalized_value) not in _normalize_for_match(source_quote):
+        raise ValueError("bridge quote does not contain value")
+
     return BridgeExtraction(
         slot=slot,
         value=normalized_value,
@@ -140,28 +152,43 @@ def _build_extraction(
         source_chunk_id=str(chunk.get("chunk_id") or ""),
         document_id=str(chunk.get("doc_id") or chunk.get("document_id") or ""),
         source=source,
+        source_quote=source_quote,
+        subject=subject,
     )
 
 
 def _extract_rating_by_rule(
     slot: str,
     chunks: list[dict[str, Any]],
+    question: str = "",
 ) -> BridgeExtraction | None:
     if slot != "rating":
         return None
+    subjects = _extract_organizations(question)
+    candidates = []
     for index, chunk in enumerate(chunks, start=1):
         content = _chunk_content(chunk)
-        for pattern in (QUOTED_RATING_PATTERN, PLAIN_RATING_PATTERN):
-            match = pattern.search(content)
-            if match:
-                return _build_extraction(
-                    slot=slot,
-                    value=match.group("value"),
-                    source_chunk_index=index,
-                    chunks=chunks,
-                    source="rule",
-                )
-    return None
+        for clause in re.split(r"[，,；;。\n]", content):
+            if not clause.strip():
+                continue
+            matching_subjects = [subject for subject in subjects if subject in clause]
+            document_name = str(chunk.get("docnm_kwd") or chunk.get("document_name") or "")
+            # A document title can bind an otherwise subjectless clause, but
+            # never override a different explicitly named company in it.
+            explicit = _extract_organizations(re.sub(r"本报告|本研报|给予|维持|首次|对", " ", clause))
+            if subjects and not matching_subjects:
+                if explicit or not any(subject in document_name for subject in subjects):
+                    continue
+                matching_subjects = [subject for subject in subjects if subject in document_name]
+            for pattern in (QUOTED_RATING_PATTERN, PLAIN_RATING_PATTERN):
+                for match in pattern.finditer(clause):
+                    candidates.append(_build_extraction(
+                        slot=slot, value=match.group("value"), source_chunk_index=index,
+                        chunks=chunks, source="rule", source_quote=clause.strip(),
+                        subject=matching_subjects[0] if len(matching_subjects) == 1 else "",
+                    ))
+    unique = {(candidate.subject, canonical_text(candidate.value)) for candidate in candidates}
+    return candidates[0] if len(unique) == 1 else None
 
 
 def _prepare_evidence(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -198,7 +225,7 @@ def extract_bridge_value(
     if not chunks:
         return None
 
-    rule_result = _extract_rating_by_rule(slot, chunks)
+    rule_result = _extract_rating_by_rule(slot, chunks, first_query)
     if rule_result is not None:
         return rule_result
 
@@ -208,13 +235,13 @@ def extract_bridge_value(
 
     try:
         resolved_client = client or get_bridge_extraction_client()
-        completion = resolved_client.chat.completions.create(
+        completion = model_completion(resolved_client, "bridge_extraction",
             model=os.getenv(
                 "RAG_BRIDGE_EXTRACTION_MODEL",
                 DEFAULT_BRIDGE_EXTRACTION_MODEL,
             ),
             messages=[
-                {"role": "system", "content": BRIDGE_EXTRACTION_SYSTEM_PROMPT},
+                {"role": "system", "content": BRIDGE_EXTRACTION_SYSTEM_PROMPT + "\n同时返回subject和source_quote。source_quote须为支持该主体与槽位关系的原文句子，包含value；多主体时必须选第一跳问题指定的主体，冲突无法消解时found=false。"},
                 {
                     "role": "user",
                     "content": json.dumps(
@@ -230,7 +257,7 @@ def extract_bridge_value(
             ],
             response_format={"type": "json_object"},
             temperature=0,
-            max_tokens=160,
+            max_tokens=400,
             stream=False,
             timeout=_timeout_seconds(),
             extra_body={"enable_thinking": False},
@@ -246,12 +273,21 @@ def extract_bridge_value(
             or isinstance(source_chunk_index, bool)
         ):
             raise ValueError("bridge extraction response is invalid")
+        subjects = _extract_organizations(first_query)
+        subject = payload.get("subject", "")
+        quote = payload.get("source_quote", "")
+        if not isinstance(subject, str) or not isinstance(quote, str):
+            raise ValueError("invalid bridge relation")
+        if subjects and (subject not in subjects or not quote or subject not in quote):
+            raise ValueError("bridge subject is not supported by the quoted relation")
         return _build_extraction(
             slot=slot,
             value=value,
             source_chunk_index=source_chunk_index,
             chunks=chunks,
             source="model",
+            subject=subject,
+            source_quote=quote,
         )
     except Exception as error:
         logger.warning(

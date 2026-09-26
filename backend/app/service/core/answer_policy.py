@@ -37,6 +37,12 @@ def render_refusal(missing_requirements: Any = None) -> str:
     )
 
 
+def render_evidence_refusal(decision: dict[str, Any]) -> str:
+    if decision.get("verification_status") == "unavailable":
+        return "本次未能完成证据核验，请稍后重试。"
+    return render_refusal(decision.get("missing_requirements"))
+
+
 def refusal_from_tool_results(
     tool_results: Iterable[Any],
 ) -> tuple[str, dict[str, Any]] | None:
@@ -64,5 +70,4 @@ def refusal_from_tool_results(
     latest = empty_kb_results[-1]
     metadata = getattr(latest, "metadata", None) or {}
     decision = metadata.get("evidence_sufficiency") or {}
-    missing = decision.get("missing_requirements") or []
-    return render_refusal(missing), dict(decision)
+    return render_evidence_refusal(decision), dict(decision)

@@ -8,12 +8,17 @@ from datetime import date
 from typing import Any
 from service.core.evidence_metadata import evidence_metadata
 from service.core.answer_policy import refusal_from_tool_results
+from service.core.query_contract import QueryRequest
+from service.core.query_runtime import bounded_query, model_completion, current_runtime
+from service.core.evidence_sufficiency import check_evidence_sufficiency
+from service.core.answer_policy import render_evidence_refusal
 
 from agent.schemas import ToolResult
 from agent.tools.base import AgentTool
 
 
 DEFAULT_MAX_STEPS = 3
+MAX_TOOL_CALLS_PER_STEP = 8
 MAX_QUICK_PARSE_PROMPT_LENGTH = 4000
 MAX_QUICK_PARSE_DOCUMENT_LENGTH = 2000
 
@@ -57,6 +62,7 @@ class AgentExecution:
     direct_answer: str | None = None
     response_mode: str = "answer"
     evidence_sufficiency: dict[str, Any] | None = None
+    query_runtime: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -109,7 +115,7 @@ class MinimalAgent:
     def _normalize_tool_calls(raw_tool_calls, step: int) -> list[_ToolCallRequest]:
         """Convert SDK tool-call objects into stable internal values."""
         normalized_calls = []
-        for index, tool_call in enumerate(raw_tool_calls or []):
+        for index, tool_call in enumerate((raw_tool_calls or [])[:MAX_TOOL_CALLS_PER_STEP]):
             function = getattr(tool_call, "function", None)
             call_id = getattr(tool_call, "id", None) or f"call-{step}-{index}"
             normalized_calls.append(
@@ -156,7 +162,7 @@ class MinimalAgent:
             metadata={"error_type": error_type},
         )
 
-    def _execute_tool_call(self, tool_call: _ToolCallRequest) -> ToolResult:
+    def _execute_tool_call(self, tool_call: _ToolCallRequest, request: QueryRequest | None = None) -> ToolResult:
         """Validate model output and execute the requested local tool."""
         tool = self._tools.get(tool_call.name)
         if tool is None:
@@ -182,7 +188,13 @@ class MinimalAgent:
                 "invalid_arguments",
             )
 
+        allowed = set(tool.parameters.get("properties") or {})
+        if tool.parameters.get("additionalProperties") is False and any(key not in allowed for key in arguments):
+            return self._failed_tool_call(tool_call, "工具参数包含未声明字段。", "invalid_arguments")
+
         try:
+            if request is not None and callable(getattr(tool, "run_for_request", None)):
+                return tool.run_for_request(request, **arguments)
             return tool.run(**arguments)
         except Exception as error:
             return self._failed_tool_call(
@@ -200,6 +212,10 @@ class MinimalAgent:
                 "content": result.content,
                 "error": result.error,
                 "result_count": len(result.sources),
+                "evidence_sufficiency": (result.metadata or {}).get("evidence_sufficiency"),
+                "query_repair": (result.metadata or {}).get("query_repair"),
+                "retrieval_graph": (result.metadata or {}).get("retrieval_graph"),
+                "clarification": (result.metadata or {}).get("clarification"),
             },
             ensure_ascii=False,
         )
@@ -217,6 +233,7 @@ class MinimalAgent:
         )
 
     # 实现 Agent 执行循环的核心方法。
+    @bounded_query
     def run(
         self,
         *,
@@ -230,14 +247,9 @@ class MinimalAgent:
             {"role": "system", "content": AGENT_SYSTEM_PROMPT},
         ]
 
-        #将之前的对话历史追加到message中
-        for history_message in conversation_history or []:
-            role = history_message.get("role")
-            content = history_message.get("content")
-            if role not in {"user", "assistant"} or not isinstance(content, str):
-                continue
-            if content.strip():
-                messages.append({"role": role, "content": content})
+        request = QueryRequest.from_user(question, conversation_history)
+        for role, content in request.history:
+            messages.append({"role": role, "content": content})
 
         #追加当前用户的新问题
         messages.append(
@@ -247,12 +259,13 @@ class MinimalAgent:
             }
         )
         tool_results: list[ToolResult] = []
+        seen_calls: dict[tuple[str, str], ToolResult] = {}
 
         for step in range(1, self._max_steps + 1):
             #调用LLM
             planner_started_at = time.perf_counter()
             try:
-                completion = self._client.chat.completions.create(
+                completion = model_completion(self._client, "agent_planning",
                     model=self._model,
                     messages=messages,
                     #向模型描述可用的工具集
@@ -302,10 +315,22 @@ class MinimalAgent:
                 self._assistant_tool_message(assistant_message, tool_calls)
             )
             step_results: list[ToolResult] = []
+            new_calls = 0
             for tool_call in tool_calls:
                 #执行每个工具调用
                 tool_started_at = time.perf_counter()
-                result = self._execute_tool_call(tool_call)
+                try:
+                    identity = (tool_call.name, json.dumps(json.loads(tool_call.arguments), sort_keys=True, ensure_ascii=False))
+                except (ValueError, TypeError):
+                    identity = (tool_call.name, tool_call.arguments)
+                if identity in seen_calls:
+                    result = seen_calls[identity]
+                else:
+                    new_calls += 1
+                    result = self._execute_tool_call(tool_call, request)
+                    # Transient failures remain retryable within the request budget.
+                    if result.success:
+                        seen_calls[identity] = result
                 logger.info(
                     "PERF session_id=%s stage=tool step=%s tool=%s "
                     "status=%s sources=%s duration_ms=%.1f",
@@ -316,6 +341,7 @@ class MinimalAgent:
                     len(result.sources),
                     (time.perf_counter() - tool_started_at) * 1000,
                 )
+
                 tool_results.append(result)
                 step_results.append(result)
                 #将工具的执行结果追加到messages中再传给LLM
@@ -327,6 +353,11 @@ class MinimalAgent:
                     }
                 )
 
+            if any((result.metadata or {}).get("response_mode") == "clarify" for result in step_results):
+                return AgentRun(tool_results=tool_results, steps=step, stop_reason="clarification_required")
+            if not new_calls:
+                return AgentRun(tool_results=tool_results, steps=step, stop_reason="no_progress")
+
             # The answer model consumes tool evidence directly, so another
             # planner call that only returns READY adds latency without value.
             # Wait until every tool requested in this step produced real
@@ -334,6 +365,7 @@ class MinimalAgent:
             # planner retry with a rewritten query or a different tool.
             if step_results and all(
                 result.success and bool(result.sources)
+                and (result.metadata.get("evidence_sufficiency") or {}).get("sufficient") is not False
                 for result in step_results
             ):
                 return AgentRun(
@@ -622,7 +654,12 @@ class AgentOrchestrator:
                 error,
             )
             fallback_started_at = time.perf_counter()
-            fallback_result = self._fallback_tool.run(query=question)
+            if callable(getattr(self._fallback_tool, "run_for_request", None)):
+                fallback_result = self._fallback_tool.run_for_request(
+                    QueryRequest.from_user(question, conversation_history), query=question,
+                )
+            else:
+                fallback_result = self._fallback_tool.run(query=question)
             logger.info(
                 "PERF session_id=%s stage=tool step=0 tool=%s "
                 "status=%s sources=%s fallback=true duration_ms=%.1f",
@@ -638,6 +675,7 @@ class AgentOrchestrator:
                 stop_reason="planner_fallback",
             )
 
+    @bounded_query
     def run(
         self,
         *,
@@ -648,7 +686,9 @@ class AgentOrchestrator:
         retrieved_content: list[dict[str, Any]] | None = None,
     ) -> AgentExecution:
         """Run planning and start the final answer stream as one operation."""
-        history = list(conversation_history or [])
+        request = QueryRequest.from_user(question, conversation_history)
+        history = [{"role": role, "content": content} for role, content in request.history]
+        final_sufficiency = None
 
         if retrieved_content is None:
             planning_started_at = time.perf_counter()
@@ -667,6 +707,45 @@ class AgentOrchestrator:
                 (time.perf_counter() - planning_started_at) * 1000,
             )
             evidence = tool_results_to_retrieved_content(planning.tool_results)
+            clarification = next((result.metadata.get("clarification") for result in planning.tool_results
+                                  if result.metadata.get("response_mode") == "clarify"), None)
+            if clarification:
+                return AgentExecution(
+                    planning=planning, retrieved_content=[], response_documents=[],
+                    answer_messages=[], answer_stream=None, direct_answer=clarification,
+                    response_mode="clarify",
+                    query_runtime=current_runtime().snapshot(),
+                )
+            # KB verifiers check the immutable request. If results from multiple
+            # tools/retries are combined, verify that union against the request
+            # again before releasing partial candidates to the answer model.
+            bounded_results = [result for result in planning.tool_results if result.metadata.get("query_contract")]
+            if bounded_results:
+                final_sufficiency = bounded_results[-1].metadata.get("evidence_sufficiency")
+            if bounded_results and not (
+                len(planning.tool_results) == 1
+                and (bounded_results[0].metadata.get("evidence_sufficiency") or {}).get("sufficient") is True
+            ):
+                pool = {str(item.get("chunk_id") or item.get("source_id") or index): item
+                        for index, item in enumerate(evidence)}
+                for result in bounded_results:
+                    for chunk in result.metadata.get("candidate_chunks") or []:
+                        pool.setdefault(str(chunk.get("chunk_id") or chunk.get("content_with_weight")), chunk)
+                contract = bounded_results[-1].metadata["query_contract"]
+                verified_question = contract.get("resolved_question") or question
+                verification_evidence = build_response_documents(session_id, list(pool.values()), session_context)
+                decision = check_evidence_sufficiency(verified_question, verification_evidence)
+                final_sufficiency = decision.to_dict()
+                if not decision.sufficient:
+                    return AgentExecution(
+                        planning=planning, retrieved_content=[], response_documents=[],
+                        answer_messages=[], answer_stream=None,
+                        direct_answer=render_evidence_refusal(decision.to_dict()),
+                        response_mode="refuse", evidence_sufficiency=decision.to_dict(),
+                        query_runtime=current_runtime().snapshot(),
+                    )
+                if decision.sufficient:
+                    evidence = list(pool.values())
         else:
             planning = AgentRun(stop_reason="provided_evidence")
             evidence = list(retrieved_content)
@@ -696,6 +775,7 @@ class AgentOrchestrator:
                 direct_answer=refusal_text,
                 response_mode="refuse",
                 evidence_sufficiency=sufficiency,
+                query_runtime=current_runtime().snapshot(),
             )
 
         answer_request_started_at = time.perf_counter()
@@ -729,4 +809,6 @@ class AgentOrchestrator:
             response_documents=documents,
             answer_messages=answer_messages,
             answer_stream=answer_stream,
+            evidence_sufficiency=final_sufficiency,
+            query_runtime=current_runtime().snapshot(),
         )

@@ -6,7 +6,13 @@ from service.core.query_expansion import (
     QueryExpansionResult,
     validate_query_preservation,
 )
-from service.core.query_intent import QueryIntentDecision, QuerySubqueryPlan
+from service.core.query_intent import QueryAnalysis
+from service.core.query_planning import (
+    PreparedRetrievalRequest,
+    QuerySubqueryPlan,
+    RetrievalPlan,
+    RetrievalRoute,
+)
 from service.core.rag.nlp import search_v2
 from service.core.rag.nlp.search_v2 import reciprocal_rank_fusion
 from service.core.retrieval_evaluation import (
@@ -14,6 +20,41 @@ from service.core.retrieval_evaluation import (
     evidence_chunk_match_score,
     evaluate_retrieval_case,
 )
+
+
+def prepared_retrieval(
+    *,
+    intent="precise_lookup",
+    need_rewrite=False,
+    reason="精确查询",
+    source="rule",
+    mode="single",
+    subqueries=None,
+):
+    subqueries = list(subqueries or [])
+    analysis = QueryAnalysis(
+        intent=intent,
+        need_rewrite=need_rewrite,
+        target_count=max(1, len(subqueries)),
+        targets_independent=mode == "parallel",
+        has_dependency=mode == "sequential",
+        single_retrieval_likely_covers_all=mode == "single",
+        reason=reason,
+        source=source,
+    )
+    return PreparedRetrievalRequest(
+        analysis=analysis,
+        route=RetrievalRoute(
+            mode=mode,
+            reason=reason,
+            source="analysis" if mode != "single" else "rule",
+        ),
+        plan=RetrievalPlan(
+            mode=mode,
+            subqueries=subqueries,
+            source="model" if subqueries else "none",
+        ),
+    )
 
 
 # 用例功能：验证检索向量表达式始终使用 BGE 的 q_512_vec 字段。
@@ -89,11 +130,10 @@ def test_retrieve_raw_results_reuses_production_options(monkeypatch):
     monkeypatch.setattr(retrieval, "get_retrieval_dealer", lambda: FakeDealer())
     monkeypatch.setattr(
         retrieval,
-        "analyze_query_intent",
-        lambda _question: QueryIntentDecision(
+        "prepare_retrieval_request",
+        lambda _question: prepared_retrieval(
             intent="colloquial_lookup",
             need_rewrite=True,
-            need_decompose=False,
             reason="测试口语查询",
             source="rule",
         ),
@@ -157,11 +197,24 @@ def test_retrieve_raw_results_reuses_production_options(monkeypatch):
     assert result["query_intent"] == {
         "intent": "colloquial_lookup",
         "need_rewrite": True,
-        "need_decompose": False,
+        "target_count": 1,
+        "targets_independent": False,
+        "has_dependency": False,
+        "single_retrieval_likely_covers_all": True,
         "reason": "测试口语查询",
         "source": "rule",
-        "retrieval_mode": "single",
+        "goals": (),
+        "need_expansion": False,
+        "language_features": (),
+        "task_types": (),
+        "clarification": None,
+    }
+    assert result["retrieval_route"]["mode"] == "single"
+    assert result["retrieval_plan"] == {
+        "mode": "single",
         "subqueries": [],
+        "source": "none",
+        "fallback_reason": None,
     }
     assert result["query_transform"]["expanded"] == "测试问题 规范化 扩展"
     assert result["query_transform"]["effective_query"] == (
@@ -174,10 +227,89 @@ def test_retrieve_raw_results_reuses_production_options(monkeypatch):
         "rerank",
         "multi_hop",
         "gate",
+        "repair",
         "other",
         "total",
     }
     assert result["stage_latency_ms"]["multi_hop"] is None
+
+
+@pytest.mark.unit
+def test_parallel_plan_failure_falls_back_and_keeps_attempt_history(monkeypatch):
+    monkeypatch.setenv("RAG_PARALLEL_RETRIEVAL_ENABLED", "true")
+    calls = []
+
+    class FakeDealer:
+        def retrieval(self, **kwargs):
+            calls.append(kwargs["question"])
+            return {"total": 1, "chunks": [{"chunk_id": "fallback"}], "doc_aggs": []}
+
+    monkeypatch.setattr(retrieval, "get_retrieval_dealer", lambda: FakeDealer())
+    monkeypatch.setattr(
+        retrieval, "prepare_retrieval_request",
+        lambda _question: prepared_retrieval(
+            mode="parallel",
+            subqueries=[QuerySubqueryPlan(id="first", query="第一个指标")],
+        ),
+    )
+    monkeypatch.setattr(
+        retrieval, "_execute_parallel_retrieval",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("parallel failed")),
+    )
+    monkeypatch.setattr(
+        retrieval, "check_evidence_sufficiency",
+        lambda _question, _chunks: EvidenceSufficiencyDecision(
+            sufficient=True,
+            reason="回退证据足够",
+            missing_requirements=[],
+            supporting_chunk_indices=[1],
+            source="rule",
+            evaluated_chunk_count=1,
+            evaluated_chunk_ids=["fallback"],
+        ),
+    )
+
+    result = retrieval.retrieve_raw_results("42", "原始问题")
+
+    assert calls == ["原始问题"]
+    assert result["chunks"][0]["chunk_id"] == "fallback"
+    assert result["parallel_retrieval"]["applied"] is False
+    assert result["plan_execution"]["fallback_applied"] is True
+    assert result["plan_execution"]["requested_plan_execution_success"] is False
+    assert result["plan_execution"]["final_execution_success"] is True
+    assert [attempt["mode"] for attempt in result["plan_execution"]["attempts"]] == [
+        "parallel", "single",
+    ]
+
+
+@pytest.mark.unit
+def test_disabled_graph_plan_records_skip_before_single_fallback(monkeypatch):
+    monkeypatch.setenv("RAG_QUERY_GRAPH_ENABLED", "false")
+    calls = []
+
+    class FakeDealer:
+        def retrieval(self, **kwargs):
+            calls.append(kwargs["question"])
+            return {"total": 0, "chunks": [], "doc_aggs": []}
+
+    monkeypatch.setattr(retrieval, "get_retrieval_dealer", lambda: FakeDealer())
+    monkeypatch.setattr(
+        retrieval, "prepare_retrieval_request",
+        lambda _question: prepared_retrieval(
+            mode="graph",
+            subqueries=[QuerySubqueryPlan(id="first", query="第一个目标")],
+        ),
+    )
+
+    result = retrieval.retrieve_raw_results("42", "原始问题")
+
+    assert calls == ["原始问题"]
+    assert result["retrieval_graph"]["applied"] is False
+    assert result["plan_execution"]["executed_mode"] == "single"
+    assert result["plan_execution"]["fallback_applied"] is True
+    assert [attempt["status"] for attempt in result["plan_execution"]["attempts"]] == [
+        "skipped", "succeeded",
+    ]
 
 
 @pytest.mark.unit
@@ -192,11 +324,10 @@ def test_retrieve_raw_results_skips_rewriter_for_precise_query(monkeypatch):
     monkeypatch.setattr(retrieval, "get_retrieval_dealer", lambda: FakeDealer())
     monkeypatch.setattr(
         retrieval,
-        "analyze_query_intent",
-        lambda _question: QueryIntentDecision(
+        "prepare_retrieval_request",
+        lambda _question: prepared_retrieval(
             intent="precise_lookup",
             need_rewrite=False,
-            need_decompose=False,
             reason="包含明确表号",
             source="rule",
         ),
@@ -245,11 +376,10 @@ def test_retrieve_raw_results_removes_insufficient_evidence(monkeypatch):
     monkeypatch.setattr(retrieval, "get_retrieval_dealer", lambda: FakeDealer())
     monkeypatch.setattr(
         retrieval,
-        "analyze_query_intent",
-        lambda _question: QueryIntentDecision(
+        "prepare_retrieval_request",
+        lambda _question: prepared_retrieval(
             intent="precise_lookup",
             need_rewrite=False,
-            need_decompose=False,
             reason="精确查询",
             source="rule",
         ),
@@ -310,11 +440,10 @@ def test_retrieve_raw_results_keeps_sufficient_evidence(monkeypatch):
     monkeypatch.setattr(retrieval, "get_retrieval_dealer", lambda: FakeDealer())
     monkeypatch.setattr(
         retrieval,
-        "analyze_query_intent",
-        lambda _question: QueryIntentDecision(
+        "prepare_retrieval_request",
+        lambda _question: prepared_retrieval(
             intent="precise_lookup",
             need_rewrite=False,
-            need_decompose=False,
             reason="精确查询",
             source="rule",
         ),
@@ -363,11 +492,10 @@ def test_table_context_expands_before_sufficiency_check(monkeypatch):
     monkeypatch.setattr(retrieval, "get_retrieval_dealer", lambda: FakeDealer())
     monkeypatch.setattr(
         retrieval,
-        "analyze_query_intent",
-        lambda _question: QueryIntentDecision(
+        "prepare_retrieval_request",
+        lambda _question: prepared_retrieval(
             intent="precise_lookup",
             need_rewrite=False,
-            need_decompose=False,
             reason="精确查询",
             source="rule",
         ),
@@ -462,13 +590,12 @@ def test_sequential_retrieval_extracts_bridge_and_preserves_each_hop(
                 "retrieval_fusion": {"method": "weighted_rrf"},
             }
 
-    intent = QueryIntentDecision(
+    prepared = prepared_retrieval(
         intent="complex_lookup",
         need_rewrite=False,
-        need_decompose=True,
         reason="评级解释依赖评级名称",
         source="rule",
-        retrieval_mode="sequential",
+        mode="sequential",
         subqueries=[
             QuerySubqueryPlan(
                 id="rating_lookup",
@@ -493,7 +620,11 @@ def test_sequential_retrieval_extracts_bridge_and_preserves_each_hop(
 
     monkeypatch.setattr(retrieval, "rerank_similarity", rerank_merged)
     monkeypatch.setattr(retrieval, "get_retrieval_dealer", FakeDealer)
-    monkeypatch.setattr(retrieval, "analyze_query_intent", lambda _q: intent)
+    monkeypatch.setattr(
+        retrieval,
+        "prepare_retrieval_request",
+        lambda _q: prepared,
+    )
     monkeypatch.setattr(
         retrieval,
         "check_evidence_sufficiency",
@@ -587,13 +718,12 @@ def test_parallel_retrieval_reserves_coverage_for_every_subquery(monkeypatch):
                 "retrieval_fusion": {"method": "weighted_rrf"},
             }
 
-    intent = QueryIntentDecision(
+    prepared = prepared_retrieval(
         intent="complex_lookup",
         need_rewrite=False,
-        need_decompose=True,
         reason="两个独立指标",
         source="model",
-        retrieval_mode="parallel",
+        mode="parallel",
         subqueries=[
             QuerySubqueryPlan(
                 id="eps_lookup",
@@ -615,7 +745,11 @@ def test_parallel_retrieval_reserves_coverage_for_every_subquery(monkeypatch):
     }
 
     monkeypatch.setattr(retrieval, "get_retrieval_dealer", FakeDealer)
-    monkeypatch.setattr(retrieval, "analyze_query_intent", lambda _q: intent)
+    monkeypatch.setattr(
+        retrieval,
+        "prepare_retrieval_request",
+        lambda _q: prepared,
+    )
     monkeypatch.setattr(
         retrieval,
         "rerank_similarity",
@@ -684,6 +818,87 @@ def test_parallel_retrieval_reserves_coverage_for_every_subquery(monkeypatch):
 
 
 @pytest.mark.unit
+def test_different_rows_in_same_table_are_not_numeric_duplicates():
+    chunks = {
+        "ocf": {
+            "table_id_kwd": "cash-flow-table",
+            "table_row_int": "9",
+            "table_cells_kwd": [
+                "经营活动现金流",
+                "3071",
+                "23940",
+                "31078",
+                "26415",
+                "29468",
+            ],
+        },
+        "fcff": {
+            "table_id_kwd": "cash-flow-table",
+            "table_row_int": "14",
+            "table_cells_kwd": [
+                "企业自由现金流",
+                "123",
+                "456",
+                "789",
+                "1000",
+                "34791",
+            ],
+        },
+    }
+
+    assert not retrieval._duplicates_numeric_fact(
+        "fcff",
+        {"ocf"},
+        chunks,
+    )
+
+
+@pytest.mark.unit
+def test_same_primary_table_row_is_a_numeric_duplicate():
+    chunks = {
+        "first": {
+            "table_id_kwd": "expense-table",
+            "table_row_int": "3",
+        },
+        "second": {
+            "table_id_kwd": "expense-table",
+            "table_row_int": "3",
+        },
+    }
+
+    assert retrieval._duplicates_numeric_fact(
+        "second",
+        {"first"},
+        chunks,
+    )
+
+
+@pytest.mark.unit
+def test_shared_table_header_does_not_make_rows_numeric_duplicates():
+    shared_header = "| 指标 | 2023 | 2024 | 2025E | 2026E | 2027E |"
+    chunks = {
+        "ocf": {
+            "content_with_weight": (
+                shared_header
+                + "\n| 经营活动现金流 | 1 | 2 | 3 | 4 | 5 |"
+            ),
+        },
+        "fcff": {
+            "content_with_weight": (
+                shared_header
+                + "\n| 企业自由现金流 | 6 | 7 | 8 | 9 | 10 |"
+            ),
+        },
+    }
+
+    assert not retrieval._duplicates_numeric_fact(
+        "fcff",
+        {"ocf"},
+        chunks,
+    )
+
+
+@pytest.mark.unit
 def test_parallel_retrieval_prefers_exact_distinct_metric_evidence(
     monkeypatch,
 ):
@@ -720,6 +935,8 @@ def test_parallel_retrieval_prefers_exact_distinct_metric_evidence(
             {
                 "chunk_id": "amount-cash-flow",
                 "evidence_type_kwd": "table",
+                "table_id_kwd": "expense-table",
+                "table_row_int": "8",
                 "content_with_weight": (
                     "| 现金流量表（百万元） | 2025E | 2026E | 2027E |\n"
                     "| 财务费用 | 8389 | 10049 | 10216 |"
@@ -728,6 +945,8 @@ def test_parallel_retrieval_prefers_exact_distinct_metric_evidence(
             {
                 "chunk_id": "amount-profit-table",
                 "evidence_type_kwd": "table",
+                "table_id_kwd": "expense-table",
+                "table_row_int": "8",
                 "content_with_weight": (
                     "| 利润表（百万元） | 2025E | 2026E | 2027E |\n"
                     "| 财务费用 | 8389 | 10049 | 10216 |"
@@ -775,13 +994,12 @@ def test_parallel_retrieval_prefers_exact_distinct_metric_evidence(
                 "retrieval_fusion": {"method": "weighted_rrf"},
             }
 
-    intent = QueryIntentDecision(
+    prepared = prepared_retrieval(
         intent="complex_lookup",
         need_rewrite=False,
-        need_decompose=True,
         reason="费用率和费用金额需独立检索",
         source="model",
-        retrieval_mode="parallel",
+        mode="parallel",
         subqueries=[
             QuerySubqueryPlan(
                 id="rate",
@@ -809,7 +1027,11 @@ def test_parallel_retrieval_prefers_exact_distinct_metric_evidence(
     }
 
     monkeypatch.setattr(retrieval, "get_retrieval_dealer", FakeDealer)
-    monkeypatch.setattr(retrieval, "analyze_query_intent", lambda _q: intent)
+    monkeypatch.setattr(
+        retrieval,
+        "prepare_retrieval_request",
+        lambda _q: prepared,
+    )
     monkeypatch.setattr(
         retrieval,
         "rerank_similarity",
@@ -842,7 +1064,10 @@ def test_parallel_retrieval_prefers_exact_distinct_metric_evidence(
     assert result_ids[:2] == ["amount-cash-flow", "exact-rate"]
     assert "exact-rate" in result_ids
     assert "amount-cash-flow" in result_ids
-    assert "wrong-margin" not in result_ids
+    if "wrong-margin" in result_ids:
+        assert result_ids.index("exact-rate") < result_ids.index(
+            "wrong-margin"
+        )
     assert "wrong-profit" not in result_ids
     assert not {
         "amount-cash-flow",

@@ -74,7 +74,7 @@ v2 校验还会检查证据 ID 唯一性、claim 到 evidence 的引用关系、
 
 检索层现已通过 `retrieve_raw_results()` 保留完整结果，包括 `chunk_id`、各召回分支的原始排名与分数、RRF 分数和最终语义重排分数。当前评测集尚未把标准证据映射到 ES 中的稳定 `chunk_id`，因此评测脚本先校验文档名，再对返回片段和 `relevant_evidence[].text` 做规范化文本匹配。完成第一轮基线并确认切块稳定后，可以把标准 chunk ID 补入证据对象，进一步减少模糊匹配。
 
-检索入口默认先执行 RAG 查询意图识别，再只对确有需要的口语、简称或上下文查询进行规范化和关键词扩展。结果中的 `retrieval.query_intent` 记录意图、`single/parallel/sequential` 检索模式、原因及可执行子查询计划；`retrieval.query_rewrite` 记录原问题和规范化结果；`retrieval.query_transform` 记录扩展查询、最终生效查询及两级保留校验。`parallel` 会独立执行 2–3 个互不依赖的子查询，默认为每个子查询在首页保留 2 条候选（页容量不足时自动压缩），去重后使用原问题统一重排。`sequential` 会执行递进式二跳：第一跳证据中经过原文校验的桥接值用于生成第二跳查询，同文档问题还会继承文档范围。结果中的 `retrieval.parallel_retrieval` 和 `retrieval.sequential_retrieval` 分别保存子查询执行与桥接诊断，chunk 的 `parallel_subqueries` 或 `sequential_subqueries` 保存来源步骤。普通检索仍分别执行原问题关键词、扩展查询关键词和原问题向量召回，使用加权 RRF 合并后截取候选；没有有效扩展时只执行原问题关键词和原问题向量两路召回。所有检索跳完成后统一执行证据充分性检查，不能完整覆盖问题时清空 `chunks`，并在 `retrieval.evidence_sufficiency` 中记录缺失条件和判定来源。可通过 `RAG_PARALLEL_RETRIEVAL_ENABLED=false` 或 `RAG_SEQUENTIAL_RETRIEVAL_ENABLED=false` 分别关闭并行或递进检索并回退单次查询。若要恢复原来的全量改写策略，可设置 `RAG_QUERY_INTENT_ENABLED=false`；若要跑完全不含改写与扩展的对照基线，可设置 `QUERY_REWRITE_ENABLED=false`；若只关闭扩展，可设置 `QUERY_EXPANSION_ENABLED=false`；若要关闭充分性检查，可设置 `RAG_EVIDENCE_SUFFICIENCY_ENABLED=false`。
+检索入口使用不可变用户需求、语义目标、确定性路由、计划校验和有界执行。支持 `single`、`parallel`、`sequential`、`graph`、`clarify`；独立节点可并发，混合图最多 8 个节点。结果保留上下文绑定、局部约束、每步证据来源、预算与缺口补查诊断。改写与扩展开关相互独立，完整无变换基线应同时关闭 `QUERY_REWRITE_ENABLED` 和 `QUERY_EXPANSION_ENABLED`。完整流程、降级行为和当前边界见 [查询管线设计](../docs/query_pipeline.md)。
 
 每一跳的语义重排后都会进行第二阶段加权 RRF：语义重排名次权重为 `0.4`，第一阶段检索 RRF 名次权重为 `0.6`，默认平滑常数为 `10`。这种做法只融合两边的名次，不直接混合量纲不同的原始分数。再执行确定性的限定条件兼容性检查，当前覆盖时间范围、实际值/预测值/目标、表图定位符和明确实体；候选未出现可比限定时记为 `unknown`，只有出现明确互斥限定时才记为 `conflict`。明确冲突先降级，其余候选按第二阶段融合分排序。
 
@@ -184,7 +184,7 @@ docker compose exec LS_api \
 
 同名结果默认不会被覆盖。需要明确覆盖时添加 `--overwrite`，或通过 `--run-name` 使用一个新名称。
 
-新结果使用 `result_schema_version: "2.4"`，将指标分为三组：
+新结果使用 `result_schema_version: "2.5"`，将指标分为三组：
 
 | 分组 | 数据来源 | 用途 |
 | --- | --- | --- |
@@ -217,19 +217,20 @@ docker compose exec LS_api \
 - `empty_rate`、`answerable_empty_rate`、`unanswerable_empty_rate`：对应阶段的空结果比例，不能直接视为拒答比例。
 
 汇总结果还包含 `error_rate`、`average_latency_ms`、`latency_p50_ms` 和
-`latency_p95_ms`。延迟统计只使用成功完成的查询；失败查询通过 `error_count/error_rate`
+`latency_p95_ms`、`latency_p99_ms`。延迟统计只使用成功完成的查询；失败查询通过 `error_count/error_rate`
 单独体现。建议始终结合 `by_question_type`、`by_source_modality` 和 `by_split` 查看切片，
 不要只比较整体均值。
 
-逐题 `retrieval.stage_latency_ms` 记录不重叠的阶段耗时：
+逐题 `retrieval.stage_latency_ms` 记录阶段耗时；并发节点的工作时间会重叠，不能将各字段相加作为总延迟。`stage_latency_semantics` 标明统计口径：
 
 - `query_transform`：意图识别、查询改写和扩展。
 - `initial_retrieval`：关键词/向量召回及 RRF 融合；多查询或多跳时为各次召回之和。
 - `rerank`：语义重排、约束排序和最终融合；多查询或多跳时包括统一重排。
 - `multi_hop`：仅递进式检索有值，记录桥接值抽取、第二跳构造和多跳编排开销，
   不重复计算各跳召回与重排。
-- `gate`：证据充分性判定。
-- `other`：表格父上下文扩展、结果组装等未归入上述阶段的耗时。
+- `gate`：首次证据充分性判定。
+- `repair`：缺失目标补查及再次充分性检查。
+- `other`：扣除已记录工作时间后的非负剩余估计；并发时不能当成独立墙钟阶段。
 - `total`：完整检索流程耗时。
 
 汇总中的 `stage_latency_ms.<stage>` 分别提供 `sample_count`、`average_ms`、
@@ -298,8 +299,7 @@ Hit、Recall、MRR、空结果率、旧拒答率和旧 fallback 率。新结果�
 
 `run_e2e_eval.py` 在不读写聊天数据库、Redis、会话标题和推荐问题的情况下，执行与
 线上相同的知识库检索、证据充分性检查、回答提示词和流式模型响应。该 runner 固定为
-`knowledge_base_only`，不会让 Web 搜索补答知识库不可回答题；Agent 工具路由应使用
-独立数据集评估。
+`knowledge_base_only`，不会让 Web 搜索补答知识库不可回答题。默认 `--execution-mode grounded` 直接走检索；`--execution-mode agent` 通过真实 Agent 和 KB 工具执行，支持 `--planner-model`，可检测模型提炼查询时丢失用户约束的问题。Web/KB 混合工具路由仍需独立数据集评估。
 
 ```bash
 docker compose exec LS_api \
@@ -330,7 +330,7 @@ Faithfulness，以及逐条 claim 与引用证据的蕴含关系。可通过 `--
   极端 `top-k` 的上下文长度，最多评估前 20 个最终证据片段，并用
   `evidence_truncated` 标记片段列表是否被截断。
 - `citation_metrics`：编号合法率，以及 judge 启用时的引用完整率、精确率和召回率。
-- `refusal_metrics`：期望与实际的 `answer/refuse` 行为、危险作答和过度拒答。
+- `refusal_metrics`：期望与实际的 `answer/refuse/clarify` 行为、危险作答和过度拒答。
 - `sufficiency_metrics`：以本次闸门前 Top K 是否覆盖全部标准证据作为期望标签，统计
   危险放行和错误拒绝。未提取视觉事实的图表和结构未绑定的表格默认不算充分；如有
   人工复核标签，可用样本字段 `expected_evidence_sufficient` 显式覆盖。
@@ -353,7 +353,7 @@ faithfulness_score = 被全部最终证据支持的事实主张数 / 事实主�
 端到端结果结构版本已更新为 `1.1`。
 
 证据不充分时，runner 与线上知识库工具共用确定性拒答策略，不调用回答模型。
-数据集可选字段 `expected_behavior` 可显式取 `answer` 或 `refuse`；省略时从
+数据集可选字段 `expected_behavior` 可显式取 `answer`、`refuse` 或 `clarify`；`conversation_history` 可提供 user/assistant 历史消息。省略行为时从
 `answerable` 推导。v2 对该字段进行强校验；现有 `guodian_power_eval_v1.jsonl`
 仍可以通过 `--dataset` 显式指定运行，无需迁移。
 
@@ -361,3 +361,15 @@ faithfulness_score = 被全部最终证据支持的事实主张数 / 事实主�
 
 - `results/<run-name>.jsonl`：逐题回答、引用解析、检索 trace 和各项指标。
 - `results/<run-name>_summary.json`：整体与题型切片汇总。
+
+
+### 查询规划与 Agent 回归
+
+先用 `python /app/evals/run_e2e_eval.py --validate-only` 检查端到端样本结构，不需要索引或真实模型调用。
+
+```bash
+docker compose exec LS_api python /app/evals/run_e2e_eval.py \
+  --execution-mode agent --index-name <用户ID> --split dev --run-name agent_dev_v3
+```
+
+汇总 `query_metrics` 记录计划回退率、`expected_retrieval.mode` 与路由的一致率、目标支持率、补查成功率、模型/检索调用数和 token 报告覆盖数。路由一致率是规划诊断，不替代证据或答案质量。缺少 runtime 或 token 用量的样本标为不可用，不补成零。Agent 模式包含规划调用；最终回答、Web 搜索与 judge 成本不在查询 runtime 内。样本数、失败率和各切片应与成本、P95/P99 一起审阅。

@@ -19,6 +19,9 @@ from typing import Any
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 BACKEND_DIRECTORY = SCRIPT_DIRECTORY.parent
 APP_DIRECTORY = BACKEND_DIRECTORY / "app"
+if not (APP_DIRECTORY / "service").is_dir():
+    # Support both repository backend/app and container /app layouts.
+    APP_DIRECTORY = BACKEND_DIRECTORY
 DEFAULT_DATASET = SCRIPT_DIRECTORY / "data" / "power_reports_eval_v2.jsonl"
 DEFAULT_OUTPUT_DIRECTORY = SCRIPT_DIRECTORY / "results"
 

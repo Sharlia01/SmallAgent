@@ -9,6 +9,7 @@ import httpx
 import numpy as np
 from dotenv import load_dotenv
 from openai import OpenAI
+from service.core.query_runtime import current_runtime, QueryBudgetExceeded, serialized_local_inference
 
 load_dotenv()
 
@@ -102,8 +103,12 @@ def _post_remote_json(
     retryable_statuses = {408, 429, 500, 502, 503, 504}
     last_error: Exception | None = None
     for attempt in range(max_retries + 1):
+        runtime = current_runtime()
+        if runtime is not None and runtime.remaining() <= 0:
+            raise QueryBudgetExceeded(f"{operation} deadline exceeded")
         try:
-            response = client.post(endpoint, json=payload, headers=headers)
+            options = {"timeout": min(DEFAULT_REMOTE_TIMEOUT_SECONDS, runtime.remaining())} if runtime is not None else {}
+            response = client.post(endpoint, json=payload, headers=headers, **options)
             if response.status_code in retryable_statuses and attempt < max_retries:
                 time.sleep(0.2 * (2 ** attempt))
                 continue
@@ -261,6 +266,7 @@ class RerankerProvider(Protocol):
 class LocalEmbeddingProvider:
     backend = "local"
 
+    @serialized_local_inference
     def embed(
         self,
         texts: list[str],
@@ -383,6 +389,7 @@ class LocalRerankerProvider:
     def __init__(self, *, output_score_mode: str = "raw_logits"):
         self.output_score_mode = output_score_mode
 
+    @serialized_local_inference
     def rerank(
         self,
         query: str,

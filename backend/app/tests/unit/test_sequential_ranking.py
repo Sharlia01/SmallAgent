@@ -4,7 +4,7 @@ from copy import deepcopy
 import pytest
 
 from service.core import retrieval
-from service.core.query_intent import QuerySubqueryPlan
+from service.core.query_planning import QuerySubqueryPlan
 from service.core.sequential_retrieval import BridgeExtraction
 
 

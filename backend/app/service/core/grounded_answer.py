@@ -10,9 +10,10 @@ from typing import Any, Callable
 from openai import OpenAI
 
 from agent.orchestrator import build_answer_messages
-from service.core.answer_policy import render_refusal
+from service.core.answer_policy import render_evidence_refusal
 from service.core.retrieval import format_retrieved_chunk, retrieve_raw_results
 from service.core.streaming_response import collect_answer_stream
+from service.core.query_contract import QueryRequest
 
 
 DEFAULT_ANSWER_MODEL = "deepseek-v4-pro"
@@ -69,22 +70,26 @@ def execute_grounded_turn(
 
     total_started = time.perf_counter()
     retrieval_started = time.perf_counter()
+    options = dict(retrieval_options or {})
+    if conversation_history:
+        options["request"] = QueryRequest.from_user(normalized_question, conversation_history)
     raw = retrieval_function(
         index_names,
         normalized_question,
-        **(retrieval_options or {}),
+        **options,
     )
     retrieval_latency = (time.perf_counter() - retrieval_started) * 1000
 
     sufficiency = raw.get("evidence_sufficiency") or {}
     if sufficiency.get("sufficient") is False:
-        answer = render_refusal(sufficiency.get("missing_requirements"))
+        clarification = raw.get("clarification") if raw.get("response_mode") == "clarify" else None
+        answer = clarification or render_evidence_refusal(sufficiency)
         total_latency = (time.perf_counter() - total_started) * 1000
         return GroundedTurnResult(
             question=normalized_question,
             answer=answer,
             thinking="",
-            response_mode="refuse",
+            response_mode="clarify" if clarification else "refuse",
             documents=[],
             raw_retrieval=raw,
             answer_messages=[],

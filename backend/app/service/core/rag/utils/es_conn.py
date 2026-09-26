@@ -29,6 +29,7 @@ from service.core.api.utils.file_utils import get_project_base_directory
 from service.core.rag.utils.doc_store_conn import MatchExpr, OrderByExpr, MatchTextExpr, MatchDenseExpr, FusionExpr
 from service.core.rag.nlp import is_english
 from dotenv import load_dotenv
+from service.core.query_runtime import current_runtime, QueryBudgetExceeded
 
 load_dotenv()
 
@@ -436,11 +437,20 @@ class ESConnection:
         )
 
         for _ in range(ATTEMPT_TIME):
+            runtime = current_runtime()
+            if runtime is not None and runtime.remaining() <= 0:
+                raise QueryBudgetExceeded("search deadline exceeded")
             try:
-                response = self.es.search(
+                client = self.es
+                timeout = "600s"
+                if runtime is not None:
+                    remaining = min(30.0, runtime.remaining())
+                    client = self.es.options(request_timeout=remaining, max_retries=0)
+                    timeout = f"{max(1, int(remaining * 1000))}ms"
+                response = client.search(
                     index=index_names,
                     body=query_body,
-                    timeout="600s",
+                    timeout=timeout,
                     track_total_hits=True,
                     _source=True,
                 )

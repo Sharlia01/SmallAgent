@@ -1,4 +1,4 @@
-"""RAG query intent analysis used to select query preprocessing safely."""
+"""Layer 1: analyze a RAG question without building a retrieval plan."""
 
 from __future__ import annotations
 
@@ -6,13 +6,16 @@ import json
 import logging
 import os
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from typing import Any, Literal
-from service.core.query_expansion import validate_query_preservation
 
 from dotenv import load_dotenv
 from openai import OpenAI
+from service.core.query_contract import QueryGoal, decode_goals, validate_goal_sources, MAX_GOALS
+from service.core.query_runtime import validated_completion, record_observation, failure_details
+from service.core.query_validation import QueryValidationError, validate_goals, UNKNOWN_LOCATOR
+from service.core.query_semantics import alias_expansions, metric_terms
 
 
 load_dotenv()
@@ -23,8 +26,7 @@ DEFAULT_QUERY_INTENT_MODEL = "qwen3.7-flash-2026-07-15"
 DEFAULT_QUERY_INTENT_TIMEOUT_SECONDS = 6.0
 MAX_QUERY_INTENT_INPUT_CHARS = 2000
 MAX_QUERY_INTENT_REASON_CHARS = 200
-MAX_SUBQUERY_CHARS = 300
-MAX_SUBQUERIES = 3
+MAX_RETRIEVAL_TARGETS = MAX_GOALS
 
 QueryIntentName = Literal[
     "precise_lookup",
@@ -36,7 +38,6 @@ QueryIntentName = Literal[
     "invalid_query",
 ]
 QueryIntentSource = Literal["rule", "model", "fallback", "disabled"]
-RetrievalMode = Literal["single", "parallel", "sequential"]
 
 VALID_QUERY_INTENTS = {
     "precise_lookup",
@@ -47,11 +48,7 @@ VALID_QUERY_INTENTS = {
     "general_lookup",
     "invalid_query",
 }
-VALID_RETRIEVAL_MODES = {"single", "parallel", "sequential"}
-PLAN_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 
-# Exact document locators carry unusually high retrieval value. Rewriting them
-# is more likely to cause query drift than to improve recall.
 PRECISE_LOCATOR_PATTERN = re.compile(
     r"(?:表|图|附表|附图)\s*[A-Za-z]?\s*\d+(?:\s*[-－—.]\s*\d+)*"
     r"|第\s*[一二三四五六七八九十百零〇两\d]+\s*(?:章|节|页)"
@@ -72,97 +69,93 @@ RATING_SEQUENTIAL_PATTERN = re.compile(
     r"(?=.*评级)(?=.*(?:看多|看空|含义|意思|定义|标准|代表|意味))"
 )
 COLLOQUIAL_MULTI_FACET_PATTERN = re.compile(
-    r"(?:，|,|；|;).*(?:对应|另外|同时|以及)"
+    r"(?:，|,|；|;|？|\?).*(?:对应|另外|同时|以及|多少|是什么|如何|查询)"
+    r"|另一份|另一个|并查询|并查|以及|同时|分别"
 )
+EXPLICIT_RATING_PATTERN = re.compile(r"[“‘\"'][^”’\"']{2,24}[”’\"']\s*(?:投资)?评级")
 
-QUERY_INTENT_SYSTEM_PROMPT = """
-你是知识库 RAG 的查询分析器。你的任务是判断用户问题的检索意图，以及是否需要在检索前改写；不要回答问题。
+
+QUERY_ANALYSIS_SYSTEM_PROMPT = """
+你是知识库 RAG 的查询分析器。只分析问题的检索特征，不生成子查询，不回答问题，也不选择或描述执行步骤。
 
 intent 只能取以下值之一：
 - precise_lookup：已有明确实体、时间、指标、表号、图号或限定条件，可直接检索。
 - colloquial_lookup：包含口语、俗称或与文档术语不一致的表达。
-- complex_lookup：包含多个需要分别检索再合并的问题。
+- complex_lookup：包含多个事实目标，或者存在前后依赖的多跳目标。complex 不代表一定要拆分。
 - ambiguous_query：核心实体或条件缺失，无法安全确定检索目标。
 - contextual_query：依赖上一轮对话中的实体或条件。
 - general_lookup：普通知识库查询，不属于以上类型。
 
-判断规则：
-1. 只有口语规范化、简称展开或补全检索术语能明显提升召回时，need_rewrite 才为 true。
-2. 已经正式、精确、可直接检索的问题，need_rewrite 必须为 false。
-3. 表号、图号、章节、页码、公司、人名、时间、数字、单位、否定词和限定条件都是不可丢失的精确信息。
-4. retrieval_mode 只能是 single、parallel、sequential：
-   - single：一次检索可以完整回答。
-   - parallel：多个子问题互不依赖，可以分别检索。
-   - sequential：后一个子问题必须使用前一步从证据中取得的术语、实体或结论。
-5. 只有 retrieval_mode 不是 single 时，need_decompose 才为 true。
-6. sequential 必须正好给出两个 subqueries。第一步通过 output_slot 声明要从证据提取的槽位；第二步通过 query_template 和 required_slots 使用该槽位。不得提前猜测槽位值。
-7. 当用户询问“研报给了什么评级，以及该评级代表看多还是看空”时，应判为 sequential：先查询评级，再查询该评级的定义。
-8. 用户提到“这份研报、该报告、同一文档”时，第二步 inherit_document_scope 应为 true。
-9. ambiguous_query 不得通过猜测补全，因此 need_rewrite 为 false。
-10. single 的 subqueries 必须为空。只返回 JSON 对象，不输出其他文字。
-11. parallel 必须给出两个或三个可独立执行的 subqueries；每个子查询都要保留原问题中与它相关的公司、时间、指标、图表号和限定条件。不要把纯计算步骤拆成新的检索查询。
-12. 同一问题同时指定多个表号或图号，并分别询问它们的内容时，应判为 parallel，为每个图表分别生成子查询。
-13. 不得把“未来三年、近两年、今年、明年”等相对时间转换为具体年份。除非用户原问题已经明确提供基准年份，否则子查询必须原样保留相对时间表达，不得猜测或新增年份、日期、数字、实体和事实。
-14. 通常位于同一个段落或同一张表中的相关指标不要过度拆分。例如“未来三年的归母净利润和EPS”应放在同一个盈利预测子查询中，不应拆成两个独立查询。
+分析以下检索信号：
+1. target_count：不同检索目标的数量，1至8。多个问句、多个年份、计算步骤不自动构成多个检索目标。
+2. targets_independent：这些目标能否直接根据原问题各自检索。后一个目标必须使用前一个答案时为 false。
+3. has_dependency：后一个目标是否必须取得前一个目标的答案、术语或实体后才能构造查询。
+4. single_retrieval_likely_covers_all：一次检索的同一结果行、同一段落或同一局部证据是否很可能覆盖全部事实目标。
 
-返回格式：
+判断原则：
+- 默认把问题视为一个检索目标，除非存在明确不同的实体、业务指标、主题、图表定位或证据范围。
+- 同一指标的多个年份、同一表格行中的多个值、同一段落中的“数值和原因”，以及对已检索数值做求和、差值、比例或大小比较，都视为一次检索可能覆盖。
+- 两个业务指标即使属于同一张表，只要通常位于不同行、单个 Top-K 容易只召回其中一个，就视为一次检索不一定覆盖。
+- 近义改写不算不同目标。
+- “先查评级，再解释该评级含义”存在依赖；“先查两个数，再计算差值”不存在检索依赖，计算不是检索目标。
+- 只有口语规范化、简称展开或补全检索术语能明显提升召回时，need_rewrite 才为 true。
+- 已经正式、精确、可直接检索的问题，need_rewrite 必须为 false。
+- ambiguous_query 不得通过猜测补全，因此 need_rewrite 必须为 false。
+- 不得丢失或猜测表号、图号、章节、页码、公司、人名、时间、数字、单位、否定词和限定条件。
+- 语言表达、上下文依赖和任务复杂度可以同时存在，不能因一个表号或口语词就忽略其他目标。
+- goals 为语义目标清单，不是执行子查询。每个目标有唯一 id、完整目标描述 text、适用 constraints 和依赖目标 id 列表 depends_on。id 推荐小写字母、数字、下划线，不超过32字符。
+- source_spans 必须逐字引用原文；constraints 可保留原词或做确定的术语、日期规范化，并继承同一句中明确共享的修饰语，不得增加新事实。口语措辞不是必须逐字保留的查询模板。
+- 用户问“哪张图/哪个对象对应某事实”时，该对应关系是待求答案。必须保留候选范围和未知关系，禁止按提及顺序把图号或对象与事实配对。
+- 同一个修饰语限定多个指标时必须继承，例如“光伏发电量和上网电量”的两个目标都属于光伏。
+- 不同主体的年份必须绑定到各自目标；全局的“不含预测值”等条件必须分配到每个适用目标。constraints 包含指标或目标主题原文。
+- need_expansion 独立于 need_rewrite，正式字段也可以需要同义词召回。language_features 可取 colloquial、contextual、abbreviation；task_types 可取 lookup、definition、comparison、calculation、explanation、summary。
+- 歧义无法安全消解时 intent=ambiguous_query，clarification 填需要用户补充的具体问题；不要猜主体。
+
+只返回以下 JSON，不得包含 retrieval_mode、need_decompose、subqueries 或其他字段：
 {
   "intent":"complex_lookup",
-  "need_rewrite":true,
-  "need_decompose":true,
-  "retrieval_mode":"sequential",
-  "reason":"后一步依赖前一步得到的评级名称",
-  "subqueries":[
-    {
-      "id":"rating_lookup",
-      "query":"国电电力研报的投资评级是什么？",
-      "query_template":"",
-      "depends_on":[],
-      "output_slot":"rating",
-      "required_slots":[],
-      "inherit_document_scope":false
-    },
-    {
-      "id":"rating_definition",
-      "query":"",
-      "query_template":"“{rating}”的评级定义和评级标准是什么？",
-      "depends_on":["rating_lookup"],
-      "output_slot":null,
-      "required_slots":["rating"],
-      "inherit_document_scope":true
-    }
+  "need_rewrite":false,
+  "target_count":2,
+  "targets_independent":true,
+  "has_dependency":false,
+  "single_retrieval_likely_covers_all":false,
+  "reason":"两个指标通常位于不同表格行，单次结果集不一定同时覆盖",
+  "need_expansion":false,
+  "language_features":[],
+  "task_types":["lookup"],
+  "clarification":null,
+  "goals":[
+    {"id":"first_metric","text":"第一个指标的语义需求","constraints":["原问题中的指标原文"],"depends_on":[],"source_spans":["该目标的完整原文分句"]},
+    {"id":"second_metric","text":"第二个指标的语义需求","constraints":["原问题中的指标原文"],"depends_on":[],"source_spans":["该目标的完整原文分句"]}
   ]
 }
 """.strip()
 
 
 @dataclass(frozen=True)
-class QuerySubqueryPlan:
-    """One executable step in a bounded retrieval plan."""
-
-    id: str
-    query: str = ""
-    query_template: str = ""
-    depends_on: list[str] = field(default_factory=list)
-    output_slot: str | None = None
-    required_slots: list[str] = field(default_factory=list)
-    inherit_document_scope: bool = False
-
-
-@dataclass(frozen=True)
-class QueryIntentDecision:
-    """Structured decision made before RAG query rewriting."""
+class QueryAnalysis:
+    """Semantic query features consumed by the deterministic router."""
 
     intent: QueryIntentName
     need_rewrite: bool
-    need_decompose: bool
+    target_count: int
+    targets_independent: bool
+    has_dependency: bool
+    single_retrieval_likely_covers_all: bool
     reason: str
     source: QueryIntentSource
-    retrieval_mode: RetrievalMode = "single"
-    subqueries: list[QuerySubqueryPlan] = field(default_factory=list)
+    goals: tuple[QueryGoal, ...] = ()
+    need_expansion: bool = False
+    language_features: tuple[str, ...] = ()
+    task_types: tuple[str, ...] = ()
+    clarification: str | None = None
+    validation_error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        if self.validation_error is None:
+            payload.pop("validation_error")
+        return payload
 
 
 def _environment_flag(name: str, default: bool) -> bool:
@@ -172,7 +165,7 @@ def _environment_flag(name: str, default: bool) -> bool:
     return raw_value.strip().casefold() not in {"0", "false", "no", "off"}
 
 
-def _intent_timeout_seconds() -> float:
+def query_intent_timeout_seconds() -> float:
     raw_value = os.getenv(
         "RAG_QUERY_INTENT_TIMEOUT_SECONDS",
         str(DEFAULT_QUERY_INTENT_TIMEOUT_SECONDS),
@@ -184,297 +177,211 @@ def _intent_timeout_seconds() -> float:
     return value if value > 0 else DEFAULT_QUERY_INTENT_TIMEOUT_SECONDS
 
 
+def query_intent_model() -> str:
+    return os.getenv(
+        "RAG_QUERY_INTENT_MODEL",
+        os.getenv("QUERY_REWRITE_MODEL", DEFAULT_QUERY_INTENT_MODEL),
+    )
+
+
 @lru_cache(maxsize=1)
 def get_query_intent_client() -> OpenAI:
     api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
     base_url = os.getenv("DASHSCOPE_BASE_URL", "").strip()
     if not api_key or not base_url:
         raise RuntimeError(
-            "DASHSCOPE_API_KEY and DASHSCOPE_BASE_URL are required for query intent analysis"
+            "DASHSCOPE_API_KEY and DASHSCOPE_BASE_URL are required for query analysis"
         )
     return OpenAI(api_key=api_key, base_url=base_url)
 
-# 从LLM返回的completion对象中提取content字段，并进行基本验证，确保有choices和message.content
-def _response_content(completion: Any) -> str:
+
+def response_content(completion: Any) -> str:
     choices = getattr(completion, "choices", None) or []
     if not choices:
-        raise ValueError("query intent model returned no choices")
+        raise ValueError("query analysis model returned no choices")
     message = getattr(choices[0], "message", None)
     content = getattr(message, "content", None)
     if not isinstance(content, str) or not content.strip():
-        raise ValueError("query intent model returned empty content")
+        raise ValueError("query analysis model returned empty content")
     return content.strip()
 
 
-def _parse_intent_decision(content: str) -> QueryIntentDecision:
-    payload = json.loads(content)
-    if not isinstance(payload, dict):
-        raise ValueError("query intent response must be a JSON object")
-
-    intent = payload.get("intent")
-    need_rewrite = payload.get("need_rewrite")
-    need_decompose = payload.get("need_decompose")
-    reason = payload.get("reason")
-    retrieval_mode = payload.get("retrieval_mode")
-
-    if intent not in VALID_QUERY_INTENTS:
-        raise ValueError("query intent response contains an invalid intent")
-    if not isinstance(need_rewrite, bool):
-        raise ValueError("query intent need_rewrite must be a boolean")
-    if not isinstance(need_decompose, bool):
-        raise ValueError("query intent need_decompose must be a boolean")
-    if not isinstance(reason, str) or not reason.strip():
-        raise ValueError("query intent reason must be a non-empty string")
-
-    # Older providers may still return the original boolean-only contract.
-    # Preserve that response while requiring a full plan before execution.
-    if retrieval_mode is None:
-        retrieval_mode = "parallel" if need_decompose else "single"
-    if retrieval_mode not in VALID_RETRIEVAL_MODES:
-        raise ValueError("query intent response contains an invalid retrieval mode")
-
-    raw_subqueries = payload.get("subqueries", [])
-    if not isinstance(raw_subqueries, list):
-        raise ValueError("query intent subqueries must be a list")
-    if len(raw_subqueries) > MAX_SUBQUERIES:
-        raise ValueError("query intent contains too many subqueries")
-    subqueries = [_parse_subquery(item) for item in raw_subqueries]
-
-    if retrieval_mode == "single" and subqueries:
-        raise ValueError("single retrieval cannot contain subqueries")
-    if retrieval_mode == "parallel":
-        _validate_parallel_plan(subqueries)
-    if retrieval_mode == "sequential":
-        _validate_sequential_plan(subqueries)
-    need_decompose = retrieval_mode != "single"
-
-    normalized_reason = " ".join(reason.split()).strip()
-    if len(normalized_reason) > MAX_QUERY_INTENT_REASON_CHARS:
-        raise ValueError("query intent reason is too long")
-
-    # The model may identify ambiguity correctly but still request a rewrite.
-    # Without missing context, such a rewrite would have to invent facts.
-    if intent == "ambiguous_query":
-        need_rewrite = False
-
-    return QueryIntentDecision(
-        intent=intent,
-        need_rewrite=need_rewrite,
-        need_decompose=need_decompose,
-        reason=normalized_reason,
-        source="model",
-        retrieval_mode=retrieval_mode,
-        subqueries=subqueries,
-    )
-
-
-def _normalize_plan_text(value: Any, *, field_name: str) -> str:
-    if not isinstance(value, str):
-        raise ValueError(f"query intent {field_name} must be a string")
+def _normalized_reason(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise QueryValidationError("invalid_reason", "query analysis reason must be a non-empty string", field="reason")
     normalized = " ".join(value.split()).strip()
-    if len(normalized) > MAX_SUBQUERY_CHARS:
-        raise ValueError(f"query intent {field_name} is too long")
+    if len(normalized) > MAX_QUERY_INTENT_REASON_CHARS:
+        raise QueryValidationError("invalid_reason", "query analysis reason is too long", field="reason")
     return normalized
 
 
-def _parse_identifier_list(value: Any, *, field_name: str) -> list[str]:
-    if not isinstance(value, list) or not all(
-        isinstance(item, str) and PLAN_ID_PATTERN.fullmatch(item)
-        for item in value
-    ):
-        raise ValueError(f"query intent {field_name} is invalid")
-    return list(dict.fromkeys(value))
-
-
-def _parse_subquery(payload: Any) -> QuerySubqueryPlan:
+def _decode_query_analysis(content: str, question: str = "") -> QueryAnalysis:
+    payload = json.loads(content)
     if not isinstance(payload, dict):
-        raise ValueError("query intent subquery must be an object")
-    subquery_id = payload.get("id")
-    if not isinstance(subquery_id, str) or not PLAN_ID_PATTERN.fullmatch(
-        subquery_id
-    ):
-        raise ValueError("query intent subquery id is invalid")
+        raise QueryValidationError("invalid_analysis_schema", "query analysis response must be a JSON object", field="response")
 
-    output_slot = payload.get("output_slot")
-    if output_slot is not None and (
-        not isinstance(output_slot, str)
-        or not PLAN_ID_PATTERN.fullmatch(output_slot)
-    ):
-        raise ValueError("query intent output_slot is invalid")
-    inherit_document_scope = payload.get("inherit_document_scope", False)
-    if not isinstance(inherit_document_scope, bool):
-        raise ValueError("inherit_document_scope must be a boolean")
+    forbidden_fields = {"need_decompose", "retrieval_mode", "subqueries"}
+    if forbidden_fields.intersection(payload):
+        raise QueryValidationError("unexpected_planning_fields", "query analysis response contains planning fields",
+                                   field=sorted(forbidden_fields.intersection(payload))[0])
 
-    return QuerySubqueryPlan(
-        id=subquery_id,
-        query=_normalize_plan_text(payload.get("query", ""), field_name="query"),
-        query_template=_normalize_plan_text(
-            payload.get("query_template", ""),
-            field_name="query_template",
-        ),
-        depends_on=_parse_identifier_list(
-            payload.get("depends_on", []),
-            field_name="depends_on",
-        ),
-        output_slot=output_slot,
-        required_slots=_parse_identifier_list(
-            payload.get("required_slots", []),
-            field_name="required_slots",
-        ),
-        inherit_document_scope=inherit_document_scope,
+    intent = payload.get("intent")
+    need_rewrite = payload.get("need_rewrite")
+    target_count = payload.get("target_count")
+    targets_independent = payload.get("targets_independent")
+    has_dependency = payload.get("has_dependency")
+    likely_covers = payload.get("single_retrieval_likely_covers_all")
+
+    if intent not in VALID_QUERY_INTENTS:
+        raise QueryValidationError("invalid_intent", "query analysis response contains an invalid intent", field="intent")
+    if not isinstance(need_rewrite, bool):
+        raise QueryValidationError("invalid_boolean", "query analysis need_rewrite must be a boolean", field="need_rewrite")
+    if not isinstance(target_count, int) or isinstance(target_count, bool) or not (
+        1 <= target_count <= MAX_RETRIEVAL_TARGETS
+    ):
+        raise QueryValidationError("invalid_target_count", "query analysis target_count must be between 1 and 8", field="target_count")
+    if not isinstance(targets_independent, bool):
+        raise QueryValidationError("invalid_boolean", "query analysis targets_independent must be a boolean", field="targets_independent")
+    if not isinstance(has_dependency, bool):
+        raise QueryValidationError("invalid_boolean", "query analysis has_dependency must be a boolean", field="has_dependency")
+    if not isinstance(likely_covers, bool):
+        raise QueryValidationError("invalid_boolean", "query analysis single_retrieval_likely_covers_all must be a boolean",
+                                   field="single_retrieval_likely_covers_all")
+
+    if intent == "ambiguous_query":
+        need_rewrite = False
+
+    goals = decode_goals(payload["goals"]) if "goals" in payload else ()
+    need_expansion = payload.get("need_expansion", bool(alias_expansions(question)))
+    if not isinstance(need_expansion, bool):
+        raise QueryValidationError("invalid_boolean", "need_expansion must be a boolean", field="need_expansion")
+    dimensions = {}
+    for name, allowed in {
+        "language_features": {"colloquial", "contextual", "abbreviation"},
+        "task_types": {"lookup", "definition", "comparison", "calculation", "explanation", "summary"},
+    }.items():
+        values = payload.get(name, [])
+        if not isinstance(values, list) or not all(isinstance(v, str) and v in allowed for v in values):
+            raise QueryValidationError("invalid_analysis_dimension", f"invalid {name}", field=name)
+        dimensions[name] = tuple(dict.fromkeys(values))
+    clarification = payload.get("clarification")
+    if clarification is not None and (not isinstance(clarification, str) or not clarification.strip() or len(clarification) > 200):
+        raise QueryValidationError("invalid_clarification", "invalid clarification", field="clarification")
+
+    return QueryAnalysis(
+        intent=intent,
+        need_rewrite=need_rewrite,
+        target_count=target_count,
+        targets_independent=targets_independent,
+        has_dependency=has_dependency,
+        single_retrieval_likely_covers_all=likely_covers,
+        reason=_normalized_reason(payload.get("reason")),
+        source="model",
+        goals=goals,
+        need_expansion=need_expansion and intent != "ambiguous_query",
+        clarification=clarification if intent == "ambiguous_query" else None,
+        **dimensions,
     )
 
 
-def _validate_sequential_plan(subqueries: list[QuerySubqueryPlan]) -> None:
-    if len(subqueries) != 2:
-        raise ValueError("sequential retrieval must contain exactly two steps")
-    first, second = subqueries
-    if first.id == second.id:
-        raise ValueError("sequential retrieval step ids must be unique")
-    if not first.query or first.query_template or first.depends_on:
-        raise ValueError("first sequential step is invalid")
-    if not first.output_slot:
-        raise ValueError("first sequential step must declare output_slot")
-    if first.required_slots:
-        raise ValueError("first sequential step cannot require bridge slots")
-    if second.query or not second.query_template:
-        raise ValueError("second sequential step must use query_template")
-    if second.output_slot is not None:
-        raise ValueError("second sequential step cannot declare output_slot")
-    if second.depends_on != [first.id]:
-        raise ValueError("second sequential step has an invalid dependency")
-    if second.required_slots != [first.output_slot]:
-        raise ValueError("second sequential step must consume the first output slot")
-    if "{" + first.output_slot + "}" not in second.query_template:
-        raise ValueError("second query template does not reference the output slot")
+def _validate_query_analysis(analysis: QueryAnalysis, question: str) -> QueryAnalysis:
+    goals = validate_goal_sources(analysis.goals, question)
+    validate_goals(question, goals)
+    if goals:
+        count = len(goals)
+        dependency = any(goal.depends_on for goal in goals)
+        signals = {"target_count": count, "has_dependency": dependency,
+                   "targets_independent": count > 1 and not dependency}
+        changes = {key: {"before": getattr(analysis, key), "after": value}
+                   for key, value in signals.items() if getattr(analysis, key) != value}
+        if changes:
+            record_observation("query_analysis_normalization", "normalization", "accepted",
+                               end_reason="derived_signals_from_validated_goals", changes=changes)
+        return replace(analysis, goals=goals, **signals)
+    # Legacy responses without goals cannot use a graph as the source of truth.
+    # A single independent lookup is a valid lookup, not a reason to retry.
+    if analysis.target_count == 1 and analysis.targets_independent:
+        analysis = replace(analysis, targets_independent=False)
+    if analysis.has_dependency and analysis.target_count < 2:
+        raise QueryValidationError("dependency_target_count_conflict", "dependent retrieval requires at least two targets", field="target_count")
+    if analysis.has_dependency and analysis.targets_independent:
+        raise QueryValidationError("dependency_independence_conflict", "dependent retrieval targets cannot be independent", field="targets_independent")
+    return analysis
 
 
-def _validate_parallel_plan(subqueries: list[QuerySubqueryPlan]) -> None:
-    # Keep accepting the older boolean-only provider contract. It cannot be
-    # executed as parallel retrieval and will safely fall back to one query.
-    if not subqueries:
-        return
-    # 并行至少有两个子查询才有意义
-    if not 2 <= len(subqueries) <= MAX_SUBQUERIES:
-        raise ValueError("parallel retrieval must contain two or three steps")
-    if len({step.id for step in subqueries}) != len(subqueries):
-        raise ValueError("parallel retrieval step ids must be unique")
-    # 并行子查询必须是独立的，不能依赖其他步骤或共享槽位
-    for step in subqueries:
-        if not step.query or step.query_template:
-            raise ValueError("parallel retrieval steps must use direct queries")
-        if step.depends_on or step.output_slot or step.required_slots:
-            raise ValueError("parallel retrieval steps must be independent")
-        if step.inherit_document_scope:
-            raise ValueError("parallel retrieval cannot inherit a prior scope")
+def _parse_query_analysis(content: str, question: str = "") -> QueryAnalysis:
+    return _validate_query_analysis(_decode_query_analysis(content, question), question)
 
-def _validate_parallel_subquery_drift(
-    original_question: str,
-    decision: QueryIntentDecision,
-) -> None:
-    """Reject parallel plans that invent exact constraints."""
 
-    if decision.retrieval_mode != "parallel":
-        return
-
-    drifted_steps = []
-
-    for step in decision.subqueries:
-        validation = validate_query_preservation(
-            original_question,
-            step.query,
-        )
-
-        # 不检查 missing_anchors，因为每个并行子查询只负责一个子意图，
-        # 不需要保留原问题中的全部指标。
-        #
-        # 这里只禁止增加原问题不存在的年份、数字、实体、表图编号等。
-        if validation.added_risky_terms:
-            drifted_steps.append(
-                {
-                    "subquery_id": step.id,
-                    "added_risky_terms": validation.added_risky_terms,
-                }
-            )
-
-    if drifted_steps:
-        raise ValueError(
-            f"parallel subqueries invented exact constraints: "
-            f"{drifted_steps}"
-        )
-
-def _rule_based_decision(question: str) -> QueryIntentDecision | None:
+def _rule_based_analysis(question: str) -> QueryAnalysis | None:
+    # Fast paths are deliberately abstaining: a local cue is not proof that
+    # the entire request has one goal.
+    multi_facet = bool(COLLOQUIAL_MULTI_FACET_PATTERN.search(question))
     precise_locators = {
         "".join(match.group(0).split()).casefold()
         for match in PRECISE_LOCATOR_PATTERN.finditer(question)
     }
-    if len(precise_locators) == 1:
-        return QueryIntentDecision(
+    if UNKNOWN_LOCATOR.search(question) and 2 <= len(precise_locators) <= MAX_GOALS:
+        # The answer is the mapping, so retrieve the candidate objects without
+        # attaching a requested fact to any one of them before evidence exists.
+        goal = QueryGoal(id="locator_relation", text=question, source_spans=(question,),
+                         candidate_locators=tuple(sorted(precise_locators)))
+        return QueryAnalysis(intent="complex_lookup", need_rewrite=False, target_count=1,
+                             targets_independent=False, has_dependency=False,
+                             single_retrieval_likely_covers_all=False, source="rule",
+                             reason="未知图表与事实的对应关系，先完整读取各候选对象再联合判定",
+                             goals=(goal,), task_types=("lookup", "comparison"))
+    if len(precise_locators) == 1 and not multi_facet:
+        return QueryAnalysis(
             intent="precise_lookup",
             need_rewrite=False,
-            need_decompose=False,
-            reason="包含明确的表、图、章节或页码定位信息",
+            target_count=1,
+            targets_independent=False,
+            has_dependency=False,
+            single_retrieval_likely_covers_all=True,
+            reason="包含单个明确的表、图、章节或页码定位信息",
             source="rule",
         )
 
-    if RATING_SEQUENTIAL_PATTERN.search(question):
-        return QueryIntentDecision(
+    if (RATING_SEQUENTIAL_PATTERN.search(question) and not EXPLICIT_RATING_PATTERN.search(question)
+            and not multi_facet and not metric_terms(question)):
+        return QueryAnalysis(
             intent="complex_lookup",
-            need_rewrite=True,
-            need_decompose=True,
-            reason="评级含义依赖先取得研报给出的具体评级名称",
+            need_rewrite=False,
+            target_count=2,
+            targets_independent=False,
+            has_dependency=True,
+            single_retrieval_likely_covers_all=False,
+            reason="评级含义查询依赖先取得研报给出的具体评级名称",
             source="rule",
-            retrieval_mode="sequential",
-            subqueries=[
-                QuerySubqueryPlan(
-                    id="rating_lookup",
-                    query=question,
-                    output_slot="rating",
-                ),
-                QuerySubqueryPlan(
-                    id="rating_definition",
-                    query_template=(
-                        "“{rating}”的评级定义、评级标准、股价表现与"
-                        "市场代表性指数是什么？"
-                    ),
-                    depends_on=["rating_lookup"],
-                    required_slots=["rating"],
-                    inherit_document_scope=(
-                        "这份研报" in question
-                        or "该研报" in question
-                        or "这份报告" in question
-                        or "该报告" in question
-                    ),
-                ),
-            ],
         )
 
     has_colloquial_language = any(
         pattern.search(question) for pattern in COLLOQUIAL_PATTERNS
     )
-    # Multi-facet colloquial questions still need the model to decide whether
-    # their facets are independent. A deterministic colloquial shortcut would
-    # otherwise hide an executable parallel plan (for example profit + EPS + PE).
-    if (
-        has_colloquial_language
-        and COLLOQUIAL_MULTI_FACET_PATTERN.search(question)
-    ):
+    if multi_facet or RATING_SEQUENTIAL_PATTERN.search(question):
         return None
 
     if has_colloquial_language:
-        return QueryIntentDecision(
+        return QueryAnalysis(
             intent="colloquial_lookup",
             need_rewrite=True,
-            need_decompose=False,
+            target_count=1,
+            targets_independent=False,
+            has_dependency=False,
+            single_retrieval_likely_covers_all=True,
             reason="包含需要转换为文档术语的口语表达",
             source="rule",
         )
 
     if CONTEXTUAL_PATTERN.search(question):
-        return QueryIntentDecision(
+        return QueryAnalysis(
             intent="contextual_query",
             need_rewrite=True,
-            need_decompose=False,
+            target_count=1,
+            targets_independent=False,
+            has_dependency=False,
+            single_retrieval_likely_covers_all=True,
             reason="查询包含依赖上下文的指代或承接表达",
             source="rule",
         )
@@ -486,103 +393,115 @@ def analyze_query_intent(
     question: str,
     *,
     client: Any | None = None,
-) -> QueryIntentDecision:
-    """Classify a RAG query and conservatively decide whether to rewrite it.
+) -> QueryAnalysis:
+    """Analyze query semantics without selecting a route or making a plan."""
 
-    Exact locators and common conversational forms use deterministic rules.
-    Other queries are classified by the configured model. Any provider or
-    parsing failure falls back to no rewrite so intent analysis cannot degrade
-    retrieval availability or silently introduce query drift.
-    """
     normalized_question = question.strip() if isinstance(question, str) else ""
     if not normalized_question:
-        return QueryIntentDecision(
+        return QueryAnalysis(
             intent="invalid_query",
             need_rewrite=False,
-            need_decompose=False,
+            target_count=1,
+            targets_independent=False,
+            has_dependency=False,
+            single_retrieval_likely_covers_all=True,
             reason="查询为空",
             source="rule",
         )
 
     if not _environment_flag("RAG_QUERY_INTENT_ENABLED", True):
-        return QueryIntentDecision(
+        return QueryAnalysis(
             intent="general_lookup",
             need_rewrite=True,
-            need_decompose=False,
-            reason="意图识别已关闭，沿用原有的全量改写策略",
+            target_count=1,
+            targets_independent=False,
+            has_dependency=False,
+            single_retrieval_likely_covers_all=True,
+            reason="查询分析已关闭，沿用原有的全量改写策略",
             source="disabled",
         )
 
     if len(normalized_question) > MAX_QUERY_INTENT_INPUT_CHARS:
-        return QueryIntentDecision(
+        return QueryAnalysis(
             intent="general_lookup",
             need_rewrite=False,
-            need_decompose=False,
-            reason="查询过长，跳过意图识别和改写",
+            target_count=1,
+            targets_independent=False,
+            has_dependency=False,
+            single_retrieval_likely_covers_all=True,
+            reason="查询过长，跳过查询分析和改写",
             source="fallback",
         )
 
-    rule_decision = _rule_based_decision(normalized_question)
-    if rule_decision is not None:
-        return rule_decision
+    rule_analysis = _rule_based_analysis(normalized_question)
+    if rule_analysis is not None:
+        return replace(
+            rule_analysis,
+            need_expansion=rule_analysis.need_rewrite or (
+                not precise_locator(normalized_question) and bool(alias_expansions(normalized_question))
+            ),
+            language_features=tuple(name for name, present in (
+                ("colloquial", any(p.search(normalized_question) for p in COLLOQUIAL_PATTERNS)),
+                ("contextual", bool(CONTEXTUAL_PATTERN.search(normalized_question))),
+            ) if present),
+        )
 
     try:
         resolved_client = client or get_query_intent_client()
-        completion = resolved_client.chat.completions.create(
-            model=os.getenv(
-                "RAG_QUERY_INTENT_MODEL",
-                os.getenv("QUERY_REWRITE_MODEL", DEFAULT_QUERY_INTENT_MODEL),
-            ),
+        analysis = validated_completion(resolved_client, "query_analysis",
+            parse=lambda content: _decode_query_analysis(content, normalized_question),
+            validate=lambda value: _validate_query_analysis(value, normalized_question),
+            model=query_intent_model(),
             messages=[
-                {"role": "system", "content": QUERY_INTENT_SYSTEM_PROMPT},
+                {"role": "system", "content": QUERY_ANALYSIS_SYSTEM_PROMPT},
                 {"role": "user", "content": normalized_question},
             ],
             response_format={"type": "json_object"},
             temperature=0,
-            max_tokens=520,
+            max_tokens=1800,
             stream=False,
-            timeout=_intent_timeout_seconds(),
+            timeout=query_intent_timeout_seconds(),
             extra_body={"enable_thinking": False},
         )
-        decision = _parse_intent_decision(_response_content(completion))
-        _validate_parallel_subquery_drift(
-            normalized_question,
-            decision,
-        )
-
         logger.info(
-            "RAG query intent analyzed: intent=%s need_rewrite=%s need_decompose=%s source=%s",
-            decision.intent,
-            decision.need_rewrite,
-            decision.need_decompose,
-            decision.source,
+            "RAG query analyzed: intent=%s targets=%s dependency=%s source=%s",
+            analysis.intent,
+            analysis.target_count,
+            analysis.has_dependency,
+            analysis.source,
         )
-        return decision
+        return analysis
     except Exception as error:
-        logger.warning(
-            "RAG query intent analysis or plan validation failed: %s",
-            type(error).__name__,
-        )
+        logger.warning("RAG query analysis failed: %s: %s", type(error).__name__, str(error)[:500])
+        record_observation("query_analysis_fallback", "fallback", "applied",
+                           source="rule", end_reason="conservative_single_query", **failure_details(error))
 
         has_colloquial_language = any(
             pattern.search(normalized_question)
             for pattern in COLLOQUIAL_PATTERNS
         )
-
-        return QueryIntentDecision(
+        return QueryAnalysis(
             intent=(
                 "colloquial_lookup"
                 if has_colloquial_language
                 else "general_lookup"
             ),
             need_rewrite=has_colloquial_language,
-            need_decompose=False,
+            target_count=1,
+            targets_independent=False,
+            has_dependency=False,
+            single_retrieval_likely_covers_all=True,
             reason=(
-                "意图识别或子查询保真校验失败；"
+                "查询分析失败；"
                 "口语问题回退为受保真校验的单查询改写"
                 if has_colloquial_language
-                else "意图识别失败，保守使用原查询"
+                else "查询分析失败，保守使用原查询"
             ),
             source="fallback",
+            need_expansion=has_colloquial_language or bool(alias_expansions(normalized_question)),
+            validation_error=f"{type(error).__name__}: {str(error)[:500]}",
         )
-    
+
+
+def precise_locator(question: str) -> bool:
+    return bool(PRECISE_LOCATOR_PATTERN.search(question))

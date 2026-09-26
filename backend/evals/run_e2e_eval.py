@@ -18,6 +18,9 @@ from typing import Any
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 BACKEND_DIRECTORY = SCRIPT_DIRECTORY.parent
 APP_DIRECTORY = BACKEND_DIRECTORY / "app"
+if not (APP_DIRECTORY / "service").is_dir():
+    # Compose mounts application packages directly under /app.
+    APP_DIRECTORY = BACKEND_DIRECTORY
 DEFAULT_DATASET = SCRIPT_DIRECTORY / "data" / "power_reports_eval_v2.jsonl"
 DEFAULT_OUTPUT_DIRECTORY = SCRIPT_DIRECTORY / "results"
 
@@ -49,6 +52,7 @@ from service.core.grounded_answer import (  # noqa: E402
     DEFAULT_ANSWER_MODEL,
     execute_grounded_turn,
 )
+from service.core.agent_evaluation import execute_agent_turn  # noqa: E402
 from service.core.retrieval_evaluation import (  # noqa: E402
     build_error_case,
     evaluate_retrieval_case,
@@ -74,7 +78,8 @@ def parse_args() -> argparse.Namespace:
             "without DB/Redis side effects."
         )
     )
-    parser.add_argument("--index-name", action="append", required=True)
+    parser.add_argument("--index-name", action="append")
+    parser.add_argument("--validate-only", action="store_true", help="Validate samples without model or retrieval calls.")
     parser.add_argument("--dataset", type=Path, default=DEFAULT_DATASET)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIRECTORY)
     parser.add_argument("--run-name", default="e2e_baseline")
@@ -88,6 +93,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-rrf-k", type=int, default=10)
     parser.add_argument("--match-threshold", type=float, default=0.8)
     parser.add_argument("--answer-model", default=None)
+    parser.add_argument("--execution-mode", choices=["grounded", "agent"], default="grounded")
+    parser.add_argument("--planner-model", default=None)
     parser.add_argument("--judge-model", default=None)
     parser.add_argument("--judge-timeout", type=float, default=20.0)
     parser.add_argument(
@@ -114,6 +121,8 @@ def parse_args() -> argparse.Namespace:
 
 
 def validate_args(args: argparse.Namespace) -> None:
+    if not args.validate_only and not args.index_name:
+        raise ValueError("--index-name is required unless --validate-only is set")
     if args.top_k <= 0:
         raise ValueError("--top-k must be greater than 0")
     if not 0 <= args.similarity_threshold <= 1:
@@ -138,10 +147,17 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def validate_e2e_samples(samples: list[dict[str, Any]]) -> None:
     for sample in samples:
+        history = sample.get("conversation_history", [])
+        if not isinstance(history, list) or not all(
+            isinstance(turn, dict) and turn.get("role") in {"user", "assistant"}
+            and isinstance(turn.get("content"), str) for turn in history
+        ):
+            raise ValueError(f"Sample {sample.get('id')!r} has invalid conversation_history")
         expected_behavior = sample.get("expected_behavior")
         if expected_behavior is not None and expected_behavior not in {
             "answer",
             "refuse",
+            "clarify",
         }:
             raise ValueError(
                 f"Sample {sample.get('id')!r} has invalid expected_behavior"
@@ -243,6 +259,10 @@ def main() -> int:
         splits=args.split,
     )
     validate_e2e_samples(samples)
+    if args.validate_only:
+        print(json.dumps({"dataset": str(args.dataset.resolve()), "selected_samples": len(samples),
+                          "execution_mode": args.execution_mode, "valid": True}, ensure_ascii=False, indent=2))
+        return 0
     index_names = expand_index_names(args.index_name)
     index_argument: str | list[str] = (
         index_names[0] if len(index_names) == 1 else index_names
@@ -284,12 +304,16 @@ def main() -> int:
     for position, sample in enumerate(samples, start=1):
         case_started = time.perf_counter()
         try:
-            turn = execute_grounded_turn(
+            execute = execute_agent_turn if args.execution_mode == "agent" else execute_grounded_turn
+            execution_options = {"planner_client": client, "planner_model": args.planner_model} if args.execution_mode == "agent" else {}
+            turn = execute(
                 index_names=index_argument,
                 question=str(sample["question"]),
                 answer_client=client,
                 answer_model=answer_model,
                 retrieval_options=retrieval_options,
+                conversation_history=sample.get("conversation_history"),
+                **execution_options,
             )
             retrieval_case = evaluate_retrieval_case(
                 sample,
@@ -424,6 +448,8 @@ def main() -> int:
             "pipeline": "knowledge_base_only",
             "index_names": index_names,
             "answer_model": answer_model,
+            "execution_mode": args.execution_mode,
+            "planner_model": args.planner_model or os.getenv("AGENT_MODEL", "deepseek-v4-pro"),
             "answer_temperature": 0,
             "judge_model": judge_model,
             "judge_enabled": judge_model is not None,

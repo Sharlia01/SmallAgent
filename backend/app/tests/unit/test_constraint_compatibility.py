@@ -2,7 +2,7 @@ import pytest
 
 from service.core.constraint_compatibility import (
     evaluate_constraint_compatibility,
-    extract_metrics,
+    extract_measurement_dimensions,
     extract_organizations,
     extract_time_scopes,
 )
@@ -125,17 +125,28 @@ def test_constraint_compatibility_detects_locator_conflict():
 
 
 @pytest.mark.unit
-def test_metric_extraction_distinguishes_expense_rate_from_amount():
-    assert extract_metrics("财务费用率为3.71%") == {
-        "financial_expense_rate"
+def test_measurement_dimension_extraction_is_business_agnostic():
+    assert extract_measurement_dimensions("财务费用率为3.71%") == {"rate"}
+    assert extract_measurement_dimensions("毛利率为16.27%") == {"rate"}
+    assert extract_measurement_dimensions("财务费用为10049百万元") == {
+        "currency_amount"
     }
-    assert extract_metrics("财务费用金额为10049百万元") == {
-        "financial_expense_amount"
+    assert extract_measurement_dimensions("项目成本为500元") == {
+        "currency_amount"
+    }
+    assert extract_measurement_dimensions("每股收益为0.38元/股") == {
+        "per_share"
+    }
+    assert extract_measurement_dimensions("装机规模达到100万千瓦") == {
+        "power"
+    }
+    assert extract_measurement_dimensions("发电量为200亿千瓦时") == {
+        "energy"
     }
 
 
 @pytest.mark.unit
-def test_metric_compatibility_demotes_wrong_expense_measure():
+def test_measurement_compatibility_detects_dimension_not_business_identity():
     rate_question = "国电电力2025年上半年财务费用率是多少？"
 
     exact_rate = evaluate_constraint_compatibility(
@@ -154,6 +165,21 @@ def test_metric_compatibility_demotes_wrong_expense_measure():
         document_name="国电电力.pdf",
     )
 
-    assert exact_rate.categories["metric"].level == "compatible"
-    assert expense_amount.categories["metric"].level == "conflict"
-    assert unrelated_margin.categories["metric"].level == "conflict"
+    assert exact_rate.categories["measurement_dimension"].level == (
+        "compatible"
+    )
+    assert expense_amount.categories["measurement_dimension"].level == (
+        "conflict"
+    )
+    # Both are rates.  Topic identity is intentionally left to the semantic
+    # reranker instead of a corpus-specific metric-name dictionary.
+    assert unrelated_margin.categories["measurement_dimension"].level == (
+        "compatible"
+    )
+    assert exact_rate.categories["measurement_subject"].level == "compatible"
+    assert expense_amount.categories["measurement_subject"].level == (
+        "compatible"
+    )
+    assert unrelated_margin.categories["measurement_subject"].level == (
+        "unknown"
+    )

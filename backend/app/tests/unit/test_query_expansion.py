@@ -193,7 +193,7 @@ def test_expansion_can_be_disabled_without_calling_model(monkeypatch):
 
 
 @pytest.mark.unit
-def test_unchanged_rewrite_skips_expansion_without_calling_model(monkeypatch):
+def test_unchanged_rewrite_expands_registered_aliases_without_calling_model(monkeypatch):
     monkeypatch.setenv("QUERY_EXPANSION_ENABLED", "true")
     completions = FakeCompletions(error=AssertionError("must not be called"))
     original = "国电电力归母净利润"
@@ -204,9 +204,10 @@ def test_unchanged_rewrite_skips_expansion_without_calling_model(monkeypatch):
         client=fake_client(completions),
     )
 
-    assert result.effective_query == original
-    assert result.source == "skipped"
-    assert result.expansion_applied is False
+    assert original in result.effective_query
+    assert "归属于母公司股东的净利润" in result.effective_query
+    assert result.source == "rule"
+    assert result.expansion_applied is True
     assert completions.calls == []
 
 
@@ -228,7 +229,9 @@ def test_query_anchor_extraction_does_not_treat_large_value_as_year():
         "企业自由现金流为20808百万元"
     )
 
-    assert not any(anchor.startswith("2080") for anchor in anchors)
+    assert "2080" not in anchors
+    assert "2080年" not in anchors
+    assert "20808" in anchors
 
 
 @pytest.mark.unit

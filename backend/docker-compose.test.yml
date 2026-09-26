@@ -27,6 +27,7 @@ services:
       ROOT_PATH: ""
     volumes:
       - ./app:/app
+      - ./evals:/evals:ro
     depends_on:
       gsk_pg_test:
         condition: service_healthy

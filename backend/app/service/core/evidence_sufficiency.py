@@ -6,13 +6,20 @@ import json
 import logging
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from functools import lru_cache
 from typing import Any, Literal
+from uuid import uuid4
 
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, APIConnectionError, APIStatusError
 from service.core.evidence_metadata import evidence_metadata
+from service.core.query_contract import QueryGoal
+from service.core.query_runtime import (
+    model_completion, current_runtime, observation_context, record_observation,
+    failure_details, observe_contract, QueryBudgetExceeded,
+)
+from service.core.derived_evidence import build_derived_evidence
 
 
 load_dotenv()
@@ -50,6 +57,8 @@ EVIDENCE_SUFFICIENCY_SYSTEM_PROMPT = """
 8. table_binding_kwd=unbound 的表格尚未可靠绑定表头。只有原始内容明确、无歧义地对应问题时才能作为证据，不得猜测错位或缺失的列关系。
 9. 先根据问题和候选证据确定对象范围，不得擅自扩大。问题未明确出现“全行业”“全市场”“各公司”“可比公司”等跨主体限定时，不得自行要求行业或多公司数据。如果候选证据明确在同一公司、同一报告或同一已限定主体内列出多个分类，则“最高/最低的板块”指这些已列分类之间的比较。
 10. “该板块”“该类”“它”等后续指代必须继承问题前文或证据已确定的对象与主体范围。对递进问题，允许先用一个片段确定桥接值，再用另一个片段支持该桥接值对应的后续事实。
+11. 区分原始事实与计算结果。原始数值、对象、时间、单位必须有证据；由这些数值做确定的求和、差值、比例、大小比较或单位换算，不要求文档直接写出计算结果。例如 EPS=0.40元、DPS=0.24元足以计算派息率=DPS/EPS=60%，不属于外部常识补全。输入缺失、口径不同、分母为零或关系有歧义时才缺少计算支持。
+12. derived_evidence 是服务端基于可靠表格单元格执行的白名单计算。status=supported 的结果可与其 inputs 联合支持相应计算要求，使用时在 derived_evidence_ids 中列出 id；unresolved 仅表示该自动计算未完成，不代表用户问题必然无法回答。仍需检查其余所有要求，不得因一项计算成功就放行整个问题。
 
 范围判定示例：
 - 问题要求“找出归母净利润最高的电源板块，再说明该类电源的发电量”，候选证据列出同一公司的煤电、气电、水电、风电和光伏板块时，应在这些公司内部板块中比较；不得要求全行业各公司数据。
@@ -78,6 +87,13 @@ class EvidenceSufficiencyDecision:
     source: EvidenceSufficiencySource   # 判定不充分的来源 无证据/功能关闭/LLM判定
     evaluated_chunk_count: int           #评估的候选证据数量，这次校验实际看了多少个chunk
     evaluated_chunk_ids: list[str]       #被评估的chunk ID列表
+    goal_coverage: list[dict[str, Any]] = field(default_factory=list)
+    derived_evidence: list[dict[str, Any]] = field(default_factory=list)
+    used_derived_evidence_ids: list[str] = field(default_factory=list)
+    verification_status: str = "completed"
+    failure_kind: str | None = None
+    failure: dict[str, Any] | None = None
+    attempts: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -139,6 +155,8 @@ def _parse_decision(
     *,
     chunk_count: int,
     chunk_ids: list[str],
+    goals: tuple[QueryGoal, ...] = (),
+    derived_evidence: list[dict[str, Any]] | None = None,
 ) -> EvidenceSufficiencyDecision:
     payload = json.loads(content)
     if not isinstance(payload, dict):
@@ -181,6 +199,40 @@ def _parse_decision(
     ):
         raise ValueError("supporting chunk index is out of range")
     supporting_chunk_indices = list(dict.fromkeys(raw_indices))
+    derived_evidence = derived_evidence or []
+    derived_by_id = {item["id"]: item for item in derived_evidence if item["status"] == "supported"}
+    used = payload.get("derived_evidence_ids", [])
+    if not isinstance(used, list) or not all(isinstance(key, str) and key in derived_by_id for key in used):
+        raise ValueError("unknown or unsupported derived evidence id")
+    for key in used:
+        supporting_chunk_indices.extend(derived_by_id[key]["supporting_chunk_indices"])
+    supporting_chunk_indices = list(dict.fromkeys(supporting_chunk_indices))
+    if sufficient and not supporting_chunk_indices:
+        raise ValueError("sufficient evidence must cite a supporting chunk")
+
+    coverage = []
+    if goals:
+        raw_coverage = payload.get("goal_coverage")
+        expected = {goal.id for goal in goals}
+        if not isinstance(raw_coverage, list) or len(raw_coverage) != len(expected):
+            raise ValueError("verifier must evaluate every goal")
+        for item in raw_coverage:
+            if not isinstance(item, dict) or item.get("goal_id") not in expected:
+                raise ValueError("invalid evidence goal id")
+            status = item.get("status")
+            indices = item.get("supporting_chunk_indices", [])
+            if status not in {"supported", "missing", "conflict"} or not isinstance(indices, list):
+                raise ValueError("invalid goal coverage")
+            if not all(type(i) is int and 1 <= i <= chunk_count for i in indices):
+                raise ValueError("invalid goal evidence indices")
+            if status == "supported" and not indices:
+                raise ValueError("supported goal needs evidence")
+            coverage.append({"goal_id": item["goal_id"], "status": status,
+                             "supporting_chunk_ids": [chunk_ids[i - 1] for i in dict.fromkeys(indices)]})
+        if {item["goal_id"] for item in coverage} != expected:
+            raise ValueError("duplicate or missing evidence goal id")
+        if sufficient and any(item["status"] != "supported" for item in coverage):
+            raise ValueError("sufficiency disagrees with goal coverage")
 
     return EvidenceSufficiencyDecision(
         sufficient=sufficient,
@@ -190,6 +242,9 @@ def _parse_decision(
         source="model",
         evaluated_chunk_count=chunk_count,
         evaluated_chunk_ids=chunk_ids,
+        goal_coverage=coverage,
+        derived_evidence=derived_evidence,
+        used_derived_evidence_ids=list(dict.fromkeys(used)),
     )
 
 # 从原始chunks里提取出可用于证据充分性校验的内容，限制总长度和每个chunk的长度，避免模型处理过长文本导致超时或返回错误。
@@ -215,6 +270,7 @@ def _prepare_evidence(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
             {
                 "index": len(prepared) + 1,
                 "chunk_id": str(chunk.get("chunk_id") or ""),
+                "document_id": str(chunk.get("doc_id") or chunk.get("document_id") or ""),
                 "document_name": str(
                     chunk.get("docnm_kwd")
                     or chunk.get("document_name")
@@ -229,6 +285,8 @@ def _prepare_evidence(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _fallback_decision(
     evidence: list[dict[str, Any]],
+    *, error: Exception | None = None, failure_kind: str = "verification_unavailable",
+    attempts: int = 0, derived_evidence: list[dict[str, Any]] | None = None,
 ) -> EvidenceSufficiencyDecision:
     fail_open = _environment_flag(
         "RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN",
@@ -246,6 +304,15 @@ def _fallback_decision(
         source="fallback",
         evaluated_chunk_count=len(evidence),
         evaluated_chunk_ids=[item["chunk_id"] for item in evidence],
+        verification_status="unavailable", failure_kind=failure_kind,
+        failure=failure_details(error) if error else None, attempts=attempts,
+        derived_evidence=derived_evidence or [],
+    )
+
+
+def _retryable_transport(error: Exception) -> bool:
+    return isinstance(error, (APIConnectionError, TimeoutError)) or (
+        isinstance(error, APIStatusError) and (error.status_code == 408 or error.status_code >= 500)
     )
 
 
@@ -254,6 +321,7 @@ def check_evidence_sufficiency(
     chunks: list[dict[str, Any]],
     *,
     client: Any | None = None,
+    goals: tuple[QueryGoal, ...] = (),
 ) -> EvidenceSufficiencyDecision:
     """Return whether the final chunks explicitly cover the whole question."""
 
@@ -318,13 +386,20 @@ def check_evidence_sufficiency(
 
     if len(normalized_question) > MAX_EVIDENCE_QUESTION_CHARS:
         logger.warning("Skipping evidence check because the question is too long")
-        return _fallback_decision(evidence)
+        return _fallback_decision(evidence, failure_kind="input_limit")
 
+    derived = build_derived_evidence(normalized_question, evidence)
+    if derived:
+        record_observation("derived_evidence", "calculation", "completed",
+                           supported_count=sum(item["status"] == "supported" for item in derived),
+                           calculations=derived)
+    attempts = 0
+    operation_id = uuid4().hex
     try:
         resolved_client = client or get_evidence_sufficiency_client()
         # 调用LLM做JSON判定，返回是否充分、缺失的要求和支持的证据索引。
         # 这里输入是结构化JSON输入，输出也是结构化JSON，避免模型生成不规范文本。
-        completion = resolved_client.chat.completions.create(
+        request = dict(
             model=os.getenv(
                 "RAG_EVIDENCE_SUFFICIENCY_MODEL",
                 DEFAULT_EVIDENCE_SUFFICIENCY_MODEL,
@@ -332,7 +407,11 @@ def check_evidence_sufficiency(
             messages=[
                 {
                     "role": "system",
-                    "content": EVIDENCE_SUFFICIENCY_SYSTEM_PROMPT,
+                    "content": EVIDENCE_SUFFICIENCY_SYSTEM_PROMPT + (
+                        '\n必须逐个评估goals，并返回goal_coverage数组，每项为'
+                        '{"goal_id":"目标id","status":"supported|missing|conflict","supporting_chunk_indices":[1]}。'
+                        '只有全部目标均supported且各有证据才能sufficient=true。' if goals else ""
+                    ),
                 },
                 {
                     "role": "user",
@@ -340,6 +419,8 @@ def check_evidence_sufficiency(
                         {
                             "question": normalized_question,
                             "candidate_evidence": evidence,
+                            "goals": [goal.to_dict() for goal in goals],
+                            "derived_evidence": derived,
                         },
                         ensure_ascii=False,
                     ),
@@ -347,16 +428,47 @@ def check_evidence_sufficiency(
             ],
             response_format={"type": "json_object"},
             temperature=0,
-            max_tokens=320,
+            max_tokens=1600 if goals or derived else 500,
             stream=False,
             timeout=_timeout_seconds(),
             extra_body={"enable_thinking": False},
         )
-        decision = _parse_decision(
-            _response_content(completion),
-            chunk_count=len(evidence),
-            chunk_ids=chunk_ids,
-        )
+        for attempts in (1, 2):
+            with observation_context(operation_id=operation_id, attempt=attempts, source="model", verifier="evidence_sufficiency"):
+                try:
+                    completion = model_completion(resolved_client, "evidence_sufficiency", **request)
+                except Exception as error:
+                    for suffix, phase in (("_parse", "parse"), ("_validation", "semantic_validation")):
+                        record_observation("evidence_sufficiency" + suffix, phase, "skipped", end_reason="request_failed")
+                    runtime = current_runtime()
+                    budget_available = runtime is None or (
+                        runtime.remaining() >= min(2.0, _timeout_seconds())
+                        and runtime.counts.get("model", 0) < runtime.max_model_calls
+                    )
+                    retry = attempts == 1 and _retryable_transport(error) and budget_available and _environment_flag(
+                        "RAG_EVIDENCE_SUFFICIENCY_TRANSIENT_RETRY", True,
+                    )
+                    record_observation("evidence_sufficiency_recovery", "recovery", "retry" if retry else "failed",
+                                       end_reason="transient_request_retry" if retry else "verification_unavailable",
+                                       **failure_details(error))
+                    if retry:
+                        continue
+                    raise
+                choices = getattr(completion, "choices", None) or []
+                raw_content = getattr(getattr(choices[0], "message", None), "content", None) if choices else None
+                content = raw_content if isinstance(raw_content, str) else ""
+                decision = observe_contract(
+                    "evidence_sufficiency", content, parse=lambda _: json.loads(_response_content(completion)),
+                    validate=lambda payload: _parse_decision(
+                        json.dumps(payload, ensure_ascii=False), chunk_count=len(evidence),
+                        chunk_ids=chunk_ids, goals=goals, derived_evidence=derived,
+                    ),
+                    finish_reason=getattr(choices[0], "finish_reason", None) if choices else None,
+                )
+                decision = replace(decision, attempts=attempts)
+                record_observation("evidence_sufficiency_completion", "completion", "accepted",
+                                   end_reason="verified_after_retry" if attempts > 1 else "verified")
+                break
         logger.info(
             "RAG evidence sufficiency checked: sufficient=%s chunks=%s missing=%s",
             decision.sufficient,
@@ -369,4 +481,9 @@ def check_evidence_sufficiency(
             "RAG evidence sufficiency check failed: %s",
             type(error).__name__,
         )
-        return _fallback_decision(evidence)
+        kind = ("budget_exhausted" if isinstance(error, QueryBudgetExceeded) else
+                "service_unavailable" if _retryable_transport(error) else
+                "contract_rejected" if isinstance(error, ValueError) else "configuration_or_request_error")
+        record_observation("evidence_sufficiency_completion", "completion", "failed",
+                           operation_id=operation_id, attempts=attempts, end_reason=kind, **failure_details(error))
+        return _fallback_decision(evidence, error=error, failure_kind=kind, attempts=attempts, derived_evidence=derived)
