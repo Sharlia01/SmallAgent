@@ -899,6 +899,90 @@ def test_shared_table_header_does_not_make_rows_numeric_duplicates():
 
 
 @pytest.mark.unit
+def test_parallel_coverage_keeps_original_numeric_question_when_subquery_is_shorter(
+    monkeypatch,
+):
+    original_question = (
+        "国电电力2025年上半年实际归母净利润是多少，"
+        "报告预测2025年全年归母净利润是多少？"
+    )
+
+    def chunk(chunk_id, content, *, evidence_type="text"):
+        return {
+            "chunk_id": chunk_id,
+            "doc_id": "doc-1",
+            "docnm_kwd": "国电电力.pdf",
+            "evidence_type_kwd": evidence_type,
+            "content_with_weight": content,
+        }
+
+    figure = chunk(
+        "approximate-figure",
+        "图3：国电电力归母净利润。视觉模型提取事实（未经人工核验）："
+        "2025年上半年约35亿元。",
+        evidence_type="figure",
+    )
+    actual = chunk(
+        "exact-actual",
+        "2025年上半年公司实际归母净利润36.87亿元。",
+    )
+    forecast = chunk(
+        "exact-forecast",
+        "报告预测2025年全年归母净利润70.50亿元。",
+    )
+    scores = {
+        figure["content_with_weight"]: 0.99,
+        actual["content_with_weight"]: 0.90,
+        forecast["content_with_weight"]: 0.95,
+    }
+
+    class Compatible:
+        def to_dict(self):
+            return {"categories": {}, "conflict_count": 0}
+
+    monkeypatch.setattr(
+        retrieval,
+        "evaluate_constraint_compatibility",
+        lambda *_args, **_kwargs: Compatible(),
+    )
+    monkeypatch.setattr(
+        retrieval,
+        "rerank_similarity",
+        lambda _question, documents: ([scores[text] for text in documents], None),
+    )
+
+    result = retrieval._merge_parallel_subqueries(
+        original_question=original_question,
+        subquery_results=[
+            (
+                QuerySubqueryPlan(
+                    id="actual",
+                    query="国电电力2025年上半年实际归母净利润",
+                ),
+                {"chunks": [figure, actual]},
+            ),
+            (
+                QuerySubqueryPlan(
+                    id="forecast",
+                    query="报告预测2025年全年归母净利润",
+                ),
+                {"chunks": [forecast]},
+            ),
+        ],
+        options=search_v2.Dealer.RetrievalOptions(page_size=2),
+    )
+
+    assert result["retrieval_fusion"]["final_rerank"]["coverage_chunk_ids_by_subquery"] == {
+        "actual": ["exact-actual"],
+        "forecast": ["exact-forecast"],
+    }
+    assert {item["chunk_id"] for item in result["chunks"]} == {
+        "exact-actual",
+        "exact-forecast",
+    }
+
+
+@pytest.mark.unit
 def test_parallel_retrieval_prefers_exact_distinct_metric_evidence(
     monkeypatch,
 ):

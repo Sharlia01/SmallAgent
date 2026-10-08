@@ -6,8 +6,14 @@ import json
 from collections import Counter, defaultdict
 from typing import Any, Iterable
 
+from service.core.retrieval_evaluation import (
+    aggregate_query_metrics,
+    aggregate_retrieval_stages,
+    resolve_metric_ks,
+)
 
-E2E_RESULT_SCHEMA_VERSION = "1.1"
+
+E2E_RESULT_SCHEMA_VERSION = "1.2"
 
 ANSWER_JUDGE_SYSTEM_PROMPT = """
 你是严格的 RAG 答案质量评估器。比较生成答案与参考答案，只评价事实正确性和要求覆盖度，不评价文风。
@@ -342,8 +348,11 @@ def evaluate_sufficiency(
     }
 
 
-def aggregate_e2e_results(results: list[dict[str, Any]]) -> dict[str, Any]:
-    from service.core.retrieval_evaluation import aggregate_query_metrics
+def aggregate_e2e_results(
+    results: list[dict[str, Any]],
+    *,
+    top_k: int = 5,
+) -> dict[str, Any]:
     successful = [result for result in results if not result.get("error")]
     faithfulness_answers = [
         result.get("faithfulness_metrics") or {}
@@ -390,6 +399,7 @@ def aggregate_e2e_results(results: list[dict[str, Any]]) -> dict[str, Any]:
         for item in refusal
     )
     aggregated = {
+        **aggregate_retrieval_stages(results, top_k=top_k),
         "query_metrics": aggregate_query_metrics(results),
         "query_count": len(results),
         "successful_query_count": len(successful),
@@ -504,11 +514,15 @@ def aggregate_e2e_results(results: list[dict[str, Any]]) -> dict[str, Any]:
             ),
         },
     }
-    aggregated["non_perfect_sample_ids"] = _non_perfect_sample_ids(results)
+    aggregated["non_perfect_sample_ids"].update(_non_perfect_sample_ids(results))
     return aggregated
 
 
-def build_e2e_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
+def build_e2e_summary(
+    results: list[dict[str, Any]],
+    *,
+    top_k: int = 5,
+) -> dict[str, Any]:
     by_question_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_split: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for result in results:
@@ -518,6 +532,7 @@ def build_e2e_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
         by_split[str(result.get("split") or "unknown")].append(result)
     return {
         "result_schema_version": E2E_RESULT_SCHEMA_VERSION,
+        "metric_ks": list(resolve_metric_ks(top_k)),
         "question_type_counts": dict(
             sorted(
                 Counter(
@@ -534,13 +549,13 @@ def build_e2e_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
                 ).items()
             )
         ),
-        "overall": aggregate_e2e_results(results),
+        "overall": aggregate_e2e_results(results, top_k=top_k),
         "by_question_type": {
-            name: aggregate_e2e_results(items)
+            name: aggregate_e2e_results(items, top_k=top_k)
             for name, items in sorted(by_question_type.items())
         },
         "by_split": {
-            name: aggregate_e2e_results(items)
+            name: aggregate_e2e_results(items, top_k=top_k)
             for name, items in sorted(by_split.items())
         },
     }

@@ -456,7 +456,8 @@ def _merge_parallel_subqueries(
             key=lambda key: (
                 locator_priority(key),
                 _measurement_compatibility_priority(chunks_by_key[key]),
-                _approximate_figure_penalty(step.query, chunks_by_key[key]),
+                # 子查询可能省略“多少”等措辞，沿用原问题判断图表估值是否降级。
+                _approximate_figure_penalty(original_question, chunks_by_key[key]),
                 subquery_keys.get(step.id, []).index(key),
             ),
         )

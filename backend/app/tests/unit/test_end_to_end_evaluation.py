@@ -6,6 +6,11 @@ from service.core.end_to_end_evaluation import (
     evaluate_refusal,
     evaluate_sufficiency,
 )
+from service.core.retrieval_evaluation import (
+    build_error_case,
+    build_summary,
+    evaluate_retrieval_case,
+)
 
 
 @pytest.mark.unit
@@ -164,3 +169,200 @@ def test_unread_figure_match_is_relevant_but_not_sufficient():
 
     assert result["expected_sufficient"] is False
     assert result["correct"] is True
+
+
+def _sample(identifier, *, evidence_texts=("收入100亿元",), split="dev"):
+    return {
+        "id": identifier,
+        "question": "报告中的业绩是多少？",
+        "answerable": bool(evidence_texts),
+        "question_type": "fact" if evidence_texts else "unanswerable",
+        "relevant_evidence": [
+            {"document_name": "报告.pdf", "text": text}
+            for text in evidence_texts
+        ],
+        "metadata": {"split": split},
+    }
+
+
+def _chunk(identifier="gold", text="收入100亿元"):
+    return {
+        "chunk_id": identifier,
+        "docnm_kwd": "报告.pdf",
+        "content_with_weight": text,
+    }
+
+
+def _score(sample, raw_result, *, top_k=5):
+    return evaluate_retrieval_case(
+        sample, raw_result, latency_ms=10.0, top_k=top_k, match_threshold=1.0,
+    )
+
+
+def _as_e2e_result(case, response_mode="answer"):
+    return {
+        **case,
+        "latency_ms": {"retrieval": case["latency_ms"], "total": 20.0},
+        "response_mode": response_mode,
+        "answer_metrics": {},
+        "faithfulness_metrics": {},
+        "citation_metrics": {},
+        "refusal_metrics": evaluate_refusal(case, response_mode),
+        "sufficiency_metrics": evaluate_sufficiency(case, case),
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("top_k", [5, 10])
+def test_e2e_summary_aggregates_retrieval_scores_and_slices(top_k):
+    partial = _score(
+        _sample("partial", evidence_texts=("收入100亿元", "净利润20亿元")),
+        {
+            "chunks_before_sufficiency": [_chunk()],
+            "chunks": [_chunk()],
+            "evidence_sufficiency": {"source": "model", "sufficient": True},
+        },
+        top_k=top_k,
+    )
+    rejected = _score(
+        {**_sample("rejected", split="test"), "question_type": "paraphrase"},
+        {
+            "chunks_before_sufficiency": [_chunk("noise", "无关信息"), _chunk()],
+            "chunks": [],
+            "evidence_sufficiency": {"source": "model", "sufficient": False},
+        },
+        top_k=top_k,
+    )
+    unanswerable = _score(
+        _sample("unanswerable", evidence_texts=()),
+        {
+            "chunks_before_sufficiency": [],
+            "chunks": [],
+            "evidence_sufficiency": {"source": "rule", "sufficient": False},
+        },
+        top_k=top_k,
+    )
+    failed = build_error_case(
+        _sample("failed", split="test"), error=RuntimeError("retrieval failed"),
+        latency_ms=5.0, top_k=top_k,
+    )
+    cases = [partial, rejected, unanswerable, failed]
+    results = [
+        _as_e2e_result(partial),
+        _as_e2e_result(rejected, "refuse"),
+        _as_e2e_result(unanswerable, "refuse"),
+        _as_e2e_result(failed, "error"),
+    ]
+
+    summary = build_e2e_summary(results, top_k=top_k)
+    overall = summary["overall"]
+    before = overall["retrieval_metrics"]
+    after = overall["post_gate_metrics"]
+    assert summary["result_schema_version"] == "1.2"
+    assert summary["metric_ks"] == [top_k]
+    assert before["query_count"] == 4
+    assert before["evaluated_query_count"] == 3
+    assert before["answerable_query_count"] == 2
+    assert before["unanswerable_query_count"] == 1
+    assert before["error_count"] == 1
+    assert before["error_rate"] == 0.25
+    assert before[f"hit_at_{top_k}"] == 1.0
+    assert before[f"recall_at_{top_k}"] == 0.75
+    assert before[f"mrr_at_{top_k}"] == 0.75
+    assert before[f"precision_at_{top_k}"] == pytest.approx(1 / top_k)
+    assert before[f"duplicate_rate_at_{top_k}"] == 0.0
+    assert before[f"all_requirements_hit_at_{top_k}"] is None
+    assert after[f"hit_at_{top_k}"] == 0.5
+    assert after[f"recall_at_{top_k}"] == 0.25
+    assert after[f"mrr_at_{top_k}"] == 0.5
+    assert after[f"precision_at_{top_k}"] == pytest.approx(1 / (2 * top_k))
+    assert overall["gate_metrics"]["false_rejection_with_sufficient_evidence_count"] == 1
+    assert overall["refusal_metrics"]["over_refusal_count"] == 1
+    assert summary["by_split"]["dev"]["retrieval_metrics"][f"recall_at_{top_k}"] == 0.5
+    assert summary["by_split"]["test"]["retrieval_metrics"][f"recall_at_{top_k}"] == 1.0
+    assert summary["by_question_type"]["paraphrase"]["retrieval_metrics"][f"mrr_at_{top_k}"] == 0.5
+    assert summary["by_question_type"]["unanswerable"]["retrieval_metrics"][f"recall_at_{top_k}"] is None
+    if top_k == 10:
+        assert "recall_at_5" not in before
+        assert "mrr_at_5" not in summary["by_split"]["dev"]["retrieval_metrics"]
+
+    failures = overall["non_perfect_sample_ids"]
+    assert failures["error_rate"] == ["failed"]
+    assert failures["retrieval_metrics"][f"recall_at_{top_k}"] == ["partial"]
+    assert failures["retrieval_metrics"][f"mrr_at_{top_k}"] == ["rejected"]
+    assert failures["post_gate_metrics"][f"mrr_at_{top_k}"] == ["rejected"]
+    assert failures["refusal_metrics"]["over_refusal_rate"] == ["rejected"]
+
+    # Both runners must keep identical denominators, scores and diagnostics.
+    retrieval_summary = build_summary(cases, top_k=top_k)
+    pairs = [(overall, retrieval_summary["overall"])]
+    for axis in ("by_question_type", "by_split"):
+        pairs.extend((values, retrieval_summary[axis][name]) for name, values in summary[axis].items())
+    for e2e, retrieval in pairs:
+        for group in ("retrieval_metrics", "post_gate_metrics", "gate_metrics"):
+            assert e2e[group] == retrieval[group]
+            assert e2e["non_perfect_sample_ids"][group] == retrieval["non_perfect_sample_ids"][group]
+
+
+@pytest.mark.unit
+def test_e2e_summary_keeps_missing_stage_data_unavailable():
+    legacy = _as_e2e_result(_score(_sample("legacy"), {"chunks": [_chunk()]}))
+    no_retrieval = _as_e2e_result(_score(_sample("no-retrieval"), {}))
+    for key in ("retrieval", "retrieval_metrics", "post_gate_metrics", "gate_metrics"):
+        no_retrieval.pop(key)
+
+    overall = aggregate_e2e_results([legacy, no_retrieval])
+    before = overall["retrieval_metrics"]
+    after = overall["post_gate_metrics"]
+    assert before["evaluated_query_count"] == 0
+    assert before["unavailable_query_count"] == 2
+    assert before["recall_at_5"] is None
+    assert before["mrr_at_5"] is None
+    assert after["evaluated_query_count"] == 1
+    assert after["unavailable_query_count"] == 1
+    assert after["recall_at_5"] == 1.0
+    assert overall["non_perfect_sample_ids"]["retrieval_metrics"]["recall_at_5"] == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cohort", ["empty", "unanswerable", "error"])
+def test_e2e_summary_without_scored_answerable_queries_has_null_metrics(cohort):
+    results = []
+    if cohort == "unanswerable":
+        results.append(_as_e2e_result(_score(
+            _sample("unanswerable", evidence_texts=()),
+            {"chunks_before_sufficiency": [], "chunks": []},
+        ), "refuse"))
+    elif cohort == "error":
+        results.append(_as_e2e_result(build_error_case(
+            _sample("failed"), error=RuntimeError("failed"), latency_ms=10, top_k=5,
+        ), "error"))
+    overall = build_e2e_summary(results)["overall"]
+    for group in ("retrieval_metrics", "post_gate_metrics"):
+        assert overall[group]["answerable_query_count"] == 0
+        assert overall[group]["error_count"] == int(cohort == "error")
+        for metric in ("recall", "mrr", "hit", "precision", "all_requirements_hit"):
+            assert overall[group][f"{metric}_at_5"] is None
+
+
+@pytest.mark.unit
+def test_e2e_summary_preserves_multi_evidence_completion_rank():
+    sample = _sample("multi", evidence_texts=("收入100亿元", "净利润20亿元"))
+    sample["question_type"] = "parallel_multi_evidence"
+    sample["evidence_requirements"] = [
+        {"id": f"r{i}", "alternatives": [[{"type": "text", **evidence}]]}
+        for i, evidence in enumerate(sample["relevant_evidence"])
+    ]
+    chunks = [_chunk(), _chunk("noise", "无关信息"), _chunk("profit", "净利润20亿元")]
+    result = _as_e2e_result(_score(sample, {
+        "chunks_before_sufficiency": chunks,
+        "chunks": chunks,
+        "evidence_sufficiency": {"source": "model", "sufficient": True},
+    }))
+    summary = build_e2e_summary([result])
+    for group in ("retrieval_metrics", "post_gate_metrics"):
+        metrics = summary["overall"][group]
+        assert metrics["recall_at_5"] == 1.0
+        assert metrics["hit_at_5"] == 1.0
+        assert metrics["all_requirements_hit_at_5"] == 1.0
+        assert metrics["mrr_at_5"] == pytest.approx(1 / 3, abs=1e-6)

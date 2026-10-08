@@ -4,16 +4,42 @@
 
 ## 当前数据集
 
-默认使用 `data/power_reports_eval_v2.jsonl`。它基于 `backend/国电电力.pdf` 和
-`backend/润本股份.pdf` 逐页核对制作，共 36 条，并按用途隔离：
+多报告评测集现拆为两个独立 JSONL 文件，基于 `backend/pdf/国电电力.pdf` 和
+`backend/pdf/润本股份.pdf` 制作，`dataset_version` 为 `power-reports-v2.1-split-50`，
+结构版本仍为 `2.0`。检索和端到端评测入口均默认使用 dev 文件：
 
-- `dev` 8 条：允许用于提示词、检索参数和充分性阈值调试。
-- `test` 16 条：以未在 `dev` 中出现的润本股份问题为主，用于常规回归。
-- `challenge` 12 条：6 条跨文档比较题和 6 条高混淆不可回答题，用于压力测试。
+| 文件 | 用途 | 题数 | 可回答 / 不可回答 |
+| --- | --- | --- | --- |
+| `data/power_reports_eval_v2_dev.jsonl` | 国电电力问题，用于提示词、检索参数和充分性阈值调试 | 50 | 42 / 8 |
+| `data/power_reports_eval_v2_test.jsonl` | 润本股份及跨报告比较问题，用于参数冻结后的回归 | 50 | 39 / 11 |
 
-题型覆盖 9 条单事实题、11 条并行多证据题、3 条递进式多跳题、2 条口语改写题和
-11 条不可回答题；来源覆盖正文与表格。不可回答题包含时间错位、近邻指标替换、
-缺失拆分、实时数据、反事实敏感性和跨文档缺失信息，不只是与主题无关的问题。
+| 题型 | dev | test |
+| --- | --- | --- |
+| `fact` | 22 | 16 |
+| `parallel_multi_evidence` | 10 | 14 |
+| `sequential_multi_hop` | 4 | 4 |
+| `paraphrase` | 6 | 5 |
+| `unanswerable` | 8 | 11 |
+
+原混合集 `power_reports_eval_v2.jsonl` 已由上述两个文件替代。原 dev 8 题保留在
+dev，原 test 16 题和 challenge 12 题保留在 test；另新增 dev 42 题、test 22 题。
+原 challenge 样本 ID 增加 `test-` 前缀，并保留 `metadata.original_id`、
+`metadata.original_split=challenge` 和 `challenge` 标签，便于追溯历史压力测试题。
+两个原本依赖上下文的 dev 问题补齐了公司或年份，其余原题保留。
+
+每个文件只包含同名的 `metadata.split`，100 个问题与样本 ID 均不重复。
+这是问题级划分：test 的跨报告题与 dev 共用部分国电电力事实，并非文档或事实完全
+隔离的未见测试集；与历史国电电力专项集也存在主题交集。不要将已用于调参的问题
+当作未见测试题。题目覆盖正文、表格、单位换算、跨片段计算及桥接检索；不可回答题
+覆盖时间错位、近邻指标替换、缺失拆分、实时数据和反事实敏感性。
+
+文件可直接编辑；改题时应同步维护答案、证据、claim、划分及版本号。分别校验：
+
+```bash
+cd backend
+python evals/run_retrieval_eval.py --dataset evals/data/power_reports_eval_v2_dev.jsonl --validate-only
+python evals/run_retrieval_eval.py --dataset evals/data/power_reports_eval_v2_test.jsonl --validate-only
+```
 
 `data/guodian_power_eval_v1.jsonl` 是兼容保留的首版单文档基线，共 28 条：
 
@@ -125,17 +151,19 @@ docker compose exec LS_api \
   --validate-only
 ```
 
-只校验某个数据划分：
+校验独立的 test 评测集：
 
 ```bash
 docker compose exec LS_api \
   python /app/evals/run_retrieval_eval.py \
+  --dataset /app/evals/data/power_reports_eval_v2_test.jsonl \
   --validate-only \
   --split test
 ```
 
 运行 v2 前，目标用户知识库必须同时包含 `国电电力.pdf` 和 `润本股份.pdf`，且文件名
-保持不变。`--split` 可重复，也可写成逗号分隔，例如 `--split test,challenge`。
+保持不变。使用 `--dataset` 切换 dev/test 文件；`--split` 只在所选文件内部筛选，
+不会自动切换文件。对仍包含多个划分的国电专项集，`--split` 可重复或用逗号分隔。
 
 当前系统把登录用户的数字 ID 作为知识库 Elasticsearch 索引名。正式运行前，可从 PostgreSQL 查询用户 ID：
 
@@ -169,6 +197,7 @@ docker compose exec LS_api \
   --vector-weight 0.6 \
   --final-reranker-weight 0.7 \
   --final-rrf-k 10 \
+  --dataset /app/evals/data/power_reports_eval_v2_test.jsonl \
   --split test \
   --run-name retrieval_baseline
 ```
@@ -305,13 +334,15 @@ Hit、Recall、MRR、空结果率、旧拒答率和旧 fallback 率。新结果�
 docker compose exec LS_api \
   python /app/evals/run_e2e_eval.py \
   --index-name <用户ID> \
+  --dataset /app/evals/data/power_reports_eval_v2_test.jsonl \
   --split test \
   --run-name e2e_test_v2
 ```
 
-调参时只跑 `--split dev`；参数冻结后再跑 `--split test`，最后单独跑
-`--split challenge`。不要根据 test/challenge 失败案例继续调参后仍沿用同一版数据集，
-否则需要提升 `dataset_version` 并重新留出未见测试题。
+调参时使用默认 dev 文件；参数冻结后通过 `--dataset` 显式选择 test 文件。
+多报告集不再有独立的 `challenge` 划分，原压力题已包含在 test 的 50 题中。
+不要根据 test 失败案例继续调参后仍将其视为未见评测；需要提升 `dataset_version`
+并重新留出未见测试题。
 
 默认使用 `CHAT_MODEL` 生成答案，使用 `E2E_JUDGE_MODEL` 判断答案正确性、
 Faithfulness，以及逐条 claim 与引用证据的蕴含关系。可通过 `--answer-model`、
@@ -350,7 +381,28 @@ faithfulness_score = 被全部最终证据支持的事实主张数 / 事实主�
 `non_perfect_sample_ids.refusal_metrics.refusal_recall` 和
 `non_perfect_sample_ids.sufficiency_metrics.accuracy`。危险作答、过度拒答、危险放行和
 错误拒绝等反向指标以 `0` 为理想值。
-端到端结果结构版本已更新为 `1.1`。
+端到端结果结构版本已更新为 `1.2`。
+
+端到端汇总文件现在同时包含整体检索指标，无需再单独运行检索评测。以
+`--top-k 5` 为例，查看以下路径：
+
+- `metrics.overall.retrieval_metrics.recall_at_5`：充分性检查前的平均召回率。
+- `metrics.overall.retrieval_metrics.mrr_at_5`：充分性检查前的平均倒数排名。
+- 同组的 `hit_at_5`、`precision_at_5`、`all_requirements_hit_at_5` 和
+  `duplicate_rate_at_5`：命中率、精确率、多证据完整命中率和重复率。
+- `metrics.overall.post_gate_metrics`：充分性检查后交给回答模型的证据指标。
+- `metrics.overall.gate_metrics`：放行、拒绝、检查失败及拒绝原因归因统计。
+
+`metrics.by_question_type` 和 `metrics.by_split` 中也包含这三组统计。
+`non_perfect_sample_ids` 同步提供检索指标对应的未达标样本 ID，原有答案、引用和
+拒答指标及其样本列表继续保留。运行结束后终端也会打印整体统计。
+
+统计口径与检索 runner 共用：Hit/Recall/Precision/MRR 只对成功且该阶段数据可用的
+可回答题做宏平均；不可回答题、执行异常和缺失阶段数据不补成零分。检索指标组包含
+`evaluated_query_count`、`unavailable_query_count`、`error_count` 等计数；无可用分母
+时指标为 `null`。多证据题的 MRR 仍按全部要求被满足时的排名计算。
+K 跟随实际 `--top-k`，例如 `--top-k 10` 只输出 `@10`。这些检索统计不依赖 judge，
+使用 `--no-judge` 时仍然输出；历史结果文件不会被自动改写。
 
 证据不充分时，runner 与线上知识库工具共用确定性拒答策略，不调用回答模型。
 数据集可选字段 `expected_behavior` 可显式取 `answer`、`refuse` 或 `clarify`；`conversation_history` 可提供 user/assistant 历史消息。省略行为时从
@@ -369,6 +421,7 @@ faithfulness_score = 被全部最终证据支持的事实主张数 / 事实主�
 
 ```bash
 docker compose exec LS_api python /app/evals/run_e2e_eval.py \
+  --dataset /app/evals/data/power_reports_eval_v2_dev.jsonl \
   --execution-mode agent --index-name <用户ID> --split dev --run-name agent_dev_v3
 ```
 

@@ -21,7 +21,7 @@ APP_DIRECTORY = BACKEND_DIRECTORY / "app"
 if not (APP_DIRECTORY / "service").is_dir():
     # Compose mounts application packages directly under /app.
     APP_DIRECTORY = BACKEND_DIRECTORY
-DEFAULT_DATASET = SCRIPT_DIRECTORY / "data" / "power_reports_eval_v2.jsonl"
+DEFAULT_DATASET = SCRIPT_DIRECTORY / "data" / "power_reports_eval_v2_dev.jsonl"
 DEFAULT_OUTPUT_DIRECTORY = SCRIPT_DIRECTORY / "results"
 
 if str(APP_DIRECTORY) not in sys.path:
@@ -489,7 +489,7 @@ def main() -> int:
             **retrieval_options,
         },
         "result_file": str(result_path),
-        "metrics": build_e2e_summary(results),
+        "metrics": build_e2e_summary(results, top_k=args.top_k),
     }
     write_outputs(result_path, summary_path, results, summary)
     print(f"Results: {result_path}")

@@ -1444,7 +1444,7 @@ def _aggregate_stage_metrics(
 
     available = [
         result for result in successful
-        if isinstance(result["retrieval"].get(empty_key), bool)
+        if isinstance(result.get("retrieval", {}).get(empty_key), bool)
         and stage_metrics(result) is not None
     ]
     answerable = [result for result in available if result.get("answerable")]
@@ -1687,36 +1687,19 @@ def aggregate_query_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def aggregate_results(
+def aggregate_retrieval_stages(
     results: list[dict[str, Any]],
     *,
     top_k: int,
     metric_ks: Iterable[int] | None = None,
 ) -> dict[str, Any]:
-    """Aggregate run statistics and the three explicit metric stages."""
-    resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
-    successful = [result for result in results if not result.get("error")]
-    answerable = [result for result in successful if result.get("answerable")]
-    unanswerable = [
-        result for result in successful if not result.get("answerable")
-    ]
-    error_count = len(results) - len(successful)
-    latencies = [float(result["latency_ms"]) for result in successful]
+    """Share retrieval/gate summaries across retrieval and E2E result rows.
 
+    This reads stored per-query scores, without depending on the runner's
+    latency format or recomputing retrieval. Missing stage data stays unavailable.
+    """
+    resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
     aggregated = {
-        "query_count": len(results),
-        "successful_query_count": len(successful),
-        "error_count": error_count,
-        "error_rate": _rate(error_count, len(results)),
-        "answerable_query_count": len(answerable),
-        "unanswerable_query_count": len(unanswerable),
-        "latency_sample_count": len(latencies),
-        "average_latency_ms": _mean(latencies),
-        "latency_p50_ms": _percentile(latencies, 0.5),
-        "latency_p95_ms": _percentile(latencies, 0.95),
-        "latency_p99_ms": _percentile(latencies, 0.99),
-        "stage_latency_ms": _aggregate_stage_latencies(results),
-        "query_metrics": aggregate_query_metrics(results),
         "retrieval_metrics": _aggregate_stage_metrics(
             results,
             top_k=top_k,
@@ -1752,6 +1735,42 @@ def aggregate_results(
         "post_gate_metrics": post_gate_failures,
     }
     return aggregated
+
+
+def aggregate_results(
+    results: list[dict[str, Any]],
+    *,
+    top_k: int,
+    metric_ks: Iterable[int] | None = None,
+) -> dict[str, Any]:
+    """Aggregate run statistics and the three explicit metric stages."""
+    successful = [result for result in results if not result.get("error")]
+    answerable = [result for result in successful if result.get("answerable")]
+    unanswerable = [
+        result for result in successful if not result.get("answerable")
+    ]
+    error_count = len(results) - len(successful)
+    latencies = [float(result["latency_ms"]) for result in successful]
+    return {
+        "query_count": len(results),
+        "successful_query_count": len(successful),
+        "error_count": error_count,
+        "error_rate": _rate(error_count, len(results)),
+        "answerable_query_count": len(answerable),
+        "unanswerable_query_count": len(unanswerable),
+        "latency_sample_count": len(latencies),
+        "average_latency_ms": _mean(latencies),
+        "latency_p50_ms": _percentile(latencies, 0.5),
+        "latency_p95_ms": _percentile(latencies, 0.95),
+        "latency_p99_ms": _percentile(latencies, 0.99),
+        "stage_latency_ms": _aggregate_stage_latencies(results),
+        "query_metrics": aggregate_query_metrics(results),
+        **aggregate_retrieval_stages(
+            results,
+            top_k=top_k,
+            metric_ks=metric_ks,
+        ),
+    }
 
 
 def build_summary(

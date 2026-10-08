@@ -237,14 +237,34 @@ def bounded_query(function):
                 # Preserve the trace before the request-local context is reset.
                 error.query_runtime = runtime.snapshot()
                 raise
-            reason = ("clarification_required" if result.get("response_mode") == "clarify" else
-                      "budget_exhausted" if result.get("budget_exhausted") else
-                      "verification_unavailable" if (result.get("evidence_sufficiency") or {}).get("verification_status") == "unavailable" else
-                      "evidence_insufficient" if (result.get("evidence_sufficiency") or {}).get("sufficient") is False else
-                      "evidence_returned" if result.get("chunks") else "empty_results")
+            if isinstance(result, dict):
+                response_mode = result.get("response_mode")
+                budget_exhausted = result.get("budget_exhausted")
+                sufficiency = result.get("evidence_sufficiency") or {}
+                evidence = result.get("chunks")
+            else:
+                response_mode = getattr(result, "response_mode", None)
+                if getattr(result, "stop_reason", None) == "clarification_required":
+                    response_mode = "clarify"
+                budget_exhausted = getattr(result, "budget_exhausted", False)
+                sufficiency = getattr(result, "evidence_sufficiency", None) or {}
+                evidence = getattr(result, "retrieved_content", None)
+                if evidence is None:
+                    evidence = any(
+                        getattr(tool_result, "sources", None)
+                        for tool_result in getattr(result, "tool_results", ())
+                    )
+            reason = ("clarification_required" if response_mode == "clarify" else
+                      "budget_exhausted" if budget_exhausted else
+                      "verification_unavailable" if sufficiency.get("verification_status") == "unavailable" else
+                      "evidence_insufficient" if sufficiency.get("sufficient") is False else
+                      "evidence_returned" if evidence else "empty_results")
             record_observation("query_pipeline", "pipeline", "completed", end_reason=reason,
                                duration_ms=round((time.monotonic() - started) * 1000, 3))
-            result["query_runtime"] = runtime.snapshot()
+            if isinstance(result, dict):
+                result["query_runtime"] = runtime.snapshot()
+            elif hasattr(result, "query_runtime"):
+                result.query_runtime = runtime.snapshot()
             return result
     return wrapped
 

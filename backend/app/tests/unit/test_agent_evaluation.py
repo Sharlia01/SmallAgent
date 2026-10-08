@@ -59,8 +59,11 @@ def test_agent_eval_keeps_user_contract_when_planner_drops_conditions():
     assert observed[0][2].user_question == question
     assert observed[0][2].history == (("user", "请看报告"),)
     assert result.answer == "答案。##1$$"
+    assert len(observed) == 1
+    assert len(planner.calls) == 1
     assert result.raw_retrieval["agent_execution"]["stop_reason"] == "evidence_ready"
     assert result.raw_retrieval["query_runtime"]["counts"]["model"] == 1
+    assert all(event["status"] != "error" for event in result.raw_retrieval["query_runtime"]["events"])
     assert result.raw_retrieval["evidence_sufficiency"]["sufficient"] is True
 
 

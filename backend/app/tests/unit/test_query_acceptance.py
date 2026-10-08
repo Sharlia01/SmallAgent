@@ -68,7 +68,11 @@ FIGURE_GOALS = [
 ]
 
 
-@pytest.mark.parametrize("filename", ["guodian_power_eval_v2.jsonl", "power_reports_eval_v2.jsonl"])
+@pytest.mark.parametrize("filename", [
+    "guodian_power_eval_v2.jsonl",
+    "power_reports_eval_v2_dev.jsonl",
+    "power_reports_eval_v2_test.jsonl",
+])
 def test_every_benchmark_question_preserves_itself(filename):
     dataset = Path(__file__).resolve().parents[3] / "evals" / "data" / filename
     rows = [json.loads(line) for line in dataset.read_text().splitlines()]
