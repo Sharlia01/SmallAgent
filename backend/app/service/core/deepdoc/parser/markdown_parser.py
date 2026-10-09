@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2025 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +23,7 @@ class RAGFlowMarkdownParser:
         self.chunk_token_num = int(chunk_token_num)
 
     def extract_tables_and_remainder(self, markdown_text):
-        # Standard Markdown table
+        # 标准 Markdown 表格。
         table_pattern = re.compile(
             r'''
             (?:\n|^)                     
@@ -33,7 +34,7 @@ class RAGFlowMarkdownParser:
         tables = table_pattern.findall(markdown_text)
         remainder = table_pattern.sub('', markdown_text)
 
-        # Borderless Markdown table
+        # 无外边框的 Markdown 表格。
         no_border_table_pattern = re.compile(
             r'''
             (?:\n|^)                 

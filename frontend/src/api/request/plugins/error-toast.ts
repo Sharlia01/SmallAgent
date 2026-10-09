@@ -3,19 +3,19 @@ import { ResponseError } from '../error'
 import { IRequestPlugin } from './plugin'
 
 const NETWORK_ERROR_MAP = {
-  // '400': 'Bad Request',
-  // '401': 'Unauthorized, please login again',
-  // '403': 'Access Denied',
-  // '404': 'Request Error, Resource Not Found',
-  // '405': 'Method Not Allowed',
-  // '408': 'Request Timeout',
+  // '400': '请求参数错误',
+  // '401': '尚未授权，请重新登录',
+  // '403': '拒绝访问',
+  // '404': '请求的资源不存在',
+  // '405': '不支持此请求方法',
+  // '408': '请求超时',
   429: '请求过于频繁，请稍后再试',
-  // '500': 'Internal Server Error',
-  // '501': 'Not Implemented',
-  // '502': 'Network Error',
-  // '503': 'Service Unavailable',
-  // '504': 'Network Timeout',
-  // '505': 'HTTP Version Not Supported',
+  // '500': '服务器内部错误',
+  // '501': '服务尚未实现此功能',
+  // '502': '网关响应异常',
+  // '503': '服务暂时不可用',
+  // '504': '网关请求超时',
+  // '505': '不支持此 HTTP 协议版本',
 }
 
 export const errorToastPlugin: IRequestPlugin = {

@@ -36,18 +36,15 @@ def create_token(user_id: int, user_name: str, salting: str = ""):
 
 
 def authenticate(username: str, password: str) -> str:
-    """
-    认证用户
-    
-    Args:
-        username (str): 用户名
-        password (str): 明文密码
-    
-    Returns:
-        str: 认证成功返回token，失败返回None
-    
-    Raises:
-        AuthError: 认证失败时抛出
+    """认证用户。
+
+    参数：
+        username（str）：用户名。
+        password（str）：明文密码。
+    返回：
+        认证成功时返回令牌，失败时返回 None。
+    异常：
+        AuthError：认证失败。
     """
     db = next(get_db())
     try:
@@ -71,15 +68,13 @@ def authenticate(username: str, password: str) -> str:
         db.close()
 
 def register_user(username: str, password: str):
-    """
-    注册新用户
-    
-    Args:
-        username (str): 用户名
-        password (str): 明文密码
-    
-    Raises:
-        AuthError: 如果用户名已存在或注册失败
+    """注册新用户。
+
+    参数：
+        username（str）：用户名。
+        password（str）：明文密码。
+    异常：
+        AuthError：用户名已存在或注册失败。
     """
     from utils.password import hash_password
     

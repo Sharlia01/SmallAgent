@@ -7,11 +7,9 @@ def get_logger():
 
     LOG_LEVEL = os.environ.get('LOG_LEVEL', 'DEFAULT')
 
-    #########################
-    ## color logger define ##
-    #########################
+    # 定义彩色日志格式。
 
-    # Handler for logging
+    # 日志处理器。
     handler = colorlog.StreamHandler()
     formatter = colorlog.ColoredFormatter(
         "%(log_color)s%(asctime)s.%(msecs)03d - %(levelname)s - [%(funcName)s] - %(message)s",
@@ -26,14 +24,14 @@ def get_logger():
     )
     handler.setFormatter(formatter)
 
-    # Logger instance
+    # 日志记录器实例。
     logger = colorlog.getLogger(__name__)
     if not logger.handlers:
         logger.addHandler(handler)
 
     logger.propagate = False
 
-    # Logger level
+    # 日志输出级别。
     LOG_LEVEL_OPTION = {
         'DEBUG': logging.DEBUG,
         'INFO': logging.INFO,

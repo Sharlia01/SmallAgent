@@ -1,4 +1,4 @@
-"""Parse and evaluate inline citations emitted by the answer model."""
+"""解析并评估回答模型输出的行内引用。"""
 
 from __future__ import annotations
 
@@ -48,11 +48,10 @@ def parse_citation_ids(answer: str) -> list[int]:
 
 
 def parse_answer_claims(answer: str) -> list[dict[str, Any]]:
-    """Split an answer into bounded sentence-like units with citation IDs."""
+    """将回答拆分为长度受限、带引用编号的句子片段。"""
     claims: list[dict[str, Any]] = []
-    # Models commonly put a citation immediately after sentence punctuation.
-    # Move that marker before the punctuation so it stays with the claim it
-    # supports when the sentence is split.
+    # 模型常在句末标点后添加引用；拆句前将引用移至标点前，
+    # 确保引用仍与其支持的事实陈述属于同一片段。
     normalized_answer = TRAILING_CITATIONS_PATTERN.sub(r"\2\1", answer or "")
     for segment in CLAIM_SPLIT_PATTERN.split(normalized_answer):
         raw = segment.strip()
@@ -182,7 +181,7 @@ def evaluate_citations(
     judge_timeout: float = 20.0,
     classified_claims: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Return structural citation metrics plus optional claim entailment."""
+    """返回引用结构指标，并可选检查引用是否支持对应事实。"""
     citation_ids = parse_citation_ids(answer)
     valid_ids = [value for value in citation_ids if 1 <= value <= len(documents)]
     invalid_ids = [value for value in citation_ids if value not in valid_ids]

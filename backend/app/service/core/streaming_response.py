@@ -1,4 +1,4 @@
-"""Provider-neutral helpers for consuming OpenAI-compatible answer streams."""
+"""读取 OpenAI 兼容回答流的辅助函数，不依赖具体提供方。"""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any, Iterable
 
 @dataclass(frozen=True)
 class CollectedAnswer:
-    """Complete text reconstructed from a streamed model response."""
+    """从模型响应流重建的完整文本。"""
 
     answer: str
     thinking: str
@@ -16,7 +16,7 @@ class CollectedAnswer:
 
 
 def read_stream_chunk(chunk: Any) -> tuple[Any, str, str]:
-    """Extract finish state, answer text and reasoning text from one chunk."""
+    """从单个响应片段提取结束状态、回答文本及推理文本。"""
     choices = getattr(chunk, "choices", None) or []
     if not choices:
         return None, "", ""
@@ -32,7 +32,7 @@ def read_stream_chunk(chunk: Any) -> tuple[Any, str, str]:
 
 
 def collect_answer_stream(stream: Iterable[Any]) -> CollectedAnswer:
-    """Consume the same streaming response used by chat without SSE or storage."""
+    """读取与聊天相同的回答流，不生成 SSE 事件或写入存储。"""
     answer_parts: list[str] = []
     thinking_parts: list[str] = []
     chunk_count = 0

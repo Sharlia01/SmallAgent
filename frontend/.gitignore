@@ -1,4 +1,4 @@
-# Logs
+# 日志文件。
 logs
 *.log
 npm-debug.log*
@@ -12,7 +12,7 @@ dist
 dist-ssr
 *.local
 
-# Editor directories and files
+# 编辑器目录和配置文件。
 .vscode/*
 !.vscode/extensions.json
 .idea

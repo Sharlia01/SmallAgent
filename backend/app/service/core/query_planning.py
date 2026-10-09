@@ -1,4 +1,4 @@
-"""Layers 2 and 3: route an analyzed query, then build its retrieval plan."""
+"""第二、三层：先按查询分析结果选择路由，再构建检索计划。"""
 
 from __future__ import annotations
 
@@ -129,7 +129,7 @@ SEQUENTIAL_PLAN_SYSTEM_PROMPT = """
 
 @dataclass(frozen=True)
 class QuerySubqueryPlan:
-    """One executable step in a bounded retrieval plan."""
+    """有界检索计划中的一个可执行步骤。"""
 
     id: str
     query: str = ""
@@ -144,7 +144,7 @@ class QuerySubqueryPlan:
 
 @dataclass(frozen=True)
 class RetrievalRoute:
-    """Layer-2 decision derived only from query-analysis signals."""
+    """仅根据查询分析信号生成的第二层路由决策。"""
 
     mode: RetrievalMode
     reason: str
@@ -156,7 +156,7 @@ class RetrievalRoute:
 
 @dataclass(frozen=True)
 class RetrievalPlan:
-    """Layer-3 executable plan; single retrieval has no subqueries."""
+    """第三层可执行计划；单次检索不包含子查询。"""
 
     mode: RetrievalMode
     subqueries: list[QuerySubqueryPlan] = field(default_factory=list)
@@ -169,7 +169,7 @@ class RetrievalPlan:
 
 @dataclass(frozen=True)
 class PreparedRetrievalRequest:
-    """The three pre-execution layers retained for diagnostics."""
+    """保存执行前的三层结果，供诊断使用。"""
 
     analysis: QueryAnalysis
     route: RetrievalRoute
@@ -177,7 +177,7 @@ class PreparedRetrievalRequest:
 
 
 def select_retrieval_route(analysis: QueryAnalysis) -> RetrievalRoute:
-    """Choose a retrieval method without creating any subqueries."""
+    """选择检索方式，不在此创建子查询。"""
 
     if analysis.intent in {"ambiguous_query", "invalid_query"}:
         return RetrievalRoute(mode="clarify", reason=analysis.clarification or "请补充明确的查询对象和条件。", source="analysis")
@@ -355,9 +355,8 @@ def _validate_parallel_subquery_drift(
                                    f"parallel subqueries invented exact constraints: {drifted_steps}",
                                    field="subqueries[].query", node_id=drifted_steps[0]["subquery_id"])
 
-    # Every applicable shared scope must survive in every independent query.
-    # Goal-bearing plans use locally compiled constraints below. Uniqueness of
-    # a date in a whole request does not establish that it applies to all goals.
+    # 每个独立查询都必须保留适用的共享约束；带目标的计划使用
+    # 下方按目标编译的局部约束。全文只有一个日期不代表它适用于所有目标。
     shared = [] if goals else shared_scope_terms(original_question)
     for step in subqueries:
         if missing_constraints(shared, step.query):
@@ -381,7 +380,7 @@ def _validate_step_bindings(question: str, steps: list[QuerySubqueryPlan]) -> No
 
 
 def validate_dependency_graph(subqueries: list[QuerySubqueryPlan]) -> list[list[QuerySubqueryPlan]]:
-    """Validate all templates and dependencies before any retrieval is run."""
+    """开始检索前校验全部模板和依赖关系。"""
     if not 1 <= len(subqueries) <= MAX_SUBQUERIES:
         raise QueryValidationError("invalid_graph_size", "invalid graph size", field="subqueries")
     by_id = {step.id: step for step in subqueries}
@@ -440,8 +439,8 @@ def _validate_goal_coverage(question: str, steps: list[QuerySubqueryPlan], goals
     _validate_step_bindings(question, steps)
     by_id = {goal.id: goal for goal in goals}
     if not goals:
-        # Compatibility with saved v2 plans: at least guard invented details and
-        # loss across the plan, even when stable goal IDs are unavailable.
+        # 兼容已保存的第二版计划；即使没有稳定目标编号，
+        # 也至少检查新增条件和整个计划中的约束丢失。
         combined = " ".join(step.query or step.query_template for step in steps)
         for step in steps:
             text = re.sub(r"\{[a-z][a-z0-9_]*\}", "", step.query or step.query_template)
@@ -466,9 +465,8 @@ def _validate_goal_coverage(question: str, steps: list[QuerySubqueryPlan], goals
         missing = missing_constraints(constraints, text)
         if (missing and step.output_slot and step.query and re.search(r"排名|排序", text)
                 and all(re.search(r"(?:最高|最低|最多|最少)$", term) for term in missing)):
-            # Retrieving the ranked candidate set is valid, but the bridge
-            # still needs an explicit selection operator. Compile it from the
-            # accepted goal instead of guessing a winning category.
+            # 取回有排名的候选集合本身有效，但桥接仍需明确的选择操作。
+            # 从已接受的目标编译选择条件，不能猜测最终胜出的类别。
             text = " ".join([text, *missing])
             step = replace(step, query=_normalize_plan_text(text, field_name="query"))
             validate_relation_bindings(question, [text])
@@ -564,7 +562,7 @@ def build_retrieval_plan(
     client: Any | None = None,
     goals: tuple[QueryGoal, ...] = (),
 ) -> RetrievalPlan:
-    """Build a plan only after the router has fixed the retrieval mode."""
+    """路由确定检索模式后再构建执行计划。"""
 
     if route.mode in {"single", "clarify"}:
         return RetrievalPlan(mode=route.mode)
@@ -574,8 +572,8 @@ def build_retrieval_plan(
                            end_reason="compiled_candidate_reads", node_count=len(steps))
         return RetrievalPlan(mode="parallel", subqueries=steps, source="rule")
     if route.mode == "parallel" and goals:
-        # Independent validated goals already describe executable searches.
-        # Compile first; ask a second model only when compilation is rejected.
+        # 已校验的独立目标已能描述可执行查询；先进行规则编译，
+        # 只有编译被拒绝时才调用额外模型。
         steps = [QuerySubqueryPlan(id=goal.id, query=" ".join(dict.fromkeys([
             goal.text, *missing_constraints(required_constraint_terms(goal.constraints), goal.text),
         ])), goal_ids=[goal.id]) for goal in goals]
@@ -641,8 +639,8 @@ def build_retrieval_plan(
             type(error).__name__,
             str(error)[:500],
         )
-        # Independent compilation has already been tried before the model.
-        # Repeating the same rejected deterministic plan cannot repair it.
+        # 模型调用前已尝试独立目标编译；
+        # 重复同一份已被拒绝的确定性计划不能修复问题。
         record_observation("query_planning_fallback", "fallback", "applied", source="fallback",
                            end_reason="single_query_fallback", requested_mode=route.mode,
                            selected_mode="single", **failure_details(error))
@@ -661,7 +659,7 @@ def prepare_retrieval_request(
     *,
     client: Any | None = None,
 ) -> PreparedRetrievalRequest:
-    """Coordinate analysis, routing, and planning before execution."""
+    """执行前统一协调分析、路由和规划。"""
 
     analysis = analyze_query_intent(question, client=client)
     record_observation("query_analysis_result", "decision", "selected", source=analysis.source,

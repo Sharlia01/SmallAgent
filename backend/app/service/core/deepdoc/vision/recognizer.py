@@ -1,4 +1,5 @@
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2025 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,16 +33,11 @@ from . import operators
 
 class Recognizer(object):
     def __init__(self, label_list, task_name, model_dir=None):
-        """
-        If you have trouble downloading HuggingFace models, -_^ this might help!!
+        """HuggingFace 模型下载失败时，可尝试配置镜像地址。
 
-        For Linux:
-        export HF_ENDPOINT=https://hf-mirror.com
-
-        For Windows:
-        Good luck
-        ^_-
-
+        Linux 环境示例：
+            export HF_ENDPOINT=https://hf-mirror.com
+        Windows 环境请按相应终端的语法设置同一环境变量。
         """
         if not model_dir:
             model_dir = os.path.join(
@@ -69,17 +65,17 @@ class Recognizer(object):
                 return False
             return False
 
+        # 推理完成后收缩 GPU 内存，参考以下问题讨论：
         # https://github.com/microsoft/onnxruntime/issues/9509#issuecomment-951546580
-        # Shrink GPU memory after execution
         self.run_options = ort.RunOptions()
 
         if cuda_is_available():
             options = ort.SessionOptions()
             options.enable_cpu_mem_arena = False
             cuda_provider_options = {
-                "device_id": 0, # Use specific GPU
-                "gpu_mem_limit": 512 * 1024 * 1024, # Limit gpu memory
-                "arena_extend_strategy": "kNextPowerOfTwo",  # gpu memory allocation strategy
+                "device_id": 0, # 选择指定的 GPU。
+                "gpu_mem_limit": 512 * 1024 * 1024, # 限制 GPU 内存使用量。
+                "arena_extend_strategy": "kNextPowerOfTwo",  # 设置 GPU 内存分配策略。
             }
             self.ort_sess = ort.InferenceSession(
                 model_file_path, options=options,
@@ -99,11 +95,11 @@ class Recognizer(object):
 
     @staticmethod
     def sort_Y_firstly(arr, threashold):
-        # sort using y1 first and then x1
+        # 先按下边界 y1 排序，再按横坐标 x1 排序。
         arr = sorted(arr, key=lambda r: (r["top"], r["x0"]))
         for i in range(len(arr) - 1):
             for j in range(i, -1, -1):
-                # restore the order using th
+                # 根据原始顺序标记 th 恢复阅读顺序。
                 if abs(arr[j + 1]["top"] - arr[j]["top"]) < threashold \
                         and arr[j + 1]["x0"] < arr[j]["x0"]:
                     tmp = deepcopy(arr[j])
@@ -113,11 +109,11 @@ class Recognizer(object):
 
     @staticmethod
     def sort_X_firstly(arr, threashold, copy=True):
-        # sort using y1 first and then x1
+        # 先按下边界 y1 排序，再按横坐标 x1 排序。
         arr = sorted(arr, key=lambda r: (r["x0"], r["top"]))
         for i in range(len(arr) - 1):
             for j in range(i, -1, -1):
-                # restore the order using th
+                # 根据原始顺序标记 th 恢复阅读顺序。
                 if abs(arr[j + 1]["x0"] - arr[j]["x0"]) < threashold \
                         and arr[j + 1]["top"] < arr[j]["top"]:
                     tmp = deepcopy(arr[j]) if copy else arr[j]
@@ -127,12 +123,12 @@ class Recognizer(object):
 
     @staticmethod
     def sort_C_firstly(arr, thr=0):
-        # sort using y1 first and then x1
-        # sorted(arr, key=lambda r: (r["x0"], r["top"]))
+        # 先按下边界 y1 排序，再按横坐标 x1 排序。
+        # 排序写法示例：sorted(arr, key=lambda r: (r["x0"], r["top"]))
         arr = Recognizer.sort_X_firstly(arr, thr)
         for i in range(len(arr) - 1):
             for j in range(i, -1, -1):
-                # restore the order using th
+                # 根据原始顺序标记 th 恢复阅读顺序。
                 if "C" not in arr[j] or "C" not in arr[j + 1]:
                     continue
                 if arr[j + 1]["C"] < arr[j]["C"] \
@@ -149,8 +145,8 @@ class Recognizer(object):
 
     @staticmethod
     def sort_R_firstly(arr, thr=0):
-        # sort using y1 first and then x1
-        # sorted(arr, key=lambda r: (r["top"], r["x0"]))
+        # 先按下边界 y1 排序，再按横坐标 x1 排序。
+        # 排序写法示例：sorted(arr, key=lambda r: (r["top"], r["x0"]))
         arr = Recognizer.sort_Y_firstly(arr, thr)
         for i in range(len(arr) - 1):
             for j in range(i, -1, -1):
@@ -206,8 +202,8 @@ class Recognizer(object):
             index, layout = item
             score = layout.get("score")
             if score is not None:
-                # Detector confidence is the primary signal.  The original
-                # index makes ties deterministic without changing page order.
+                # 优先使用检测置信度；置信度相同时按原始下标确定顺序，
+                # 使结果可复现，并保留页面中的原有顺序。
                 return 1, float(score), -index
             return 0, ocr_covered_area(layout), -index
 
@@ -217,9 +213,9 @@ class Recognizer(object):
             return Recognizer.overlapped_area(a, b) >= thr \
                 or Recognizer.overlapped_area(b, a) >= thr
 
-        # Suppress duplicate layouts globally in descending confidence order.
-        # Page-order greedy cleanup is not transitive: an oversized parent can
-        # remove one real child and then be removed by a higher-scoring sibling.
+        # 按置信度从高到低，全局去除重复版面区域。
+        # 按页面顺序贪心清理不具有传递性：过大的父区域可能先删除真实子区域，
+        # 随后又被置信度更高的相邻区域删除，造成有效结果丢失。
         kept = []
         for index, layout in sorted(enumerate(layouts), key=rank, reverse=True):
             if any(duplicates(layout, kept_layout) for _, kept_layout in kept):
@@ -234,12 +230,13 @@ class Recognizer(object):
         return layouts
 
     def create_inputs(self, imgs, im_info):
-        """generate input for different model type
-        Args:
-            imgs (list(numpy)): list of images (np.ndarray)
-            im_info (list(dict)): list of image info
-        Returns:
-            inputs (dict): input of model
+        """为不同类型的模型生成输入。
+
+        参数：
+            imgs：图像数组列表。
+            im_info：各图像的信息字典列表。
+        返回：
+            inputs（dict）：模型输入。
         """
         inputs = {}
 
@@ -363,7 +360,7 @@ class Recognizer(object):
                 h, w = img.shape[:2]
                 img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 img = cv2.resize(np.array(img).astype('float32'), (ww, hh))
-                # Scale input pixel values to 0 to 1
+                # 将输入像素值缩放到 0 至 1。
                 img /= 255.0
                 img = img.transpose(2, 0, 1)
                 img = img[np.newaxis, :, :, :].astype(np.float32)
@@ -387,7 +384,7 @@ class Recognizer(object):
             return bb
 
         def xywh2xyxy(x):
-            # [x, y, w, h] to [x1, y1, x2, y2]
+            # 将中心坐标和宽高 [x, y, w, h] 转换为两角坐标 [x1, y1, x2, y2]。
             y = np.copy(x)
             y[:, 0] = x[:, 0] - x[:, 2] / 2
             y[:, 1] = x[:, 1] - x[:, 3] / 2
@@ -396,21 +393,21 @@ class Recognizer(object):
             return y
 
         def compute_iou(box, boxes):
-            # Compute xmin, ymin, xmax, ymax for both boxes
+            # 分别计算两个边界框的 xmin、ymin、xmax 和 ymax。
             xmin = np.maximum(box[0], boxes[:, 0])
             ymin = np.maximum(box[1], boxes[:, 1])
             xmax = np.minimum(box[2], boxes[:, 2])
             ymax = np.minimum(box[3], boxes[:, 3])
 
-            # Compute intersection area
+            # 计算交集面积。
             intersection_area = np.maximum(0, xmax - xmin) * np.maximum(0, ymax - ymin)
 
-            # Compute union area
+            # 计算并集面积。
             box_area = (box[2] - box[0]) * (box[3] - box[1])
             boxes_area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
             union_area = box_area + boxes_area - intersection_area
 
-            # Compute IoU
+            # 计算交并比 IoU。
             iou = intersection_area / union_area
 
             return iou
@@ -420,14 +417,14 @@ class Recognizer(object):
 
             keep_boxes = []
             while sorted_indices.size > 0:
-                # Pick the last box
+                # 选取排序后的最后一个边界框。
                 box_id = sorted_indices[0]
                 keep_boxes.append(box_id)
 
-                # Compute IoU of the picked box with the rest
+                # 计算所选边界框与剩余边界框的交并比。
                 ious = compute_iou(boxes[box_id, :], boxes[sorted_indices[1:], :])
 
-                # Remove boxes with IoU over the threshold
+                # 移除交并比超过阈值的边界框。
                 keep_indices = np.where(ious < iou_threshold)[0]
 
                 # print(keep_indices.shape, sorted_indices.shape)
@@ -436,14 +433,14 @@ class Recognizer(object):
             return keep_boxes
 
         boxes = np.squeeze(boxes).T
-        # Filter out object confidence scores below threshold
+        # 过滤目标置信度低于阈值的结果。
         scores = np.max(boxes[:, 4:], axis=1)
         boxes = boxes[scores > thr, :]
         scores = scores[scores > thr]
         if len(boxes) == 0:
             return []
 
-        # Get the class with the highest confidence
+        # 选择置信度最高的类别。
         class_ids = np.argmax(boxes[:, 4:], axis=1)
         boxes = boxes[:, :4]
         input_shape = np.array([inputs["scale_factor"][0], inputs["scale_factor"][1], inputs["scale_factor"][0], inputs["scale_factor"][1]])

@@ -1,4 +1,4 @@
-"""Layer 1: analyze a RAG question without building a retrieval plan."""
+"""第一层：分析检索增强问题，不在此生成检索计划。"""
 
 from __future__ import annotations
 
@@ -134,7 +134,7 @@ intent 只能取以下值之一：
 
 @dataclass(frozen=True)
 class QueryAnalysis:
-    """Semantic query features consumed by the deterministic router."""
+    """确定性路由使用的查询语义特征。"""
 
     intent: QueryIntentName
     need_rewrite: bool
@@ -298,8 +298,8 @@ def _validate_query_analysis(analysis: QueryAnalysis, question: str) -> QueryAna
             record_observation("query_analysis_normalization", "normalization", "accepted",
                                end_reason="derived_signals_from_validated_goals", changes=changes)
         return replace(analysis, goals=goals, **signals)
-    # Legacy responses without goals cannot use a graph as the source of truth.
-    # A single independent lookup is a valid lookup, not a reason to retry.
+    # 旧响应没有目标列表时，不能以依赖图作为目标依据。
+    # 单个独立查询本身有效，不应因此触发重试。
     if analysis.target_count == 1 and analysis.targets_independent:
         analysis = replace(analysis, targets_independent=False)
     if analysis.has_dependency and analysis.target_count < 2:
@@ -314,16 +314,15 @@ def _parse_query_analysis(content: str, question: str = "") -> QueryAnalysis:
 
 
 def _rule_based_analysis(question: str) -> QueryAnalysis | None:
-    # Fast paths are deliberately abstaining: a local cue is not proof that
-    # the entire request has one goal.
+    # 快捷规则只在明确情形下接受；局部线索不足以证明整个请求只有一个目标。
     multi_facet = bool(COLLOQUIAL_MULTI_FACET_PATTERN.search(question))
     precise_locators = {
         "".join(match.group(0).split()).casefold()
         for match in PRECISE_LOCATOR_PATTERN.finditer(question)
     }
     if UNKNOWN_LOCATOR.search(question) and 2 <= len(precise_locators) <= MAX_GOALS:
-        # The answer is the mapping, so retrieve the candidate objects without
-        # attaching a requested fact to any one of them before evidence exists.
+        # 待求答案本身是对应关系；先取回候选对象，
+        # 在证据出现前不能将所求事实预先绑定给某个候选。
         goal = QueryGoal(id="locator_relation", text=question, source_spans=(question,),
                          candidate_locators=tuple(sorted(precise_locators)))
         return QueryAnalysis(intent="complex_lookup", need_rewrite=False, target_count=1,
@@ -394,7 +393,7 @@ def analyze_query_intent(
     *,
     client: Any | None = None,
 ) -> QueryAnalysis:
-    """Analyze query semantics without selecting a route or making a plan."""
+    """分析查询语义，不选择路由或制定执行计划。"""
 
     normalized_question = question.strip() if isinstance(question, str) else ""
     if not normalized_question:

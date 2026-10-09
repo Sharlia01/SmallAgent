@@ -1,4 +1,4 @@
-"""Knowledge-base retrieval entry points used by chat and offline evaluation."""
+"""聊天与离线评测共用的知识库检索入口。"""
 
 import logging
 import os
@@ -8,13 +8,20 @@ from copy import deepcopy
 from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Any
+from domain.evidence import EvidenceCollection
+from service.core.evidence_adapter import collection_from_records, evidence_from_record
+from service.core.retrieval_result import RetrievalResult, retrieval_result
 from service.core.evidence_metadata import evidence_metadata, ranking_text
+from service.core.entity_retrieval import (
+    resolve_company_constraint, subquery_company_constraint,
+)
 
 from service.core.constraint_compatibility import evaluate_constraint_compatibility, extract_locators
-from service.core.evidence_sufficiency import check_evidence_sufficiency
+from service.core.evidence_verification import verify_evidence
 from service.core.query_expansion import QueryExpansionResult, expand_query
 from service.core.query_intent import QueryAnalysis
-from service.core.query_contract import QueryRequest, resolve_request
+from service.core.query_contract import QueryRequest
+from service.core.query_context import QueryContext, query_context_for
 from service.core.query_execution import execute_graph
 from service.core.query_runtime import (
     bounded_query, current_runtime, run_independent, QueryBudgetExceeded,
@@ -91,7 +98,7 @@ def _parallel_coverage_per_subquery() -> int:
 
 @lru_cache(maxsize=1)
 def get_retrieval_dealer() -> Dealer:
-    """Create the Elasticsearch-backed dealer only when retrieval is used."""
+    """真正执行检索时，才创建基于 Elasticsearch 的检索器。"""
     return Dealer(dataStore=ESConnection())
 
 
@@ -115,13 +122,20 @@ def _prepare_query_transform(
 
 
 class _BudgetedDealer:
-    """Request-local query deduplication and leaf transformation."""
+    """请求内查询去重及末端查询变换。"""
 
-    def __init__(self, dealer, *, transform_nodes=False):
+    def __init__(self, dealer, *, transform_nodes=False, company_constraint=None):
         self.dealer = dealer
         self.transform_nodes = transform_nodes
+        self.company_constraint = company_constraint
 
     def retrieval(self, **kwargs):
+        # 在扩展搜索词之前固定公司。并行、递进和补查都从这里经过。
+        if self.company_constraint is not None:
+            options = kwargs["options"]
+            if options.company_constraint is None:
+                scope = subquery_company_constraint(kwargs["question"], self.company_constraint)
+                kwargs["options"] = replace(options, company_constraint=scope)
         runtime = current_runtime()
         key = ("retrieval", repr(kwargs))
         if runtime is not None:
@@ -214,7 +228,7 @@ def _approximate_figure_penalty(
     question: str,
     chunk: dict[str, Any],
 ) -> int:
-    """Prefer exact prose/table values over approximate visual estimates."""
+    """优先使用正文或表格的精确值，而非图像估算值。"""
     if str(chunk.get("evidence_type_kwd") or "") != "figure":
         return 0
     if not re.search(r"多少|具体数值|精确|分别是", question):
@@ -226,7 +240,7 @@ def _approximate_figure_penalty(
 
 # 不再根据内容判断表格行是否重复，而是优先使用表格id和行号来标识表格行，避免使用表格内容来标识，因为表格内容可能会有重复或相似的情况
 def _primary_table_row_signature(chunk: dict[str, Any]) -> str | None:
-    """Return the identity of the primary table row represented by a chunk."""
+    """返回片段所代表的表格主行标识。"""
 
     # 优先使用表格id和行号来标识表格行，避免使用表格内容来标识，因为表格内容可能会有重复或相似的情况
     table_id = str(chunk.get("table_id_kwd") or "").strip()
@@ -237,13 +251,12 @@ def _primary_table_row_signature(chunk: dict[str, Any]) -> str | None:
         "" if row_index is None else str(row_index).strip()
     )
 
-    # This is the strongest identity: the same row in the same parsed table.
+    # 同一已解析表格中的同一行，是最可靠的证据身份标识。
     if table_id and normalized_row_index:
         return f"table-row:{table_id}:{normalized_row_index}"
 
-    # Older table chunks may not have stable table/row identifiers.  Their
-    # primary cells are still safer than expanded markdown, which can contain
-    # shared headers and neighbouring rows.
+    # 旧表格片段可能没有稳定的表号和行号；优先使用主行单元格，
+    # 避免扩展后的 Markdown 中共享表头和邻近行干扰去重。
     cells = chunk.get("table_cells_kwd")
     if not isinstance(cells, list) or not cells:
         return None
@@ -428,9 +441,8 @@ def _merge_parallel_subqueries(
         ),
     )
 
-    # Reserve membership, not fixed positions, for the strongest results from
-    # every independent facet. A shared chunk counts toward every subquery in
-    # which it appeared, while the common reranker still determines ordering.
+    # 为各独立目标的最佳结果保留入选资格，而非固定排序位置。
+    # 共享片段可同时覆盖它出现过的各子查询，最终顺序仍由共同问题的重排决定。
     per_subquery_quota = min(
         _parallel_coverage_per_subquery(),
         max(1, options.page_size // max(1, len(subquery_results))),
@@ -570,6 +582,7 @@ def _merge_parallel_subqueries(
                 {
                     "subquery_id": step.id,
                     "query": step.query,
+                    "company_constraint": result.get("company_constraint") or {},
                     "retrieval_fusion": result.get("retrieval_fusion") or {},
                     "returned_chunk_count": len(result.get("chunks") or []),
                 }
@@ -689,9 +702,8 @@ def _merge_sequential_hops(
                     hop_metadata
                 )
         hop_keys.append(current_keys)
-        # Keep the validated bridge rather than an unrelated first-hop leader.
-        # Later hops retain their best unique local result, so background
-        # evidence is not lost merely because it scores lower for the full query.
+        # 保留已经核验的桥接证据，避免仅保留无关的第一跳最高分结果。
+        # 后续各跳保留自己的最佳独立结果，防止背景证据因对完整问题得分较低而丢失。
         representative = None
         if hop_number == 1 and 1 <= bridge.source_chunk_index <= len(current_keys):
             representative = current_keys[bridge.source_chunk_index - 1]
@@ -728,8 +740,8 @@ def _merge_sequential_hops(
                 )
             }
         except Exception as error:
-            # Keep both hops if the additional rerank request fails. Only local
-            # ranks, not raw scores from different questions, are comparable.
+            # 额外重排请求失败时，保留两跳证据；
+            # 不同问题的原始分数不能直接比较，只比较各自局部排名。
             ranking_source = "fallback"
             ranking_method = "hop_rank_rrf"
             fallback_reason = f"原问题统一重排失败（{type(error).__name__}）"
@@ -749,8 +761,8 @@ def _merge_sequential_hops(
             str(chunk.get("content_with_weight") or chunk.get("content_ltks") or ""),
             document_name=str(chunk.get("docnm_kwd") or ""),
         ).to_dict()
-        # Per-hop scores and ranks remain in sequential_subqueries. The public
-        # rerank score now refers to the original question, or is unknown on failure.
+        # 各跳分数和排名保留在 sequential_subqueries 中；
+        # 对外重排分数对应原始问题，重排失败时为未知。
         chunk["rerank_score"] = scores_by_key[key] if ranking_source == "model" else None
         chunk["similarity"] = chunk["rerank_score"]
         chunk["final_ranking"] = {
@@ -768,12 +780,12 @@ def _merge_sequential_hops(
             key,
         ),
     )
-    # Coverage determines membership of the first page, never fixed positions.
-    # Sort the selected evidence by the common query's ranking; append the rest
-    # once so later pages cannot repeat a reserved first-page result.
+    # 目标覆盖决定首页入选集合，不决定固定位置。
+    # 入选证据按共同问题的排名排序，剩余结果只追加一次，
+    # 防止后续页面重复出现首页预留结果。
     reserved_keys = set(representative_keys)
     if len(reserved_keys) > options.page_size:
-        reserved_keys = set()  # A one-slot page cannot guarantee two-hop coverage.
+        reserved_keys = set()  # 只有一个结果位置的页面无法保证同时覆盖两跳证据。
     selected_keys = set(reserved_keys)
     for key in ranked_keys:
         if len(selected_keys) >= options.page_size:
@@ -830,6 +842,7 @@ def _merge_sequential_hops(
                     "subquery_id": step.id,
                     "hop": hop_number,
                     "query": query,
+                    "company_constraint": result.get("company_constraint") or {},
                     "retrieval_fusion": result.get("retrieval_fusion") or {},
                     "returned_chunk_count": len(result.get("chunks") or []),
                 }
@@ -986,7 +999,7 @@ def _execute_sequential_retrieval(
 
 
 def _clarification_result(request: QueryRequest, message: str) -> dict[str, Any]:
-    # A clarification is an execution skip, not a failed retrieval attempt.
+    # 需要澄清时跳过执行，不将其记录为检索失败。
     record_observation("plan_execution", "execution", "skipped", mode="clarify",
                        execution_success=None, end_reason="clarification_required")
     return {
@@ -1002,7 +1015,7 @@ def _clarification_result(request: QueryRequest, message: str) -> dict[str, Any]
     }
 
 
-def _build_goal_repair_queries(goals, chunks, question):
+def _build_goal_repair_queries(goals, evidence: EvidenceCollection, question):
     """把缺失目标转成补查词，同时记录每条查询属于哪个目标。"""
     queries = {}
     query_owners = {}
@@ -1012,8 +1025,8 @@ def _build_goal_repair_queries(goals, chunks, question):
         if goal.candidate_locators:
             if present_locators is None:
                 present_locators = set().union(*(
-                    extract_locators(str(chunk.get("locator_kwd") or ""))
-                    for chunk in chunks
+                    extract_locators(item.structure.locator)
+                    for item in evidence
                 ))
             for index, locator in enumerate(goal.candidate_locators):
                 if extract_locators(locator) <= present_locators:
@@ -1030,44 +1043,45 @@ def _build_goal_repair_queries(goals, chunks, question):
     return queries, query_owners
 
 
-def _repair_missing_goals(result, decision, *, question, analysis, dealer, index_names, options):
+def _repair_missing_goals(result, evidence: EvidenceCollection, assessment, *, dealer, index_names, options, context: QueryContext):
     """证据不足时只补查一轮，返回合并后的结果和再次核验的判定。
 
-    result 是已取回的片段，decision 是首次充分性判定，analysis.goals
-    是用户需求清单。此函数更新 result；不负责最终拒答或清空片段。
+    result 保留检索排序所需的原始记录，evidence 是已核验的来源集合。
+    返回更新后的检索记录、完整集合和报告；不负责最终拒答或清空片段。
     """
     # 1. 确认确实需要补查。核验器故障不能解释为“资料里缺少事实”。
-    if decision.sufficient or not analysis.goals:
-        return result, decision
+    question, goals = context.question, context.goals
+    if assessment.sufficient or not goals:
+        return result, evidence, assessment
     if not _environment_flag("RAG_QUERY_REPAIR_ENABLED", True):
-        return result, decision
-    if decision.source in {"fallback", "disabled"}:
-        return result, decision
+        return result, evidence, assessment
+    if assessment.source in {"fallback", "disabled"}:
+        return result, evidence, assessment
 
     # 2. 找出没有被支持的目标。零片段时，所有目标都视为缺失。
     missing_goal_ids = {
         item["goal_id"]
-        for item in decision.goal_coverage
+        for item in assessment.goal_coverage
         if item["status"] != "supported"
     }
-    existing_chunks = result.get("chunks") or []
+    existing_chunks = evidence
     if not existing_chunks:
-        missing_goal_ids = {goal.id for goal in analysis.goals}
+        missing_goal_ids = {goal.id for goal in goals}
     # 依赖目标需要先取得桥接值，不能直接当作独立查询补查。
     repairable_goals = [
-        goal for goal in analysis.goals
+        goal for goal in goals
         if goal.id in missing_goal_ids and not goal.depends_on
     ]
     if not repairable_goals:
-        return result, decision
+        return result, evidence, assessment
 
     # 3. 为每个缺口准备搜索词；一个图表目标可能对应多条候选查询。
     queries, query_owners = _build_goal_repair_queries(
         repairable_goals, existing_chunks, question,
     )
     if not queries:
-        return result, decision
-    existing_chunk_ids = {_chunk_key(chunk) for chunk in existing_chunks}
+        return result, evidence, assessment
+    existing_chunk_ids = {item.id for item in evidence}
 
     # 4. 并发补查。候选数可大于初次 top-k，但受重排候选上限约束。
     repair_page_size = min(options.rerank_candidate_size, max(options.page_size, 10))
@@ -1102,17 +1116,23 @@ def _repair_missing_goals(result, decision, *, question, analysis, dealer, index
         repair_step = QuerySubqueryPlan(
             id=query_id, query=queries[query_id], goal_ids=[query_owners[query_id]],
         )
+        repair_result["chunks"] = _identified_chunks(repair_result.get("chunks") or [])
         successful_repairs.append((repair_step, repair_result))
 
     repaired_chunk_ids = {
-        _chunk_key(chunk)
+        item.id
         for _, repair_result in successful_repairs
-        for chunk in repair_result.get("chunks") or []
+        for item in collection_from_records(repair_result.get("chunks") or [], query=question)
     }
     new_chunk_ids = repaired_chunk_ids - existing_chunk_ids
     repair_diagnostics = {
         "attempted_goal_ids": list(dict.fromkeys(query_owners.values())),
         "queries": queries,
+        "company_constraints": {
+            query_id: repair_result.get("company_constraint") or {}
+            for query_id, repair_result in repair_results.items()
+            if not isinstance(repair_result, Exception)
+        },
         "new_candidate_count": len(new_chunk_ids),
         "failed_goal_ids": list(dict.fromkeys(query_owners[key] for key in failed_query_ids)),
         "failed_query_ids": failed_query_ids,
@@ -1120,7 +1140,7 @@ def _repair_missing_goals(result, decision, *, question, analysis, dealer, index
     }
     result["query_repair"] = repair_diagnostics
     if not new_chunk_ids:
-        return result, decision
+        return result, evidence, assessment
 
     # 6. 保留原有片段，并合并、去重、重排补查结果。合并容量最多 20 条；
     # 后面的表格上下文展开仍可能调整片段内容或数量。
@@ -1135,19 +1155,19 @@ def _repair_missing_goals(result, decision, *, question, analysis, dealer, index
     )
     merged_chunks = expand_table_contexts(merged_result["chunks"], question)
 
+    evidence = collection_from_records(merged_chunks, query=question)
+
     # 7. 用完整问题重新核验全部目标，不只核验本轮补查词；不再递归补查。
-    final_decision = check_evidence_sufficiency(
-        question, merged_chunks, goals=analysis.goals,
-    )
+    final_assessment = verify_evidence(context, evidence)
     result["chunks"] = merged_chunks
     result["chunks_before_sufficiency"] = list(merged_chunks)
     result["total"] = merged_result["total"]
     result["total_before_evidence_sufficiency"] = merged_result["total"]
     result["doc_aggs"] = merged_result["doc_aggs"]
     repair_diagnostics["stop_reason"] = (
-        "goals_satisfied" if final_decision.sufficient else "repair_limit"
+        "goals_satisfied" if final_assessment.sufficient else "repair_limit"
     )
-    return result, final_decision
+    return result, evidence, final_assessment
 
 
 @dataclass(slots=True)
@@ -1158,18 +1178,9 @@ class _PlanResult:
     multi_hop_ms: float | None = None
 
 
-def _resolve_cached_request(question: str, request: QueryRequest | None) -> QueryRequest:
-    """Resolve conversation context once per request-local runtime."""
-    request = request or QueryRequest.from_user(question)
-    runtime = current_runtime()
-    key = ("resolved_request", request)
-    if key not in runtime.cache:
-        runtime.cache[key] = resolve_request(request)
-    return runtime.cache[key]
-
 
 def _prepare_cached_request(question: str):
-    """Reuse query analysis and its executable plan within this request."""
+    """在当前请求内复用查询分析及可执行计划。"""
     runtime = current_runtime()
     key = ("prepared_request", question)
     if key not in runtime.cache:
@@ -1271,7 +1282,7 @@ def _run_single_plan(dealer, index_names, question, keyword_question, options, *
 def _execute_retrieval_plan(
     dealer, index_names, question, keyword_question, route, plan, options,
 ) -> _PlanResult:
-    """Run the requested mode, then use single retrieval if it cannot produce a result."""
+    """执行请求指定的模式，无法取得结果时回退单次检索。"""
     result = None
     attempts = []
     prior_initial_retrieval_ms = 0.0
@@ -1307,7 +1318,7 @@ def _execute_retrieval_plan(
             if stage_latency is not None:
                 multi_hop_ms = stage_latency["multi_hop"]
                 if result is None:
-                    # Preserve work already spent on the first hop before falling back.
+                    # 回退前保留第一跳已经消耗的执行工作和耗时记录。
                     prior_initial_retrieval_ms = stage_latency["initial_retrieval"]
                     prior_rerank_ms = stage_latency["rerank"]
         else:
@@ -1356,67 +1367,63 @@ def _execute_retrieval_plan(
     return _PlanResult(result, prior_initial_retrieval_ms, prior_rerank_ms, multi_hop_ms)
 
 
-def _verify_retrieved_evidence(result, *, question, analysis, dealer, index_names, options):
+def _identified_chunks(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """在检索入口补齐来源标识，展开表格和输出 JSON 沿用同一 ID。"""
+    return [record if record.get("chunk_id") else {**record, "chunk_id": evidence_from_record(record).id}
+            for record in records]
+
+
+def _verify_retrieved_evidence(result, *, dealer, index_names, options, context: QueryContext):
     """统一执行证据门控：首次核验 → 按需补查 → 根据最终判定放行或拒答。
 
-    返回 (result, gate_ms, repair_ms)。gate_ms 只记录首次核验耗时；
+    返回 (result, gate_ms, repair_ms, RetrievalResult)。gate_ms 只记录首次核验耗时；
     repair_ms 包含补查及再次核验。门控前快照用于评测和失败排查。
     """
     # 1. 补齐表格的表头等上下文，再保存快照。拒答时只清空回答用的
     # chunks，仍保留 chunks_before_sufficiency，便于检查检索到了什么。
-    initial_chunks = list(result.get("chunks") or [])
+    question = context.question
+    initial_chunks = _identified_chunks(result.get("chunks") or [])
     verification_chunks = expand_table_contexts(initial_chunks, question)
     result["chunks"] = verification_chunks
     result["chunks_before_sufficiency"] = list(verification_chunks)
     result["total_before_evidence_sufficiency"] = result.get("total", 0)
 
+    evidence = collection_from_records(verification_chunks, query=question)
+
     # 2. 所有检索分支已经合并完毕，此时才检查能否回答完整用户问题。
     gate_started = time.perf_counter()
-    gate_options = {"goals": analysis.goals} if analysis.goals else {}
-    initial_decision = check_evidence_sufficiency(
-        question, verification_chunks, **gate_options,
-    )
+    initial_assessment = verify_evidence(context, evidence)
     record_observation(
         "evidence_gate",
         "decision",
-        "sufficient" if initial_decision.sufficient else "insufficient",
-        source=initial_decision.source,
+        "sufficient" if initial_assessment.sufficient else "insufficient",
+        source=initial_assessment.source,
         end_reason="initial_evidence_check",
-        detail=initial_decision.reason[:500],
+        detail=initial_assessment.reason[:500],
     )
     gate_ms = (time.perf_counter() - gate_started) * 1000
 
     # 3. 补查函数自行判断是否需要执行；已充分或无法安全补查时直接返回。
     # 若实际补查，快照会更新为合并后的证据，并返回再次核验的判定。
     repair_started = time.perf_counter()
-    result, final_decision = _repair_missing_goals(
-        result,
-        initial_decision,
-        question=question,
-        analysis=analysis,
+    result, evidence, final_assessment = _repair_missing_goals(
+        result, evidence, initial_assessment,
         dealer=dealer,
         index_names=index_names,
-        options=options,
+        options=options, context=context,
     )
     repair_ms = (time.perf_counter() - repair_started) * 1000
 
-    # 4. 对外只保存最终判定。仍不足时不把片段交给回答阶段；
-    # 保留核验原因和门控前快照，让上层能解释拒答并进行评测。
-    result["evidence_sufficiency"] = final_decision.to_dict()
-    result["evidence_sufficiency"]["enabled"] = _environment_flag(
-        "RAG_EVIDENCE_SUFFICIENCY_ENABLED", True,
-    )
-    if not final_decision.sufficient:
-        result["total"] = 0
-        result["chunks"] = []
-        result["doc_aggs"] = []
-    return result, gate_ms, repair_ms
+    # 来源集合与服务端报告直接传递，JSON 协议只在输出边界构造。
+    retrieved = RetrievalResult(evidence if final_assessment.sufficient else EvidenceCollection(),
+                               evidence, final_assessment, total_candidates=int(result.get("total") or 0))
+    return result, gate_ms, repair_ms, retrieved
 
 
 def _record_retrieval_latency(
     result, *, pipeline_started, query_transform_ms, execution, gate_ms, repair_ms,
 ):
-    """Keep wall time separate from child work that can overlap under concurrency."""
+    """区分实际经过时间与可并发重叠的子任务耗时。"""
     initial_retrieval_ms = (
         execution.prior_initial_retrieval_ms
         + _stage_latency(result, "initial_retrieval")
@@ -1444,8 +1451,7 @@ def _record_retrieval_latency(
     }
 
 
-@bounded_query
-def retrieve_raw_results(
+def _retrieve_evidence_result(
     index_names: str | list[str],
     question: str,
     *,
@@ -1458,12 +1464,12 @@ def retrieve_raw_results(
     rrf_k: int = DEFAULT_RRF_K,
     final_reranker_weight: float = DEFAULT_FINAL_RERANKER_WEIGHT,
     final_rrf_k: int = DEFAULT_FINAL_RRF_K,
-    request: QueryRequest | None = None,
-) -> dict[str, Any]:
-    """Run the KB query pipeline and return full evidence and diagnostics.
+    context: QueryContext,
+) -> RetrievalResult:
+    """执行知识库查询管线，返回完整证据与诊断信息。
 
-    Chat consumes compact chunks, while offline evaluation also needs the raw
-    rankings, evidence snapshots, plan trace, and stage timings.
+    聊天使用紧凑片段，离线评测还需要原始排名、
+    证据快照、计划轨迹及各阶段耗时。
     """
     pipeline_started = time.perf_counter()
     options = Dealer.RetrievalOptions(
@@ -1480,19 +1486,24 @@ def retrieve_raw_results(
     )
 
     # 1. 解析会话指代并生成计划；需要澄清的问题不进入检索。
-    request = _resolve_cached_request(question, request)
+    request = context.resolve()
     # 进行了指代消解的用户查询，可能和原始问题不同。后续检索和证据充分性检查都使用解析后的查询。
     original_question = request.resolved_question
     if request.clarification:
-        return _clarification_result(request, request.clarification)
+        result = _clarification_result(request, request.clarification)
+        return retrieval_result(context, EvidenceCollection(), EvidenceCollection(), None,
+                                retrieval_diagnostics(result), result["clarification"], total_candidates=0)
 
     query_transform_started = time.perf_counter()
-    prepared_request = _prepare_cached_request(original_question)
+    prepared_request = context.prepared or _prepare_cached_request(original_question)
+    context.prepared = prepared_request
     query_analysis = prepared_request.analysis
     retrieval_route = prepared_request.route
     retrieval_plan = prepared_request.plan
     if retrieval_plan.mode == "clarify":
-        return _clarification_result(request, retrieval_route.reason)
+        result = _clarification_result(request, retrieval_route.reason)
+        return retrieval_result(context, EvidenceCollection(), EvidenceCollection(), None,
+                                retrieval_diagnostics(result), result["clarification"], total_candidates=0)
 
     if query_analysis.goals:
         options = replace(options, page_size=min(20, max(page_size, len(query_analysis.goals))))
@@ -1507,16 +1518,20 @@ def retrieve_raw_results(
     query_transform_ms = (time.perf_counter() - query_transform_started) * 1000
 
     # 2. 执行计划。失败或功能关闭时，执行器负责记录并回退到单查询。
-    dealer = _BudgetedDealer(get_retrieval_dealer(), transform_nodes=retrieval_plan.mode != "single")
+    company_constraint = resolve_company_constraint(original_question)
+    dealer = _BudgetedDealer(
+        get_retrieval_dealer(), transform_nodes=retrieval_plan.mode != "single",
+        company_constraint=company_constraint,
+    )
     execution = _execute_retrieval_plan(
         dealer, index_names, original_question, query_transform.effective_query,
         retrieval_route, retrieval_plan, options,
     )
 
     # 3. 保存门控前证据，检查充分性，并在必要时补查缺口。
-    result, gate_ms, repair_ms = _verify_retrieved_evidence(
-        execution.result, question=original_question, analysis=query_analysis,
-        dealer=dealer, index_names=index_names, options=options,
+    result, gate_ms, repair_ms, retrieved = _verify_retrieved_evidence(
+        execution.result,
+        dealer=dealer, index_names=index_names, options=options, context=context,
     )
 
     # 4. 附加查询决策与运行诊断，供 Agent 和离线评测复查。
@@ -1525,22 +1540,25 @@ def retrieve_raw_results(
         "rewritten": rewritten_question,
         "changed": rewritten_question != original_question,
     }
-    result["query_intent"] = query_analysis.to_dict()
     result["retrieval_route"] = retrieval_route.to_dict()
     result["retrieval_plan"] = retrieval_plan.to_dict()
     result["query_transform"] = query_transform.to_dict()
-    result["query_contract"] = request.to_dict()
+    # 多查询的实际限制记录在各子查询诊断里；这里记录原问题的公司范围。
+    result["company_constraint"] = company_constraint.to_dict()
     result["query_runtime"] = current_runtime().snapshot() if current_runtime() else {}
     _record_retrieval_latency(
         result, pipeline_started=pipeline_started,
         query_transform_ms=query_transform_ms, execution=execution,
         gate_ms=gate_ms, repair_ms=repair_ms,
     )
-    return result
+    retrieved.diagnostics = retrieval_diagnostics(result)
+    retrieved.request = request
+    retrieved.analysis = query_analysis
+    return retrieved
 
 
 def _optional_float(value: Any) -> float | None:
-    """Convert NumPy and Python numeric values into JSON-safe floats."""
+    """将 NumPy 和 Python 数值转换为可进行 JSON 序列化的浮点数。"""
     if value is None:
         return None
     try:
@@ -1549,20 +1567,30 @@ def _optional_float(value: Any) -> float | None:
         return None
 
 
+@bounded_query
+def retrieve_evidence(index_names: str | list[str], question: str, *,
+                      request: QueryRequest | None = None, context: QueryContext | None = None,
+                      **options) -> RetrievalResult:
+    """生产和评测直接接收来源集合及服务端报告。"""
+    context = context or query_context_for(request or QueryRequest.from_user(question))
+    return _retrieve_evidence_result(index_names, question, context=context, **options)
+
+
 def format_retrieved_chunk(chunk: dict[str, Any], rank: int) -> dict[str, Any]:
-    """Build the compact, JSON-safe chunk representation used by callers."""
-    document_name = str(chunk.get("docnm_kwd", "N/A"))
+    """构建调用方使用的紧凑、可进行 JSON 序列化的片段表示。"""
+    # JSON 格式化与领域适配使用相同缺省值，避免格式化本身改变报告绑定的来源身份。
+    document_name = str(chunk.get("document_name") or chunk.get("docnm_kwd") or "未知文档")
     document_name = document_name.replace("\\", "/").split("/")[-1]
 
     return {
-        # ``id`` is retained for the existing citation prompt and frontend.
+        # 保留 id 字段，供现有引用提示与前端使用。
         "id": rank,
         **evidence_metadata(chunk),
         "rank": rank,
         "chunk_id": chunk.get("chunk_id", ""),
-        "document_id": chunk.get("doc_id", "N/A"),
+        "document_id": chunk.get("document_id") or chunk.get("doc_id") or "",
         "document_name": document_name,
-        "content_with_weight": chunk.get("content_with_weight", "N/A"),
+        "content_with_weight": chunk.get("content_with_weight", chunk.get("content", "")),
         "similarity": _optional_float(chunk.get("similarity")),
         "rerank_score": _optional_float(chunk.get("rerank_score")),
         "rrf_score": _optional_float(chunk.get("rrf_score")),
@@ -1585,56 +1613,39 @@ def format_retrieved_chunk(chunk: dict[str, Any], rank: int) -> dict[str, Any]:
     }
 
 
-def retrieve_content(
-    indexNames: str,
-    question: str,
-    *,
-    page_size: int = DEFAULT_PAGE_SIZE,
-) -> list[dict[str, Any]]:
-    """Retrieve the top chunks for chat while retaining ranking metadata."""
-    chunks, _diagnostics = retrieve_content_with_diagnostics(
-        indexNames,
-        question,
-        page_size=page_size,
-    )
-    return chunks
-
-
-def retrieve_content_with_diagnostics(
-    indexNames: str,
-    question: str,
-    *,
-    page_size: int = DEFAULT_PAGE_SIZE,
-    request: QueryRequest | None = None,
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Return chat chunks plus bounded policy/retrieval diagnostics."""
-    kwargs = {"request": request} if request is not None else {}
-    results = retrieve_raw_results(indexNames, question, page_size=page_size, **kwargs)
-    return format_retrieval_results(results)
-
-
 def format_retrieval_results(results: dict[str, Any]) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Shared result envelope for production tools and complete Agent evals."""
+    """外部检索器和历史 JSON 的适配准备，不执行检索。"""
     chunks = [
         format_retrieved_chunk(chunk, rank)
         for rank, chunk in enumerate(results.get("chunks", []), start=1)
     ]
-    diagnostics = {
-        "query_contract": dict(results.get("query_contract") or {}),
+    diagnostics = retrieval_diagnostics(results)
+    diagnostics.update(
+        candidate_chunks=[format_retrieved_chunk(chunk, rank) for rank, chunk in enumerate(
+            results.get("chunks_before_sufficiency") or [], start=1)],
+        evidence_sufficiency=dict(results.get("evidence_sufficiency") or {}),
+        query_contract=dict(results.get("query_contract") or {}),
+        query_intent=dict(results.get("query_intent") or {}),
+        response_mode=results.get("response_mode", "answer" if chunks else "insufficient"),
+        clarification=results.get("clarification"),
+        total=results.get("total"),
+    )
+
+    return chunks, diagnostics
+
+
+def retrieval_diagnostics(results: dict[str, Any]) -> dict[str, Any]:
+    """运行诊断不承担来源、查询契约或核验报告的传递。"""
+    return {
+        "query_rewrite": dict(results.get("query_rewrite") or {}),
+        "retrieval_fusion": dict(results.get("retrieval_fusion") or {}),
+        "doc_aggs": list(results.get("doc_aggs") or []),
+        "company_constraint": dict(results.get("company_constraint") or {}),
         "query_transform": dict(results.get("query_transform") or {}),
         "query_runtime": dict(results.get("query_runtime") or {}),
         "plan_execution": dict(results.get("plan_execution") or {}),
         "retrieval_graph": dict(results.get("retrieval_graph") or {}),
         "query_repair": dict(results.get("query_repair") or {}),
-        "response_mode": results.get("response_mode", "answer" if chunks else "insufficient"),
-        "clarification": results.get("clarification"),
-        "candidate_chunks": [format_retrieved_chunk(chunk, rank) for rank, chunk in enumerate(
-            results.get("chunks_before_sufficiency") or [], start=1,
-        )][:20],
-        "evidence_sufficiency": dict(
-            results.get("evidence_sufficiency") or {}
-        ),
-        "query_intent": dict(results.get("query_intent") or {}),
         "retrieval_route": dict(results.get("retrieval_route") or {}),
         "retrieval_plan": dict(results.get("retrieval_plan") or {}),
         "sequential_retrieval": dict(
@@ -1649,12 +1660,3 @@ def format_retrieval_results(results: dict[str, Any]) -> tuple[list[dict[str, An
             results.get("total_before_evidence_sufficiency") or 0
         ),
     }
-    return chunks, diagnostics
-
-
-if __name__ == "__main__":
-    result = retrieve_content(
-        question="世运电路成长性如何",
-        indexNames="test01",
-    )
-    print(result)

@@ -1,4 +1,5 @@
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2025 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -505,14 +506,14 @@ def _parse_pdf(filename, binary, from_page, to_page, parser_config, callback):
 
 
 def _parse_excel(filename, binary, parser_config, callback):
-    """Parse each worksheet as one table object instead of plain text rows."""
+    """将每个工作表解析为一个完整表格对象。"""
     callback(0.1, "Start to parse.")
     file_content = _load_binary(filename, binary)
     excel_parser = ExcelParser()
 
-    # The object layer owns the complete worksheet; row-level chunking happens
-    # later in tokenize_table.  A very large chunk_rows value prevents the old
-    # Excel adapter from splitting one sheet into unrelated pseudo-tables.
+    # 对象层保留完整工作表，稍后由 tokenize_table 按行生成片段。
+    # 设置较大的 chunk_rows，避免旧 Excel 适配器将同一工作表
+    # 拆成互不相关的伪表格。
     raw_tables = excel_parser.html(file_content, 1_000_000)
     tables = [((None, table), "") for table in raw_tables if table]
     callback(0.8, "Finish parsing.")

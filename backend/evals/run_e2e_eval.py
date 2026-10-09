@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run retrieval, answer, faithfulness, citation and refusal evaluation."""
+"""执行检索、回答、忠实度、引用和拒答评测。"""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 BACKEND_DIRECTORY = SCRIPT_DIRECTORY.parent
 APP_DIRECTORY = BACKEND_DIRECTORY / "app"
 if not (APP_DIRECTORY / "service").is_dir():
-    # Compose mounts application packages directly under /app.
+    # 容器编排将应用包直接挂载在 /app 目录下。
     APP_DIRECTORY = BACKEND_DIRECTORY
 DEFAULT_DATASET = SCRIPT_DIRECTORY / "data" / "power_reports_eval_v2_dev.jsonl"
 DEFAULT_OUTPUT_DIRECTORY = SCRIPT_DIRECTORY / "results"

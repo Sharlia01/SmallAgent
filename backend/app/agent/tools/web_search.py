@@ -1,4 +1,4 @@
-"""Real-time web search exposed through the standard Agent tool protocol."""
+"""通过标准 Agent 工具协议提供实时网页搜索。"""
 
 import hashlib
 import os
@@ -8,7 +8,8 @@ from urllib.parse import urlparse
 
 import dashscope
 
-from agent.schemas import ToolResult, ToolSource
+from agent.schemas import ToolResult
+from domain.evidence import Evidence, EvidenceCollection, EvidenceSource
 from utils import logger
 
 
@@ -20,7 +21,7 @@ PROVIDER_CITATION_PATTERN = re.compile(r"\s*\[ref_\d+\]", re.IGNORECASE)
 
 
 def _value(container: Any, key: str, default=None):
-    """Read one field from DashScope dict-like or attribute-style objects."""
+    """兼容 DashScope 的字典式和属性式对象，读取指定字段。"""
     if container is None:
         return default
     if isinstance(container, dict):
@@ -56,7 +57,7 @@ def _call_dashscope_web_search(
     query: str,
     native_base_url: str | None,
 ):
-    """Call DashScope natively because the compatible API omits sources."""
+    """使用 DashScope 原生接口调用搜索，以保留兼容接口未提供的来源信息。"""
     if native_base_url:
         dashscope.base_http_api_url = native_base_url
 
@@ -82,12 +83,12 @@ def _extract_answer(output: Any) -> str:
         return ""
     message = _value(choices[0], "message")
     answer = str(_value(message, "content", "") or "").strip()
-    # DashScope's ref_N values identify entries inside one provider response.
-    # They are not the document numbers used by our final-answer citation UI.
+    # DashScope 的 ref_N 只标识单次提供方响应中的条目，
+    # 与最终回答引用界面使用的文档编号不是同一套编号。
     return PROVIDER_CITATION_PATTERN.sub("", answer)
 
 
-def _extract_sources(output: Any) -> list[ToolSource]:
+def _extract_sources(output: Any) -> list[dict]:
     search_info = _value(output, "search_info", {}) or {}
     search_results = _value(search_info, "search_results", []) or []
     sources = []
@@ -103,40 +104,27 @@ def _extract_sources(output: Any) -> list[ToolSource]:
         if not url or not title:
             continue
 
-        sources.append(
-            ToolSource(
-                source_type="web",
-                source_id=_stable_id("web", url),
-                title=title,
-                content=(
-                    f"来源网站：{site_name}\n搜索结果标题：{title}"
-                    if site_name
-                    else f"搜索结果标题：{title}"
-                ),
-                url=url,
-                metadata={
-                    "site_name": site_name,
-                    "icon": _value(result, "icon", "") or "",
-                    "index": source_index,
-                },
-            )
-        )
+        sources.append({
+            "source_type": "web", "source_id": _stable_id("web", url), "title": title,
+            "content": f"来源网站：{site_name}\n搜索结果标题：{title}" if site_name else f"搜索结果标题：{title}",
+            "url": url, "metadata": {"site_name": site_name, "icon": _value(result, "icon", "") or "", "index": source_index},
+        })
 
     return sources
 
 
-def _format_web_content(answer: str, sources: list[ToolSource]) -> str:
+def _format_web_content(answer: str, sources: list[dict]) -> str:
     sections = []
     if answer:
         sections.append(f"**实时网络搜索摘要：**\n{answer}")
 
     source_lines = []
     for position, source in enumerate(sources, start=1):
-        site_name = source.metadata.get("site_name")
+        site_name = source["metadata"].get("site_name")
         site_suffix = f"（{site_name}）" if site_name else ""
         source_lines.append(
             f"{position}. "
-            f"[{_escape_markdown_label(source.title)}]({source.url}){site_suffix}"
+            f"[{_escape_markdown_label(source['title'])}]({source['url']}){site_suffix}"
         )
     if source_lines:
         sections.append("**网络来源：**\n" + "\n".join(source_lines))
@@ -145,7 +133,7 @@ def _format_web_content(answer: str, sources: list[ToolSource]) -> str:
 
 
 class WebSearchTool:
-    """Search the public web and return a cited, provider-neutral result."""
+    """搜索公开网页，返回带引用且不依赖提供方的标准结果。"""
 
     name = "search_web"
     description = (
@@ -183,14 +171,14 @@ class WebSearchTool:
         self._search_callable = search_callable or _call_dashscope_web_search
 
     def run(self, *, query: str) -> ToolResult:
-        """Force a real web search and preserve its source links."""
+        """明确启用真实网页搜索，并保留来源链接。"""
         normalized_query = query.strip() if isinstance(query, str) else ""
         if not normalized_query:
             return ToolResult.failure(
                 tool_name=self.name,
                 query=normalized_query,
                 error="query 不能为空。",
-                metadata={"error_type": "validation_error"},
+                diagnostics={"error_type": "validation_error"},
             )
 
         if not self._api_key:
@@ -198,7 +186,7 @@ class WebSearchTool:
                 tool_name=self.name,
                 query=normalized_query,
                 error="实时网络搜索未配置 API Key。",
-                metadata={"error_type": "configuration_error"},
+                diagnostics={"error_type": "configuration_error"},
             )
 
         try:
@@ -224,7 +212,7 @@ class WebSearchTool:
                 tool_name=self.name,
                 query=normalized_query,
                 error=FAILED_WEB_RESULT_MESSAGE,
-                metadata={"error_type": type(error).__name__},
+                diagnostics={"error_type": type(error).__name__},
             )
 
         if not sources:
@@ -234,7 +222,7 @@ class WebSearchTool:
                 content=answer,
                 success=False,
                 error=EMPTY_WEB_RESULT_MESSAGE,
-                metadata={
+                diagnostics={
                     "error_type": "empty_search_results",
                     "model": self._model,
                     "request_id": request_id,
@@ -246,8 +234,12 @@ class WebSearchTool:
             tool_name=self.name,
             query=normalized_query,
             content=_format_web_content(answer, sources),
-            sources=sources,
-            metadata={
+            evidence=EvidenceCollection([Evidence(
+                _stable_id("web-search", document_key), _format_web_content(answer, sources),
+                EvidenceSource("web", _stable_id("web-search", document_key), f"实时网络搜索：{normalized_query}",
+                               sources[0]["url"], links=tuple(sources)),
+            )]),
+            diagnostics={
                 "result_count": len(sources),
                 "model": self._model,
                 "request_id": request_id,
@@ -258,5 +250,5 @@ class WebSearchTool:
 
 
 def search_web(query: str) -> ToolResult:
-    """Functional entry point for callers that do not manage tool instances."""
+    """为不管理工具实例的调用方提供函数式入口。"""
     return WebSearchTool().run(query=query)

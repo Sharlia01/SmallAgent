@@ -1,4 +1,5 @@
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2025 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -39,9 +40,7 @@ def build_post_process(config, global_config=None):
 
 
 class DBPostProcess(object):
-    """
-    The post process for Differentiable Binarization (DB).
-    """
+    """对可微二值化模型的输出进行后处理。"""
 
     def __init__(self,
                  thresh=0.3,
@@ -67,10 +66,7 @@ class DBPostProcess(object):
             [[1, 1], [1, 1]])
 
     def polygons_from_bitmap(self, pred, _bitmap, dest_width, dest_height):
-        '''
-        _bitmap: single map with shape (1, H, W),
-            whose values are binarized as {0, 1}
-        '''
+        """_bitmap 为形状 (1, H, W) 的单通道图，像素值已二值化为 0 或 1。"""
 
         bitmap = _bitmap
         height, width = bitmap.shape
@@ -114,10 +110,7 @@ class DBPostProcess(object):
         return boxes, scores
 
     def boxes_from_bitmap(self, pred, _bitmap, dest_width, dest_height):
-        '''
-        _bitmap: single map with shape (1, H, W),
-                whose values are binarized as {0, 1}
-        '''
+        """_bitmap 为形状 (1, H, W) 的单通道图，像素值已二值化为 0 或 1。"""
 
         bitmap = _bitmap
         height, width = bitmap.shape
@@ -192,9 +185,7 @@ class DBPostProcess(object):
         return box, min(bounding_box[1])
 
     def box_score_fast(self, bitmap, _box):
-        '''
-        box_score_fast: use bbox mean score as the mean score
-        '''
+        """快速计算边界框内的平均置信度，作为该框的得分。"""
         h, w = bitmap.shape[:2]
         box = _box.copy()
         xmin = np.clip(np.floor(box[:, 0].min()).astype("int32"), 0, w - 1)
@@ -209,9 +200,7 @@ class DBPostProcess(object):
         return cv2.mean(bitmap[ymin:ymax + 1, xmin:xmax + 1], mask)[0]
 
     def box_score_slow(self, bitmap, contour):
-        '''
-        box_score_slow: use polyon mean score as the mean score
-        '''
+        """计算多边形区域内的平均置信度，作为该区域的得分。"""
         h, w = bitmap.shape[:2]
         contour = contour.copy()
         contour = np.reshape(contour, (-1, 2))
@@ -260,7 +249,7 @@ class DBPostProcess(object):
 
 
 class BaseRecLabelDecode(object):
-    """ Convert between text-label and text-index """
+    """在文本标签与字符索引之间转换。"""
 
     def __init__(self, character_dict_path=None, use_space_char=False):
         self.beg_str = "sos"
@@ -309,7 +298,7 @@ class BaseRecLabelDecode(object):
         return dict_character
 
     def decode(self, text_index, text_prob=None, is_remove_duplicate=False):
-        """ convert text-index into text-label. """
+        """将字符索引转换为文本标签。"""
         result_list = []
         ignored_tokens = self.get_ignored_tokens()
         batch_size = len(text_index)
@@ -334,18 +323,18 @@ class BaseRecLabelDecode(object):
 
             text = ''.join(char_list)
 
-            if self.reverse:  # for arabic rec
+            if self.reverse:  # 处理阿拉伯语识别结果。
                 text = self.pred_reverse(text)
 
             result_list.append((text, np.mean(conf_list).tolist()))
         return result_list
 
     def get_ignored_tokens(self):
-        return [0]  # for ctc blank
+        return [0]  # 处理 CTC 的空白占位符。
 
 
 class CTCLabelDecode(BaseRecLabelDecode):
-    """ Convert between text-label and text-index """
+    """在文本标签与字符索引之间转换。"""
 
     def __init__(self, character_dict_path=None, use_space_char=False,
                  **kwargs):

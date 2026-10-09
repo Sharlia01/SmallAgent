@@ -1,4 +1,4 @@
-"""Deterministic answer/refusal policy shared by production and evaluation."""
+"""生产和评测共用的确定性回答与拒答策略。"""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ MAX_REFUSAL_REQUIREMENTS = 5
 
 
 def normalize_missing_requirements(values: Any) -> list[str]:
-    """Return bounded, unique requirement text safe for a user-facing refusal."""
+    """生成长度受限、去重且适合向用户展示的拒答缺口描述。"""
     if not isinstance(values, list):
         return []
 
@@ -27,7 +27,7 @@ def normalize_missing_requirements(values: Any) -> list[str]:
 
 
 def render_refusal(missing_requirements: Any = None) -> str:
-    """Render a stable refusal instead of asking a model to improvise one."""
+    """生成稳定的拒答文本，避免让模型自行编造。"""
     requirements = normalize_missing_requirements(missing_requirements)
     if not requirements:
         return DEFAULT_REFUSAL_MESSAGE
@@ -46,15 +46,13 @@ def render_evidence_refusal(decision: dict[str, Any]) -> str:
 def refusal_from_tool_results(
     tool_results: Iterable[Any],
 ) -> tuple[str, dict[str, Any]] | None:
-    """Return a refusal only when successful KB searches produced no sources.
+    """仅当知识库搜索成功但没有来源时返回拒答。
 
-    A web result, session document, or a later successful KB retry must be able
-    to answer the request. Operational tool failures are deliberately excluded:
-    they should follow the existing error/fallback path instead of being
-    misreported as a trustworthy "not in the documents" decision.
+    网页结果、会话文档或后续成功的知识库重试仍可用于回答。
+    工具运行故障交由既有错误或回退路径处理，不能误报为可靠的“文档中没有答案”。
     """
     results = list(tool_results)
-    if any(getattr(result, "sources", None) for result in results):
+    if any(getattr(result, "evidence", None) for result in results):
         return None
 
     empty_kb_results = [
@@ -62,12 +60,12 @@ def refusal_from_tool_results(
         for result in results
         if getattr(result, "tool_name", None) == "search_knowledge_base"
         and getattr(result, "success", False)
-        and not getattr(result, "sources", None)
+        and not getattr(result, "evidence", None)
     ]
     if not empty_kb_results:
         return None
 
     latest = empty_kb_results[-1]
-    metadata = getattr(latest, "metadata", None) or {}
-    decision = metadata.get("evidence_sufficiency") or {}
+    assessment = getattr(latest, "assessment", None)
+    decision = assessment.to_dict() if assessment else {}
     return render_evidence_refusal(decision), dict(decision)

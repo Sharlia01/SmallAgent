@@ -1,4 +1,4 @@
-"""Bounded bridge extraction for evidence-grounded sequential retrieval."""
+"""依据证据进行有界桥接值抽取，供顺序检索使用。"""
 
 from __future__ import annotations
 
@@ -55,7 +55,7 @@ BRIDGE_EXTRACTION_SYSTEM_PROMPT = """
 
 @dataclass(frozen=True)
 class BridgeExtraction:
-    """A dependency value tied to the exact chunk that supplied it."""
+    """将依赖值绑定到实际提供它的原始片段。"""
 
     slot: str
     value: str
@@ -173,8 +173,8 @@ def _extract_rating_by_rule(
                 continue
             matching_subjects = [subject for subject in subjects if subject in clause]
             document_name = str(chunk.get("docnm_kwd") or chunk.get("document_name") or "")
-            # A document title can bind an otherwise subjectless clause, but
-            # never override a different explicitly named company in it.
+            # 文档标题可为没有主体的分句提供绑定，
+            # 但不能覆盖分句中明确命名的其他公司。
             explicit = _extract_organizations(re.sub(r"本报告|本研报|给予|维持|首次|对", " ", clause))
             if subjects and not matching_subjects:
                 if explicit or not any(subject in document_name for subject in subjects):
@@ -221,7 +221,7 @@ def extract_bridge_value(
     chunks: list[dict[str, Any]],
     client: Any | None = None,
 ) -> BridgeExtraction | None:
-    """Extract one slot value, accepting only text grounded in a source chunk."""
+    """提取一个槽位值，仅接受原始片段中有依据的文本。"""
     if not chunks:
         return None
 
@@ -301,7 +301,7 @@ def resolve_query_template(
     template: str,
     bridge_values: dict[str, str],
 ) -> str:
-    """Resolve a validated template without permitting unknown placeholders."""
+    """填充已校验模板，不允许使用未知占位符。"""
     fields = []
     for _literal, field_name, format_spec, conversion in Formatter().parse(
         template

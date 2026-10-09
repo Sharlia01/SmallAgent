@@ -1,4 +1,5 @@
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2025 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -33,7 +34,7 @@ from .postprocess import build_post_process
 
 
 def transform(data, ops=None):
-    """ transform """
+    """执行图像变换。"""
     if ops is None:
         ops = []
     for op in ops:
@@ -44,11 +45,10 @@ def transform(data, ops=None):
 
 
 def create_operators(op_param_list, global_config=None):
-    """
-    create operators based on the config
+    """根据配置创建图像处理算子。
 
-    Args:
-        params(list): a dict list, used to create some operators
+    参数：
+        params（list）：算子配置字典列表。
     """
     assert isinstance(
         op_param_list, list), ('operator config should be a list')
@@ -86,14 +86,14 @@ def load_model(model_dir, nm):
     options.intra_op_num_threads = 2
     options.inter_op_num_threads = 2
 
+    # 推理完成后收缩 GPU 内存，参考以下问题讨论：
     # https://github.com/microsoft/onnxruntime/issues/9509#issuecomment-951546580
-    # Shrink GPU memory after execution
     run_options = ort.RunOptions()
     if cuda_is_available():
         cuda_provider_options = {
-            "device_id": 0, # Use specific GPU
-            "gpu_mem_limit": 512 * 1024 * 1024, # Limit gpu memory
-            "arena_extend_strategy": "kNextPowerOfTwo",  # gpu memory allocation strategy
+            "device_id": 0, # 选择指定的 GPU。
+            "gpu_mem_limit": 512 * 1024 * 1024, # 限制 GPU 内存使用量。
+            "arena_extend_strategy": "kNextPowerOfTwo",  # 设置 GPU 内存分配策略。
         }
         sess = ort.InferenceSession(
             model_file_path,
@@ -154,7 +154,7 @@ class TextRecognizer(object):
     def resize_norm_img_vl(self, img, image_shape):
 
         imgC, imgH, imgW = image_shape
-        img = img[:, :, ::-1]  # bgr2rgb
+        img = img[:, :, ::-1]  # 将颜色通道从 BGR 转换为 RGB。
         resized_image = cv2.resize(
             img, (imgW, imgH), interpolation=cv2.INTER_LINEAR)
         resized_image = resized_image.astype('float32')
@@ -239,9 +239,9 @@ class TextRecognizer(object):
         h = img.shape[0]
         w = img.shape[1]
         valid_ratio = 1.0
-        # make sure new_width is an integral multiple of width_divisor.
+        # 确保缩放后的宽度是 width_divisor 的整数倍。
         width_divisor = int(1 / width_downsample_ratio)
-        # resize
+        # 调整图像尺寸。
         ratio = w / float(h)
         resize_w = math.ceil(imgH * ratio)
         if resize_w % width_divisor != 0:
@@ -253,7 +253,7 @@ class TextRecognizer(object):
             resize_w = min(imgW_max, resize_w)
         resized_image = cv2.resize(img, (resize_w, imgH))
         resized_image = resized_image.astype('float32')
-        # norm
+        # 对图像进行归一化。
         if image_shape[0] == 1:
             resized_image = resized_image / 255
             resized_image = resized_image[np.newaxis, :]
@@ -317,7 +317,7 @@ class TextRecognizer(object):
     def norm_img_can(self, img, image_shape):
 
         img = cv2.cvtColor(
-            img, cv2.COLOR_BGR2GRAY)  # CAN only predict gray scale image
+            img, cv2.COLOR_BGR2GRAY)  # 该模型仅支持灰度图像预测。
 
         if self.rec_image_shape[0] == 1:
             h, w = img.shape
@@ -337,11 +337,11 @@ class TextRecognizer(object):
 
     def __call__(self, img_list):
         img_num = len(img_list)
-        # Calculate the aspect ratio of all text bars
+        # 计算所有文本条图像的宽高比。
         width_list = []
         for img in img_list:
             width_list.append(img.shape[1] / float(img.shape[0]))
-        # Sorting can speed up the recognition process
+        # 按宽高比排序可加快识别过程。
         indices = np.argsort(np.array(width_list))
         rec_res = [['', 0.0]] * img_num
         batch_num = self.rec_batch_num
@@ -497,16 +497,11 @@ class TextDetector(object):
 
 class OCR(object):
     def __init__(self, model_dir=None):
-        """
-        If you have trouble downloading HuggingFace models, -_^ this might help!!
+        """HuggingFace 模型下载失败时，可尝试配置镜像地址。
 
-        For Linux:
-        export HF_ENDPOINT=https://hf-mirror.com
-
-        For Windows:
-        Good luck
-        ^_-
-
+        Linux 环境示例：
+            export HF_ENDPOINT=https://hf-mirror.com
+        Windows 环境请按相应终端的语法设置同一环境变量。
         """
         if not model_dir:
             try:
@@ -526,16 +521,9 @@ class OCR(object):
         self.crop_image_res_index = 0
 
     def get_rotate_crop_image(self, img, points):
-        '''
-        img_height, img_width = img.shape[0:2]
-        left = int(np.min(points[:, 0]))
-        right = int(np.max(points[:, 0]))
-        top = int(np.min(points[:, 1]))
-        bottom = int(np.max(points[:, 1]))
-        img_crop = img[top:bottom, left:right, :].copy()
-        points[:, 0] = points[:, 0] - left
-        points[:, 1] = points[:, 1] - top
-        '''
+        """备用裁剪思路：取四边形的外接矩形，复制对应图像区域，
+        再将各顶点坐标转换为相对于裁剪区域左上角的坐标。
+        """
         assert len(points) == 4, "shape of points must be 4*2"
         img_crop_width = int(
             max(
@@ -560,12 +548,12 @@ class OCR(object):
         return dst_img
 
     def sorted_boxes(self, dt_boxes):
-        """
-        Sort text boxes in order from top to bottom, left to right
-        args:
-            dt_boxes(array):detected text boxes with shape [4, 2]
-        return:
-            sorted boxes(array) with shape [4, 2]
+        """按从上到下、从左到右的阅读顺序排列文本框。
+
+        参数：
+            dt_boxes（array）：形状为 [4, 2] 的文本框顶点数组。
+        返回：
+            排序后的文本框数组，每个文本框的形状仍为 [4, 2]。
         """
         num_boxes = dt_boxes.shape[0]
         sorted_boxes = sorted(dt_boxes, key=lambda x: (x[0][1], x[0][0]))

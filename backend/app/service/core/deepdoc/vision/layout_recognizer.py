@@ -1,4 +1,5 @@
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2025 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -70,7 +71,7 @@ class LayoutRecognizer(Recognizer):
         layouts = super().__call__(image_list, thr, batch_size)
         # save_results(image_list, layouts, self.labels, output_dir='output/', threshold=0.7)
         assert len(image_list) == len(ocr_res)
-        # Tag layout type
+        # 标注版面类型。
         boxes = []
         assert len(image_list) == len(layouts)
         garbages = {}
@@ -88,7 +89,7 @@ class LayoutRecognizer(Recognizer):
             lts = self.layouts_cleanup(bxs, lts)
             page_layout.append(lts)
 
-            # Tag layout type, layouts are ready
+            # 版面检测完成后，标注各文本框的版面类型。
             def findLayout(ty):
                 nonlocal bxs, lts, self
                 lts_ = [lt for lt in lts if lt["type"] == ty]
@@ -103,7 +104,7 @@ class LayoutRecognizer(Recognizer):
 
                     ii = self.find_overlapped_with_threashold(bxs[i], lts_,
                                                               thr=0.4)
-                    if ii is None:  # belong to nothing
+                    if ii is None:  # 未归属于任何已识别版面区域。
                         bxs[i]["layout_type"] = ""
                         i += 1
                         continue
@@ -131,7 +132,7 @@ class LayoutRecognizer(Recognizer):
                        "table caption", "title", "table", "text", "figure", "equation"]:
                 findLayout(lt)
 
-            # add box to figure layouts which has not text box
+            # 为没有文本框的图片区域补充占位框。
             for i, lt in enumerate(
                     [lt for lt in lts if lt["type"] in ["figure", "equation"]]):
                 if lt.get("visited"):
@@ -185,15 +186,15 @@ class LayoutRecognizer4YOLOv10(LayoutRecognizer):
 
     def preprocess(self, image_list):
         inputs = []
-        new_shape = self.input_shape # height, width
+        new_shape = self.input_shape # 读取图像高度和宽度。
         for img in image_list:
-            shape = img.shape[:2]# current shape [height, width]
-            # Scale ratio (new / old)
+            shape = img.shape[:2]# 当前图像尺寸按高度、宽度排列。
+            # 计算新尺寸与原尺寸的缩放比例。
             r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
-            # Compute padding
+            # 计算所需填充量。
             new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
-            dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
-            dw /= 2  # divide padding into 2 sides
+            dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # 分别计算宽度和高度方向的填充量。
+            dw /= 2  # 将填充量均分到两侧。
             dh /= 2
             ww, hh = new_unpad
             img = np.array(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).astype(np.float32)
@@ -202,7 +203,7 @@ class LayoutRecognizer4YOLOv10(LayoutRecognizer):
             left, right = int(round(dw - 0.1)) if self.center else 0, int(round(dw + 0.1))
             img = cv2.copyMakeBorder(
                 img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114)
-            )  # add border
+            )  # 在图像边缘添加填充。
             img /= 255.0
             img = img.transpose(2, 0, 1)
             img = img[np.newaxis, :, :, :].astype(np.float32)

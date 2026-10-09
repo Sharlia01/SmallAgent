@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the application's Alembic migrations."""
+"""执行应用的 Alembic 数据库迁移。"""
 
 import os
 import sys
@@ -20,7 +20,7 @@ def get_alembic_config() -> Config:
 
 
 def run_migration() -> int:
-    """Upgrade the configured database to the latest revision."""
+    """将配置的数据库升级至最新迁移版本。"""
     if not os.getenv("DATABASE_URL"):
         print("错误: 未找到 DATABASE_URL 环境变量")
         return 1

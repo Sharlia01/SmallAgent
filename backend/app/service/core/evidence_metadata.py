@@ -1,4 +1,6 @@
-"""Provenance fields carried from parsing through retrieval and citations."""
+"""从解析、检索到引用全程携带的来源字段。"""
+
+from service.core.entity_attribution import ENTITY_ATTRIBUTION_FIELDS
 
 EVIDENCE_FIELDS = (
     "page_num_int",
@@ -26,6 +28,9 @@ EVIDENCE_FIELDS = (
     "visual_model_kwd",
     "image_ref_kwd",
     "parser_version_kwd",
+    "financial_facts",
+    "answer_context",
+    *ENTITY_ATTRIBUTION_FIELDS,
 )
 
 def evidence_metadata(source):
@@ -33,7 +38,7 @@ def evidence_metadata(source):
 
 
 def ranking_text(source):
-    """Prefer compact table semantics for reranking, falling back for old data."""
+    """重排时优先使用紧凑的表格语义文本，旧数据使用兼容回退。"""
     return (
         source.get("table_semantic_text_with_weight")
         or source.get("content_with_weight")

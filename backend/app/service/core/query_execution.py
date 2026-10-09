@@ -1,4 +1,4 @@
-"""Execute validated retrieval DAGs while keeping evidence from failed paths."""
+"""执行已校验的检索依赖图，并保留失败路径中已经取得的证据。"""
 
 from __future__ import annotations
 

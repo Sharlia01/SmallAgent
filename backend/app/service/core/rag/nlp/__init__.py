@@ -23,7 +23,7 @@ def is_english(texts):
 
 def tokenize_chunks_docx(chunks, doc, eng, images):
     res = []
-    # wrap up as es documents
+    # 封装为 Elasticsearch 文档。
     for ck, image in zip(chunks, images):
         if len(ck.strip()) == 0:
             continue
@@ -102,7 +102,7 @@ def naive_merge(sections, chunk_token_num=128, delimiter="\n。；！？"):
             pos = ""
         if tnum < 8:
             pos = ""
-        # Ensure that the length of the merged chunk does not exceed chunk_token_num  
+        # 确保合并片段的词元数不超过 chunk_token_num。
         if tk_nums[-1] > chunk_token_num:
 
             if text.find(pos) < 0:
@@ -212,7 +212,7 @@ def add_positions(d, poss):
 
 def tokenize_table(tbls, doc, eng, batch_size=10):
     res = []
-    # add tables
+    # 追加表格片段。
     """
     img   # 表格区域截图
     rows  # 表格识别出来的文本
@@ -241,8 +241,8 @@ def tokenize_table(tbls, doc, eng, batch_size=10):
             # 将表格对象拆分为多个块，每个块包含一定数量的行，以便后续处理
             for table_chunk in build_table_chunks(table_object):
                 d = copy.deepcopy(doc)
-                # Only semantic_text participates in keyword search and
-                # embedding.  The LLM-facing content is deterministic Markdown.
+                # 只有 semantic_text 参与关键词检索和向量生成；
+                # 传给语言模型的内容使用确定性生成的 Markdown 表格。
                 tokenize(d, table_chunk.semantic_text, eng)
                 d["content_with_weight"] = table_chunk.markdown_excerpt
                 d.update(table_chunk.to_record())
@@ -259,8 +259,8 @@ def tokenize_table(tbls, doc, eng, batch_size=10):
                     d["table_headers_kwd"] = row.get("headers") or []
                     d["table_cells_kwd"] = row.get("cells") or []
                     d["table_row_int"] = row.get("row_index")
-                # All child chunks share one in-memory parent payload; the
-                # persistence layer writes it once per table_id.
+                # 同一张表的子片段共享一个内存中的父表对象；
+                # 持久化层按 table_id 只写入一次。
                 d["_table_object"] = table_object_payload
                 if img is not None:
                     d["image"] = img
@@ -351,7 +351,7 @@ def title_frequency(bull, sections):
 
 def tokenize_chunks(chunks, doc, eng, pdf_parser=None):
     res = []
-    # wrap up as es documents
+    # 封装为 Elasticsearch 文档。
     for chunk in chunks:
         if len(chunk.strip()) == 0:
             continue

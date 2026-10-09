@@ -1,4 +1,4 @@
-"""Retrieval query expansion with deterministic intent-preservation checks."""
+"""扩展检索查询，并通过确定性检查保护原始意图。"""
 
 from __future__ import annotations
 
@@ -104,9 +104,8 @@ GENERIC_ORGANIZATIONS = {
     "证券",
 }
 
-# These are already canonical retrieval terms. If the user supplied one, an
-# expansion should retain it verbatim rather than replace it with a broader
-# concept.
+# 这些词已是规范检索术语；用户明确使用时应原样保留，
+# 不能在扩展中替换为更宽泛的概念。
 CANONICAL_TERM_PATTERN = re.compile(
     r"归母净利润|扣非归母净利润|营业收入|营业成本|每股收益|市盈率|"
     r"市净率|现金流|装机容量|发电量|上网电价|利用小时|煤价|分红|"
@@ -162,7 +161,7 @@ class QueryValidationResult:
 
 @dataclass(frozen=True)
 class QueryExpansionResult:
-    """Full query transformation state retained for retrieval diagnostics."""
+    """保存完整查询变换状态，供检索诊断使用。"""
 
     original: str
     rewritten: str
@@ -262,15 +261,15 @@ def _unique_matches(pattern: re.Pattern, query: str) -> set[str]:
 
 
 def _extract_organizations(query: str) -> set[str]:
-    # Financial field names such as 归属于母公司股东的净利润 are not new
-    # corporate entities. Mask known fields before applying the suffix guard.
+    # “归属于母公司股东的净利润”等财务字段不是新的公司实体。
+    # 使用组织后缀识别前，先遮蔽已知字段名称。
     field_names = [name for canonical, aliases in domain_policy()["aliases"].items()
                    for name in [canonical, *aliases] if not name.isascii()]
     original = query
     for name in sorted(field_names, key=len, reverse=True):
         query = query.replace(name, " ")
-    # Mask before matching; deleting a time from an already matched entity
-    # would fabricate a non-contiguous name such as “2025年国电电力”.
+    # 先遮蔽时间文本再匹配实体；对已匹配名称删除时间会拼造
+    # 原文中不连续的名称，例如“2025年国电电力”。
     query = YEAR_OR_DATE_PATTERN.sub(" ", query)
     query = RELATIVE_TIME_PATTERN.sub(" ", query)
     organizations = set()
@@ -288,7 +287,7 @@ def _extract_organizations(query: str) -> set[str]:
 
 
 def extract_query_anchors(query: str) -> list[str]:
-    """Extract high-confidence terms that transformations must preserve."""
+    """提取查询变换必须保留的高置信度锚点词。"""
     if not isinstance(query, str) or not query.strip():
         return []
 
@@ -347,7 +346,7 @@ def validate_query_preservation(
     original: str,
     candidate: str,
 ) -> QueryValidationResult:
-    """Reject candidates that drop anchors or invent risky exact details."""
+    """拒绝丢失锚点或无依据增加精确条件的候选查询。"""
     required_anchors = extract_query_anchors(original)
     normalized_candidate = _normalize_for_match(candidate)
     missing_anchors = [
@@ -432,7 +431,7 @@ def _apply_domain_expansion_policy(
     expanded: str,
     added_terms: list[str],
 ) -> tuple[str, list[str]]:
-    """Apply small deterministic guards for high-value retrieval intents."""
+    """为重要检索意图应用范围有限的确定性保护规则。"""
     filtered_terms = list(added_terms)
 
     # 目标价不是“投资评级”的同义词。用户没有询问价格或估值时，移除模型
@@ -515,7 +514,7 @@ def expand_query(
     client: Any | None = None,
     allow_model: bool = True,
 ) -> QueryExpansionResult:
-    """Generate one expanded keyword query and validate intent preservation."""
+    """生成一条扩展关键词查询，并检查原始意图是否保留。"""
     original_query = original.strip() if isinstance(original, str) else ""
     rewritten_query = rewritten.strip() if isinstance(rewritten, str) else ""
 

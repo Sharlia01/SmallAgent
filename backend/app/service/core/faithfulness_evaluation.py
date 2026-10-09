@@ -1,4 +1,4 @@
-"""Evaluate whether answer claims are supported by the final RAG evidence."""
+"""评估回答中的事实陈述是否由最终检索证据支持。"""
 
 from __future__ import annotations
 
@@ -208,7 +208,7 @@ def evaluate_faithfulness(
     judge_model: str | None = None,
     judge_timeout: float = 20.0,
 ) -> dict[str, Any]:
-    """Score factual answer claims against all final retrieved evidence."""
+    """使用全部最终检索证据评估回答事实的忠实度。"""
     evidence_document_count = len(documents)
     if response_mode != "answer":
         return _empty_result(

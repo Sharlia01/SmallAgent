@@ -1,4 +1,5 @@
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2024 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,6 +23,9 @@ from service.core.evidence_metadata import (
     EVIDENCE_FIELDS,
     evidence_metadata,
     ranking_text,
+)
+from service.core.entity_retrieval import (
+    COMPANY_FILTER_KEY, CompanyConstraint, resolve_company_constraint,
 )
 
 from service.core.rag.settings import TAG_FLD, PAGERANK_FLD
@@ -59,7 +63,7 @@ def reciprocal_rank_fusion(
     *,
     k: int = 60,
 ) -> RrfFusionResult:
-    """Fuse independent rankings without comparing their raw score scales."""
+    """融合各路独立排名，不直接比较量纲不同的原始分数。"""
     # 将多路独立检索的排名结果合并成一个统一的排序，而且只用名次，不比较各自的原始分数
     if k <= 0:
         raise ValueError("RRF k must be greater than zero")
@@ -192,6 +196,7 @@ class Dealer:
             default_factory=lambda: {PAGERANK_FLD: 10}
         )
         kb_ids: list[str] | None = None
+        company_constraint: CompanyConstraint | None = None
 
         def __post_init__(self):
             positive_fields = {
@@ -246,6 +251,12 @@ class Dealer:
             #如果请求中包含这些字段，并且不为None，则将其添加到过滤条件中
             if key in req and req[key] is not None:
                 condition[key] = req[key]
+        # 公司限制在两路召回之前生成；关键词放宽时也不会删除它。
+        scope = req.get("company_constraint")
+        if scope is None:
+            scope = resolve_company_constraint(req.get("question", ""))
+        if scope.enabled:
+            condition[COMPANY_FILTER_KEY] = list(scope.entity_ids)
         return condition
 
     def _build_search_context(self, req):
@@ -301,7 +312,7 @@ class Dealer:
         self, context, idx_names, kb_ids, highlight_fields,
         match_expressions, rank_feature,
     ):
-        """Execute one independent retrieval branch in Elasticsearch."""
+        """在 Elasticsearch 中执行一个独立检索分支。"""
         return self.dataStore.search(
             context.source_fields,
             highlight_fields,
@@ -343,7 +354,7 @@ class Dealer:
 
     @staticmethod
     def _redistribute_empty_branch_weights(branches, requested_weights):
-        """Keep modality weights stable when one retrieval branch is empty."""
+        """某个检索分支为空时，仍保留其他分支的既定权重。"""
         active_names = {branch.name for branch in branches if branch.ids}
         active_keywords = sorted(
             name
@@ -450,8 +461,8 @@ class Dealer:
             rank_feature,
         )
 
-        # Relax only this lexical branch. Metadata and document filters remain
-        # unchanged so fallback cannot escape the caller's retrieval scope.
+        # 仅放宽当前关键词分支，继续保留元数据和文档过滤条件，
+        # 确保回退检索不会超出调用方指定的范围。
         if self.dataStore.getTotal(response) == 0:
             match_text, keywords = self.qryr.question(text, min_match=0.1)
             response = self._run_hybrid_search(
@@ -579,9 +590,9 @@ class Dealer:
         self, req, context, question, idx_names, kb_ids,
         highlight, rank_feature,
     ):
-        """Run independent lexical/vector retrieval and fuse with RRF."""
-        # Candidate retrieval always starts at rank one in every branch. Final
-        # pagination is applied after semantic reranking.
+        """执行独立的关键词和向量检索，再通过倒数排名融合合并。"""
+        # 每个分支都从第一名开始召回候选；
+        # 最终分页在语义重排完成后执行。
         context.offset = 0
         expanded_question = req.get("keyword_question") or question
         has_expanded_query = (
@@ -694,7 +705,7 @@ class Dealer:
         return [float(t) for t in txt.split("\t")]
 
     def _rank_feature_scores(self, query_rfea, search_res):
-        ## For rank feature(tag_fea) scores.
+        # 处理排名特征 tag_fea 的得分。
         rank_fea = []
         pageranks = []
         for chunk_id in search_res.ids:
@@ -718,7 +729,7 @@ class Dealer:
         return np.array(rank_fea)*10. + pageranks
 
     def rerank_by_model(self, search_result, query):
-        """Rerank RRF candidates using only the user's original question."""
+        """只使用用户原始问题，对排名融合后的候选进行语义重排。"""
         documents = []
         for chunk_id in search_result.ids:
             source = search_result.field[chunk_id]
@@ -743,6 +754,7 @@ class Dealer:
         request = {
             "question": question,
             "keyword_question": keyword_question or question,
+            "company_constraint": options.company_constraint or resolve_company_constraint(question),
             "kb_ids": options.kb_ids,
             "doc_ids": options.doc_ids,
             # 每一路先独立召回候选，再由 RRF 截断后进入语义重排。
@@ -786,7 +798,7 @@ class Dealer:
         question: str,
         options: RetrievalOptions,
     ):
-        """Fuse semantic and retrieval ranks, then demote hard conflicts."""
+        """融合语义排名与检索排名，并降低硬约束冲突候选的优先级。"""
         if not search_result.ids:
             return [], np.array([], dtype=float)
 
@@ -1101,6 +1113,9 @@ class Dealer:
             "initial_retrieval": round(initial_retrieval_ms, 3),
             "rerank": round(rerank_ms, 3),
         }
+        scope = request.get("company_constraint")
+        if scope is not None:
+            result["company_constraint"] = scope.to_dict()
         return result
 
     def sql_retrieval(self, sql, fetch_size=128, format="json"):

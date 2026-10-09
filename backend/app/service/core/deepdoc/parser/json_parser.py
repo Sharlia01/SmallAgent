@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2025 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,8 +16,8 @@
 #  limitations under the License.
 #
 
-# The following documents are mainly referenced, and only adaptation modifications have been made
-# from https://github.com/langchain-ai/langchain/blob/master/libs/text-splitters/langchain_text_splitters/json.py
+# 主要参考以下实现，并根据本项目需要进行了适配：
+# https://github.com/langchain-ai/langchain/blob/master/libs/text-splitters/langchain_text_splitters/json.py
 
 import json
 from typing import Any
@@ -44,28 +45,28 @@ class RAGFlowJsonParser:
 
     @staticmethod
     def _json_size(data: dict) -> int:
-        """Calculate the size of the serialized JSON object."""
+        """计算 JSON 对象序列化后的大小。"""
         return len(json.dumps(data, ensure_ascii=False))
 
     @staticmethod
     def _set_nested_dict(d: dict, path: list[str], value: Any) -> None:
-        """Set a value in a nested dictionary based on the given path."""
+        """按给定路径设置嵌套字典中的值。"""
         for key in path[:-1]:
             d = d.setdefault(key, {})
         d[path[-1]] = value
 
     def _list_to_dict_preprocessing(self, data: Any) -> Any:
         if isinstance(data, dict):
-            # Process each key-value pair in the dictionary
+            # 逐个处理字典中的键值对。
             return {k: self._list_to_dict_preprocessing(v) for k, v in data.items()}
         elif isinstance(data, list):
-            # Convert the list to a dictionary with index-based keys
+            # 将列表转换为以元素下标为键的字典。
             return {
                 str(i): self._list_to_dict_preprocessing(item)
                 for i, item in enumerate(data)
             }
         else:
-            # Base case: the item is neither a dict nor a list, so return it unchanged
+            # 递归结束条件：既不是字典也不是列表的元素直接返回。
             return data
         
     def _json_split(
@@ -74,9 +75,7 @@ class RAGFlowJsonParser:
         current_path: list[str] | None,
         chunks: list[dict] | None,
     ) -> list[dict]:
-        """
-        Split json into maximum size dictionaries while preserving structure.
-        """
+        """在保留原有结构的前提下，将 JSON 拆分为大小受限的字典片段。"""
         current_path = current_path or []
         chunks = chunks or [{}]
         if isinstance(data, dict):
@@ -87,17 +86,17 @@ class RAGFlowJsonParser:
                 remaining = self.max_chunk_size - chunk_size
 
                 if size < remaining:
-                    # Add item to current chunk
+                    # 将当前元素加入正在构建的片段。
                     self._set_nested_dict(chunks[-1], new_path, value)
                 else:
                     if chunk_size >= self.min_chunk_size:
-                        # Chunk is big enough, start a new chunk
+                        # 当前片段达到最小大小后，开始构建新片段。
                         chunks.append({})
 
-                    # Iterate
+                    # 遍历剩余元素。
                     self._json_split(value, new_path, chunks)
         else:
-            # handle single item
+            # 处理单个元素。
             self._set_nested_dict(chunks[-1], current_path, data)
         return chunks
 
@@ -106,7 +105,7 @@ class RAGFlowJsonParser:
         json_data,
         convert_lists: bool = False,
     ) -> list[dict]:
-        """Splits JSON into a list of JSON chunks"""
+        """将 JSON 拆分为多个 JSON 片段。"""
 
         if convert_lists:
             preprocessed_data = self._list_to_dict_preprocessing(json_data)
@@ -114,7 +113,7 @@ class RAGFlowJsonParser:
         else:
             chunks = self._json_split(json_data, None, None)
 
-        # Remove the last chunk if it's empty
+        # 最后一个片段为空时将其删除。
         if not chunks[-1]:
             chunks.pop()
         return chunks
@@ -125,9 +124,9 @@ class RAGFlowJsonParser:
         convert_lists: bool = False,
         ensure_ascii: bool = True,
     ) -> list[str]:
-        """Splits JSON into a list of JSON formatted strings"""
+        """将 JSON 拆分为多个 JSON 格式字符串。"""
 
         chunks = self.split_json(json_data=json_data, convert_lists=convert_lists)
 
-        # Convert to string
+        # 将片段转换为字符串。
         return [json.dumps(chunk, ensure_ascii=ensure_ascii) for chunk in chunks]

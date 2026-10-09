@@ -16,7 +16,7 @@ target_metadata = Base.metadata
 
 
 def get_database_url() -> str:
-    """Return the deployment-provided database URL or fail explicitly."""
+    """读取部署环境提供的数据库地址；缺少地址时明确报错。"""
     database_url = os.environ.get("DATABASE_URL")
     if not database_url:
         raise RuntimeError("DATABASE_URL must be configured before running Alembic")
@@ -24,7 +24,7 @@ def get_database_url() -> str:
 
 
 def migration_context_options() -> dict:
-    """Keep autogenerate sensitive to model/schema drift."""
+    """使自动生成迁移能够检测模型与数据库结构之间的差异。"""
     return {
         "target_metadata": target_metadata,
         "compare_type": True,

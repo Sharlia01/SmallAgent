@@ -25,8 +25,8 @@ function normalizeLegacyWebReferences(
   )
   if (webReferenceIndex === undefined || webReferenceIndex < 0) return content
 
-  // Older answers can contain DashScope's internal ref_N marker. Point it at
-  // the aggregate web-search document used by this application's citations.
+  // 旧回答可能包含 DashScope 内部的 ref_N 标记，将其映射到
+  // 本应用引用列表中的汇总网页搜索文档。
   return content.replace(LEGACY_WEB_REFERENCE_PATTERN, () =>
     `##${webReferenceIndex + 1}$$`,
   )
@@ -68,7 +68,7 @@ export function Result(props: {
     ]
   }, [item.content])
 
-  /* markdown */
+  /* 以下为 Markdown 示例内容。 */
   const extensions = useMemo<TokenizerAndRendererExtension[]>(
     () => [
       {

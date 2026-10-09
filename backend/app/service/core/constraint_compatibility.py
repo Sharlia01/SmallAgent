@@ -1,9 +1,8 @@
-"""Deterministic compatibility checks for hard retrieval constraints.
+"""对检索的硬约束执行确定性兼容检查。
 
-The semantic reranker answers whether a passage is topically relevant.  This
-module handles a narrower question: whether an explicitly stated candidate
-constraint is compatible with the one in the user's query.  Missing candidate
-metadata stays neutral; only an explicit, comparable mismatch is a conflict.
+语义重排负责判断主题相关性；此模块只判断候选中明确陈述的约束
+是否与用户问题兼容。候选元数据缺失时保持中性，
+仅将明确、可比较的不一致判为冲突。
 """
 
 from __future__ import annotations
@@ -117,9 +116,8 @@ _FORECAST_PATTERN = re.compile(
 )
 _TARGET_PATTERN = re.compile(r"目标|规划目标|计划达到|力争")
 
-# Only compare generic measurement dimensions here.  Business metric identity
-# is open-ended and belongs to semantic retrieval; enumerating names such as
-# revenue, cash flow, or installed capacity would overfit individual corpora.
+# 这里只比较通用计量维度。业务指标识别交由语义检索处理，
+# 避免枚举营收、现金流或装机容量等名称而过度适配个别语料。
 _MEASUREMENT_DIMENSION_PATTERNS = {
     "rate": re.compile(r"率|比例|占比|比重|百分比|百分点|[%％]"),
     "currency_amount": re.compile(
@@ -165,7 +163,7 @@ _MEASUREMENT_SUBJECT_NOISE_PATTERN = re.compile(
 
 @dataclass(frozen=True)
 class ConstraintCategoryDecision:
-    """Compatibility result for one comparable constraint category."""
+    """一类可比较约束的兼容性结果。"""
 
     level: CompatibilityLevel
     required: list[str]
@@ -175,7 +173,7 @@ class ConstraintCategoryDecision:
 
 @dataclass(frozen=True)
 class ConstraintCompatibilityDecision:
-    """Structured diagnostics used by final retrieval ordering."""
+    """最终检索排序使用的结构化诊断信息。"""
 
     categories: dict[str, ConstraintCategoryDecision]
     compatible_count: int
@@ -207,7 +205,7 @@ def _quarter_number(value: str) -> str:
 
 
 def extract_time_scopes(text: str) -> set[str]:
-    """Extract canonical, explicitly scoped periods such as ``2025-Q2``."""
+    """提取带明确范围的规范报告期，例如 2025-Q2。"""
     normalized = unicodedata.normalize("NFKC", str(text or ""))
     compact = re.sub(r"\s+", "", normalized)
     scopes: set[str] = set()
@@ -239,8 +237,8 @@ def extract_time_scopes(text: str) -> set[str]:
     for match in _FORECAST_YEAR.finditer(compact):
         scopes.add(f"{_expanded_year(match.group('year'))}-FY")
 
-    # Support forms where the year and period are separated by a few words,
-    # but only when the text contains one unambiguous year.
+    # 支持年份与报告期之间夹有少量词语的表达，
+    # 但仅在全文包含唯一、无歧义年份时建立绑定。
     years = set(_YEAR_PATTERN.findall(normalized))
     if len(years) == 1:
         year = next(iter(years))
@@ -296,7 +294,7 @@ def extract_fact_statuses(
 
 
 def extract_measurement_dimensions(text: str) -> set[str]:
-    """Extract generic numeric dimensions suitable for hard mismatches."""
+    """提取可用于判断明确不一致的通用数值维度。"""
     value = unicodedata.normalize("NFKC", str(text or ""))
     return {
         dimension
@@ -306,14 +304,14 @@ def extract_measurement_dimensions(text: str) -> set[str]:
 
 
 def extract_organizations(text: str) -> set[str]:
-    # Planning and ranking must agree on entity boundaries. In particular,
-    # narrative prefixes such as “解释/查询” are not part of a company name.
+    # 规划与排序必须使用一致的实体边界；
+    # “解释”“查询”等叙述前缀不属于公司名称。
     from service.core.query_expansion import _extract_organizations
     return {_normalize(value) for value in _extract_organizations(str(text or ""))}
 
 
 def _measurement_subject_text(text: str) -> str:
-    """Remove generic constraints and retain query-specific subject text."""
+    """移除通用约束，保留问题中特有的主体文本。"""
     subject = _normalize(text)
     for organization in extract_organizations(text):
         subject = subject.replace(organization, "")
@@ -324,7 +322,7 @@ def _longest_common_measurement_subject(
     required: str,
     observed: str,
 ) -> str:
-    """Find a conservative lexical subject match without a metric lexicon."""
+    """不依赖指标词表，保守判断主体的字面匹配。"""
     maximum_length = min(len(required), len(observed), 16)
     for size in range(maximum_length, 1, -1):
         for start in range(len(required) - size + 1):
@@ -338,10 +336,10 @@ def _compare_measurement_subjects(
     question: str,
     candidate_text: str,
 ) -> ConstraintCategoryDecision | None:
-    """Return a soft lexical subject match for dimension-bearing questions.
+    """对包含计量维度的问题返回软性主体字面匹配结果。
 
-    Absence is deliberately ``unknown``, never ``conflict``: aliases and
-    paraphrases remain eligible for the semantic reranker.
+    没有匹配时返回 unknown，而非 conflict，
+    使别名和改写表达仍有机会进入语义重排。
     """
     if not extract_measurement_dimensions(question):
         return None
@@ -412,8 +410,8 @@ def _compare_time_scopes(
     elif not observed:
         level = "unknown"
     else:
-        # A bare year in the candidate does not prove that its facts use the
-        # query's requested quarter/half-year scope, so keep it neutral.
+        # 候选仅出现年份，不能证明其事实属于所要求的季度或半年，
+        # 因此保持中性，不将其视为已匹配。
         required_years = {scope.split("-", 1)[0] for scope in required}
         observed_bare_years = {
             scope.split("-", 1)[0]
@@ -439,7 +437,7 @@ def evaluate_constraint_compatibility(
     *,
     document_name: str = "",
 ) -> ConstraintCompatibilityDecision:
-    """Compare high-confidence query constraints with one candidate passage."""
+    """比较高置信度查询约束与单条候选片段。"""
     categories: dict[str, ConstraintCategoryDecision] = {}
 
     comparisons = {
@@ -468,9 +466,8 @@ def evaluate_constraint_compatibility(
         if decision is not None:
             categories[category] = decision
 
-    # Entity absence is not an explicit conflict because body chunks often
-    # inherit the entity from their document.  A match in either document
-    # metadata or passage content still provides a useful diagnostic/tie-break.
+    # 正文片段可能从文档继承实体，缺少名称不构成明确冲突。
+    # 文档元数据或正文中的实体匹配可作为诊断信息和排序同分时的依据。
     required_entities = extract_organizations(question)
     if required_entities:
         document_stem = Path(str(document_name or "")).stem

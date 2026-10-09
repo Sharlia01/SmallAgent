@@ -1,4 +1,4 @@
-"""LLM-backed query normalization shared by every retrieval caller."""
+"""所有检索调用方共用的模型查询规范化。"""
 
 from __future__ import annotations
 
@@ -97,11 +97,10 @@ def _parse_rewritten_query(content: str) -> str:
 
 
 def rewrite_query(question: str, *, client: Any | None = None) -> str:
-    """Return one retrieval-oriented rewrite, falling back to the input.
+    """返回面向检索的改写，失败时回退原始输入。
 
-    Query rewriting is an optional quality enhancement: missing credentials,
-    provider failures, malformed output, and oversized inputs must never make
-    knowledge-base retrieval unavailable.
+    改写只是可选的质量增强；缺少凭据、提供方故障、输出格式错误
+    或输入过长都不能使知识库检索不可用。
     """
     original_question = question.strip() if isinstance(question, str) else ""
     if not original_question:
@@ -109,7 +108,7 @@ def rewrite_query(question: str, *, client: Any | None = None) -> str:
     if not _environment_flag("QUERY_REWRITE_ENABLED", True):
         return original_question
 
-    # Skip query rewriting for inputs that are too long
+    # 输入过长时跳过查询改写。
     if len(original_question) > MAX_QUERY_REWRITE_INPUT_CHARS:
         logger.info(
             "Skipping query rewrite because input is too long: chars=%s",

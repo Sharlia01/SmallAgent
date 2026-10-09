@@ -12,7 +12,7 @@ class KnowledgeBase(Base):
     )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    # Database-level cascade keeps owned knowledge-base rows from becoming orphans.
+    # 通过数据库级联删除，防止所属知识库记录成为孤立数据。
     user_id = Column(
         Integer,
         ForeignKey(

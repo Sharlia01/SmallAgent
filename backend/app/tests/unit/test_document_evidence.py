@@ -1,3 +1,6 @@
+from tests.evidence_helpers import make_query
+from service.core.evidence_adapter import collection_from_records
+from tests.evidence_helpers import make_evidence_record, make_tool_result
 import json
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -17,10 +20,10 @@ from service.core.rag.nlp import tokenize_table
 from service.core.rag.nlp import rag_tokenizer
 from service.core import file_parse
 from service.core.rag.utils import es_conn
-from service.core.evidence_sufficiency import check_evidence_sufficiency
+from service.core.evidence_verification import verify_evidence
 from service.core.retrieval import format_retrieved_chunk
-from agent.tools.rag_search import _chunk_to_source
-from agent.orchestrator import tool_results_to_retrieved_content
+from service.core.evidence_adapter import evidence_from_record, reference_records
+from agent.orchestrator import collect_tool_evidence
 from agent.schemas import ToolResult
 
 
@@ -451,10 +454,12 @@ def test_bulk_non_timeout_exception_is_not_reported_as_success(monkeypatch):
 @pytest.mark.parametrize("enabled", ["true", "false"])
 def test_ocr_only_figure_cannot_answer_visual_question_even_if_verifier_disabled(monkeypatch, enabled):
     monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_ENABLED", enabled)
-    decision = check_evidence_sufficiency("图3中哪一年为负？", [{
+    decision = verify_evidence(make_query("图3中哪一年为负？"),
+        collection_from_records([{
         "chunk_id": "fig", "content_with_weight": "图3 利润 2021 2022",
         "evidence_type_kwd": "figure", "visual_status_kwd": "disabled",
-    }], client=Mock())
+    }]),
+        client=Mock())
     assert decision.sufficient is False
     assert decision.source == "rule"
 
@@ -462,12 +467,12 @@ def test_ocr_only_figure_cannot_answer_visual_question_even_if_verifier_disabled
 def test_retrieval_and_tool_source_keep_evidence_metadata():
     formatted = format_retrieved_chunk({"chunk_id": "fig", "content_with_weight": "图1",
         "evidence_type_kwd": "figure", "visual_status_kwd": "disabled", "page_num_int": [2]}, 1)
-    source = _chunk_to_source(formatted, 1)
-    assert source.metadata["visual_status_kwd"] == "disabled"
-    assert source.metadata["page_num_int"] == [2]
-    references = tool_results_to_retrieved_content([
-        ToolResult(tool_name="search_knowledge_base", query="图1", content="图1", sources=[source])
-    ])
+    source = evidence_from_record(formatted)
+    assert source.structure.figure.status == "disabled"
+    assert list(source.structure.coordinates["page_num_int"]) == [2]
+    references = reference_records(collect_tool_evidence([
+        make_tool_result(tool_name="search_knowledge_base", query="图1", content="图1", sources=[formatted])
+    ]))
     assert references[0]["visual_status_kwd"] == "disabled"
     assert references[0]["page_num_int"] == [2]
 

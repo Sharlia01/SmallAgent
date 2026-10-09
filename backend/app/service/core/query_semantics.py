@@ -1,7 +1,7 @@
-"""Deterministic semantic primitives; uncertainty is never treated as proof.
+"""确定性的语义基础规则，不将不确定信息视为证明。
 
-The registry supplies exact aliases, not related concepts. Open-ended entity
-recognition belongs in the query contract's source-grounded constraints.
+登记表只提供精确等价的别名，不包含仅有关联的概念。
+开放式实体识别由带原文约束的查询契约处理。
 """
 
 from __future__ import annotations
@@ -22,8 +22,8 @@ def canonical_text(text: str) -> str:
     text = unicodedata.normalize("NFKC", text).casefold()
     text = text.replace("−", "-").replace("－", "-").replace("—", "-")
     text = re.sub(r"((?:19|20)\d{2})\s*年?\s*(?:至|到|-)\s*((?:19|20)\d{2})", r"\1-\2", text)
-    # Optional 年 is notation, not an additional date. Keep month/quarter and
-    # forecast markers intact so different reporting periods never collapse.
+    # 可省略的“年”只是日期写法差异，不是新增日期；
+    # 保留月、季度和预测标记，避免将不同报告期合并。
     text = re.sub(r"((?:19|20)\d{2})\s*年", r"\1", text)
     text = re.sub(r"((?:19|20)\d{2})\s*h1", r"\1上半年", text)
     text = re.sub(r"((?:19|20)\d{2})\s*h2", r"\1下半年", text)
@@ -42,8 +42,8 @@ def canonical_text(text: str) -> str:
     return "".join(c for c in text if c.isalnum() or c in "+-%./<>=")
 
 
-# Query-language equivalences are deliberately separate from metric aliases:
-# “赚多少钱” does not establish a particular accounting definition of profit.
+# 查询语言的等价表达与指标别名单独处理；
+# “赚多少钱”不能证明用户要求某一种会计口径的利润。
 QUERY_CONCEPTS = {
     "盈利": ("赚多少钱", "能赚多少", "盈利"),
     "估值": ("估值贵不贵", "估值水平", "估值"),
@@ -60,10 +60,10 @@ def constraint_text(text: str) -> str:
 
 
 def reporting_periods(text: str) -> set[str]:
-    """Resolve omitted years only within a clause that has one explicit year.
+    """仅在分句包含唯一明确年份时，补全其中省略的年份。
 
-    Year lists stay lists. A range is never collapsed to one of its endpoints.
-    This is a binding primitive, not a fuzzy date similarity check.
+    年份列表仍按列表处理，范围不能缩减为其中一个端点。
+    这是期间绑定规则，不是模糊日期相似度判断。
     """
     normalized = constraint_text(text)
     pattern = re.compile(r"((?:19|20)\d{2})(预测)?(\d{1,2}月(?:\d{1,2}日)?|上半年|下半年|第[一二三四]季度|全年|年度)?")
@@ -93,10 +93,10 @@ def metric_terms(text: str) -> list[str]:
 
 
 def explicit_named_terms(text: str) -> list[str]:
-    """A small high-precision supplement to organization/quoted anchors."""
+    """对组织名称和引号锚点进行范围有限、精度优先的补充。"""
     terms = []
-    # Preserve both arguments of common person/location questions. This is a
-    # guard, not a claim to implement general Chinese NER.
+    # 保留常见人物与地点问题的两个关系参数；
+    # 这里只做有限保护，不是通用中文命名实体识别。
     for match in re.finditer(
         r"(?:^|[，。；！？\s])([\u4e00-\u9fffA-Za-z·]{2,12})在"
         r"([\u4e00-\u9fffA-Za-z·]{2,12}?)(?:负责|工作|任职|担任|居住)", text,
@@ -125,8 +125,8 @@ def semantic_conflicts(original: str, candidate: str) -> list[str]:
     candidate_ops += re.findall(r"[<>]=?|(?<![<>])=", candidate)
     if original_ops != candidate_ops:
         conflicts.append("comparison_operator_changed")
-    # Reversal can retain every token. Keep argument order for explicit 比
-    # relations; clause-local constraints additionally protect decomposed plans.
+    # 反转关系仍可能保留所有词语，因此“比”关系必须保留参数顺序；
+    # 按来源分句校验还会保护拆分计划中的局部绑定。
     if re.search(r"(?<![同环])比(?![较例重率])", original):
         def operands(text: str):
             return [canonical_text(part) for part in re.split(
@@ -138,7 +138,7 @@ def semantic_conflicts(original: str, candidate: str) -> list[str]:
             if years != candidate_order:
                 conflicts.append("comparison_arguments_changed")
         left = operands(original)[0]
-        # Keep explicit subjects on their respective sides of a comparison.
+        # 保留比较两侧各自的明确主体。
         from service.core.query_expansion import _extract_organizations
         subjects = _extract_organizations(original)
         first = [s for s in subjects if canonical_text(s) in left]
@@ -147,7 +147,7 @@ def semantic_conflicts(original: str, candidate: str) -> list[str]:
             normalized = canonical_text(candidate)
             if normalized.find(canonical_text(first[0])) > normalized.find(canonical_text(second[0])):
                 conflicts.append("comparison_subjects_changed")
-    # Polarity and value type are hard constraints, including positive requests.
+    # 正负方向和值类型都属于硬约束，正向请求也需检查。
     for term in ("不含", "不包括", "不考虑", "实际", "预测", "累计", "新增",
                  "单季度", "全年", "扣非"):
         if term in original and term not in candidate:
@@ -166,7 +166,7 @@ def alias_expansions(text: str, maximum: int = 8) -> list[str]:
     normalized = canonical_text(text)
     for canonical, aliases in domain_policy()["aliases"].items():
         if canonical_text(canonical) in normalized:
-            # Keep related but distinct metrics out of an alias expansion.
+            # 相关但含义不同的指标不能作为同义词扩展。
             if canonical == "归母净利润" and "扣非归母净利润" in normalized:
                 continue
             for alias in [canonical, *aliases]:

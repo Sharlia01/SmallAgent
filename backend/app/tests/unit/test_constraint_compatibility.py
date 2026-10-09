@@ -171,8 +171,8 @@ def test_measurement_compatibility_detects_dimension_not_business_identity():
     assert expense_amount.categories["measurement_dimension"].level == (
         "conflict"
     )
-    # Both are rates.  Topic identity is intentionally left to the semantic
-    # reranker instead of a corpus-specific metric-name dictionary.
+    # 两者都是比率。具体指标是否等价交给语义重排判断，
+    # 避免使用只适配某个语料的指标名称词典。
     assert unrelated_margin.categories["measurement_dimension"].level == (
         "compatible"
     )

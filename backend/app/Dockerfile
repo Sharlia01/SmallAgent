@@ -40,8 +40,8 @@ RUN pip install --no-cache-dir --retries 10 --timeout 120 -r requirements.txt &&
         pip install --no-cache-dir --retries 10 --timeout 120 -r requirements-test.txt; \
     fi
 
-# Keep the local embedding/reranker runtime in its own layer so changing it does not
-# force Docker to reinstall the project's larger, stable dependency set.
+# 将本地向量模型和重排模型的运行依赖放在独立镜像层，
+# 避免修改模型运行环境时重新安装项目中体积较大的稳定依赖。
 RUN pip install --no-cache-dir --retries 10 --resume-retries 30 --timeout 120 \
     torch==2.2.2 \
     transformers==4.48.3 \

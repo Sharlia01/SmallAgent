@@ -1,4 +1,4 @@
-"""Check that goal constraints do not add unsupported concrete details."""
+"""检查目标约束是否新增原文不支持的具体条件。"""
 
 from __future__ import annotations
 
@@ -41,8 +41,8 @@ def ground_constraint(value: str, question: str) -> GroundedConstraint:
         return GroundedConstraint(value, normalized, "literal",
                                   ({"quote": value, "start": start, "end": start + len(value)},), rule)
 
-    # Colloquial wording may be paraphrased. Only newly introduced concrete
-    # names, dates, numbers, and scopes are grounds for rejecting a constraint.
+    # 口语表达允许改写；仅当约束新增无依据的具体名称、日期、
+    # 数字或口径时，才据此拒绝该约束。
     from service.core.query_expansion import validate_query_preservation
     added = validate_query_preservation(question, normalized).added_risky_terms
     if added:

@@ -1,4 +1,4 @@
-"""Merged evidence must be ranked for the original question, with hop coverage."""
+"""合并证据须按原始问题排序，并保持两跳覆盖。"""
 
 from copy import deepcopy
 import pytest
@@ -43,7 +43,7 @@ def hops():
             "优于大市的评级定义",
             {"total": 10, "chunks": [
                 make_chunk("definition", "优于大市：股价表现优于市场代表性指数10%以上。", score=0.999, fusion=0.091),
-                # The same chunk has a different score for the second question.
+                # 同一个片段对第二个问题有不同得分。
                 {**rating, "rerank_score": 0.3},
             ]},
         ),
@@ -87,7 +87,7 @@ def test_original_question_rerank_removes_pinned_report_list(monkeypatch, hops):
     assert [c["chunk_id"] for c in result["chunks"]] == ["rating", "duplicate", "definition"]
     assert len(calls) == 1
     assert calls[0][0] == QUESTION
-    assert len(calls[0][1]) == 4  # One request, deduplicated across both hops.
+    assert len(calls[0][1]) == 4  # 两跳共用同一请求，重复查询按请求去重。
     rating = result["chunks"][0]
     assert rating["rerank_score"] == rating["similarity"] == 0.95
     assert [s["rerank_score"] for s in rating["sequential_subqueries"]] == [0.85, 0.3]
@@ -115,7 +115,7 @@ def test_second_hop_can_lead_when_more_relevant_to_original_question(monkeypatch
 
 
 def test_shared_top_result_does_not_crowd_out_unique_second_hop_evidence(monkeypatch, hops):
-    hops[1][2]["chunks"].reverse()  # Both hops can return the direct rating first.
+    hops[1][2]["chunks"].reverse()  # 两跳都可能将直接评级证据排在首位。
     stub_scores(monkeypatch, hops, {
         "list": 0.1, "rating": 0.95, "duplicate": 0.9, "definition": 0.3,
     })

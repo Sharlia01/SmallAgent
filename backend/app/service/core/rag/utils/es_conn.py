@@ -1,4 +1,5 @@
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2025 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,6 +31,7 @@ from service.core.rag.utils.doc_store_conn import MatchExpr, OrderByExpr, MatchT
 from service.core.rag.nlp import is_english
 from dotenv import load_dotenv
 from service.core.query_runtime import current_runtime, QueryBudgetExceeded
+from service.core.entity_retrieval import COMPANY_FILTER_KEY, CANDIDATE_STATUSES
 
 load_dotenv()
 
@@ -51,7 +53,7 @@ class ESConnection:
 
         logger.info(f"Connecting to Elasticsearch at {ES_HOST}")
         self.es = Elasticsearch(
-            [ES_HOST],  # Elasticsearch URL
+            [ES_HOST],  # Elasticsearch 服务地址。
             basic_auth=(os.getenv("ELASTIC_USERNAME", "elastic"), es_password),
             verify_certs=False,  # 禁用 SSL 证书验证
             timeout=600
@@ -62,9 +64,7 @@ class ESConnection:
         self.mapping = json.load(open(fp_mapping, "r"))
 
 
-    """
-    Helper functions for search result
-    """
+    """搜索结果的辅助处理函数。"""
 
     def getTotal(self, res):
         if isinstance(res["hits"]["total"], type({})):
@@ -115,7 +115,7 @@ class ESConnection:
         for d in self.__getSource(res):
             m = {n: d.get(n) for n in fields if d.get(n) is not None}
             for n, v in m.items():
-                if isinstance(v, list):
+                if isinstance(v, (list, dict)):
                     m[n] = v
                     continue
                 if not isinstance(v, str):
@@ -136,11 +136,9 @@ class ESConnection:
             rr.append(d["_source"])
         return rr
 
-    """
-    Database operations
-    """
+    """数据库操作接口。"""
     def _ensure_index(self, index_name: str) -> None:
-        """Create a missing index with the configured dynamic templates."""
+        """使用配置的动态模板创建缺失索引。"""
         if self.es.indices.exists(index=index_name):
             return
 
@@ -151,12 +149,12 @@ class ESConnection:
                 mappings=self.mapping.get("mappings", {}),
             )
         except BadRequestError as error:
-            # Another upload may create the same user index after exists().
+            # 检查索引存在性后，另一条并发上传可能已经创建同一用户索引。
             if "resource_already_exists_exception" not in str(error):
                 raise
 
     def insert(self, documents: list[dict], indexName: str, knowledgebaseId: str = None) -> list[str]:
-        # Refers to https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-bulk.html
+        # 批量写入接口参考：https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-bulk.html
         operations = []
         for d in documents:
             assert "_id" not in d
@@ -192,10 +190,10 @@ class ESConnection:
         return res
 
     def replace_document(self, documents: list[dict], index_name: str, doc_id: str) -> dict:
-        """Write new chunks first, then delete only the superseded snapshot IDs.
+        """先写入新片段，再仅删除已被替换的旧快照片段编号。
 
-        A failed write leaves old chunks intact. This is not an atomic ES swap;
-        readers can briefly see both versions, and a retry reconciles partial writes.
+        写入失败时保留旧片段。该操作不是 Elasticsearch 原子切换，
+        读取方可能短暂看到两个版本；重试会协调部分写入的状态。
         """
         if not documents or any(d.get("doc_id") != doc_id or d.get("kb_id") != index_name for d in documents):
             raise ValueError("Replacement requires nonempty chunks from one document and index")
@@ -235,10 +233,30 @@ class ESConnection:
         assert "_id" not in condition
 
         bool_query = Q("bool", must=[])
-        # 保留原有行为：把知识库范围加入调用方传入的 condition。
-        condition["kb_id"] = knowledgebase_ids
+        # 多路检索共用同一份条件，构造 ES 查询时不要改动它。
+        condition = dict(condition)
+        if knowledgebase_ids is not None:
+            condition["kb_id"] = knowledgebase_ids
 
         for field, value in condition.items():
+            if field == COMPANY_FILTER_KEY:
+                if not value:
+                    continue
+                if not isinstance(value, list) or not all(isinstance(entity_id, str) and entity_id for entity_id in value):
+                    raise ValueError("Company filter requires a list of nonempty entity IDs")
+                # 已明确属于别家公司的表格行，不能因文件名或候选标签而入选。
+                # 普通文字的候选标签只用来缩小搜索范围，不能证明数字归属。
+                bool_query.filter.append(Q(
+                    "bool", minimum_should_match=1,
+                    should=[
+                        Q("terms", subject_entity_ids=value),
+                        Q("bool", filter=[
+                            Q("terms", candidate_subject_entity_ids=value),
+                            Q("terms", entity_attribution_status_kwd=list(CANDIDATE_STATUSES)),
+                        ], must_not=[Q("exists", field="subject_entity_ids")]),
+                    ],
+                ))
+                continue
             if field == "available_int":
                 if value == 0:
                     bool_query.filter.append(
@@ -415,9 +433,9 @@ class ESConnection:
             isinstance(expression, MatchDenseExpr)
             for expression in match_expressions
         )
-        # A KNN-only branch already carries metadata constraints in knn.filter.
-        # Adding the same bool query at the top level would turn it into a
-        # disjunctive hybrid request and pollute the independent vector rank.
+        # 纯向量分支已在 knn.filter 中携带元数据约束；
+        # 若顶层再添加相同的 bool 查询，会变成带“或”关系的混合请求，
+        # 影响独立向量分支的排名。
         if not dense_only:
             search_query = search_query.query(bool_query)
         search_query = self._apply_highlights_and_aggregations(
@@ -506,16 +524,14 @@ class ESConnection:
         return self._execute_search(index_names, query_body)
 
     def delete(self, condition: dict, indexName: str, knowledgebaseId: str) -> int:
-        """
-        删除符合条件的文档
-        
-        Args:
-            condition: 删除条件
-            indexName: 索引名称
-            knowledgebaseId: 知识库ID
-            
-        Returns:
-            删除的文档数量
+        """删除符合条件的文档。
+
+        参数：
+            condition：删除条件。
+            indexName：索引名称。
+            knowledgebaseId：知识库编号。
+        返回：
+            删除的文档数量。
         """
         try:
             # 构建删除查询

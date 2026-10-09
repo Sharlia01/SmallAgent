@@ -8,16 +8,14 @@ import logging
 logger = logging.getLogger(__name__)
 
 def delete_document(user_id: int, file_name: str, db: Session) -> dict:
-    """
-    删除文档及其相关数据
-    
-    Args:
-        user_id: 用户ID
-        file_name: 文件名
-        db: 数据库会话
-        
-    Returns:
-        包含操作状态的字典
+    """删除文档及其相关数据。
+
+    参数：
+        user_id：用户编号。
+        file_name：文件名。
+        db：数据库会话。
+    返回：
+        包含操作状态的字典。
     """
     try:
         # 1. 从数据库中删除记录

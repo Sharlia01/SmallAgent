@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Build the enriched 50-question Guodian Power evaluation dataset.
+"""构建扩充后的 50 题国电电力评测集。
 
-The v1 file is intentionally kept immutable as a historical baseline. This
-builder migrates its 28 samples to the v2 schema and appends 22 confusion-heavy
-samples whose facts are all grounded in the same manually reviewed report.
+第一版文件作为历史基线保留；构建器将其中 28 个样本迁移至第二版结构，
+再增加 22 个容易混淆的样本，其事实均来自同一份人工审核报告。
 """
 
 from __future__ import annotations
@@ -47,7 +46,7 @@ TABLE_ROWS = {
 }
 
 
-# Each tuple contains claim text and one-based indexes into relevant_evidence.
+# 每个元组保存事实文本，以及 relevant_evidence 中从 1 开始的证据下标。
 CLAIM_OVERRIDES: dict[str, list[tuple[str, list[int]]]] = {
     "guodian-001": [
         ("2025年上半年营业收入为776.55亿元，同比下降9.52%。", [1]),

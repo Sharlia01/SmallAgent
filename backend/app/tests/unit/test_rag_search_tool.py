@@ -1,43 +1,41 @@
+from tests.evidence_helpers import bind_assessment
+from service.core.evidence_adapter import collection_from_records
 import pytest
 
 from agent.schemas import ToolResult
 from agent.tools import rag_search
 from agent.tools.base import AgentTool
+from service.core.retrieval_result import retrieval_result
+from service.core.evidence_adapter import assessment_from_record
 
 
 @pytest.mark.unit
 def test_rag_tool_returns_standard_result_and_preserves_sources(monkeypatch):
     calls = []
 
-    def fake_retrieve_content(index_name, query, *, page_size):
+    def fake_retrieve_content(index_name, query, *, page_size, context):
         calls.append((index_name, query, page_size))
-        return (
-            [
-                {
-                    "rank": 1,
-                    "chunk_id": "chunk-1",
-                    "document_id": "doc-1",
-                    "document_name": "内部制度.pdf",
-                    "content_with_weight": "差旅申请需要提前审批。",
-                    "similarity": 0.91,
-                    "vector_similarity": 0.88,
-                    "term_similarity": 0.44,
-                    "positions": [[5, 10]],
-                    "kb_id": "42",
-                    "image_id": "image-1",
-                }
-            ],
+        evidence = collection_from_records([
             {
-                "evidence_sufficiency": {
-                    "sufficient": True,
-                    "source": "model",
-                }
-            },
-        )
+                "rank": 1,
+                "chunk_id": "chunk-1",
+                "document_id": "doc-1",
+                "document_name": "内部制度.pdf",
+                "content_with_weight": "差旅申请需要提前审批。",
+                "similarity": 0.91,
+                "vector_similarity": 0.88,
+                "term_similarity": 0.44,
+                "positions": [[5, 10]],
+                "kb_id": "42",
+                "image_id": "image-1",
+            }
+        ])
+        report = bind_assessment(context, evidence, assessment_from_record({"sufficient": True, "source": "model"}))
+        return retrieval_result(context, evidence, collection_from_records([]), report, {})
 
     monkeypatch.setattr(
         rag_search,
-        "retrieve_content_with_diagnostics",
+        "retrieve_evidence",
         fake_retrieve_content,
     )
     tool = rag_search.RagSearchTool(user_id=42)
@@ -49,46 +47,35 @@ def test_rag_tool_returns_standard_result_and_preserves_sources(monkeypatch):
     assert calls == [("42", "差旅如何申请？", 8)]
     assert result.success is True
     assert result.error is None
-    assert result.metadata == {
-        "result_count": 1,
-        "top_k": 8,
-        "evidence_sufficiency": {
-            "sufficient": True,
-            "source": "model",
-        },
-    }
+    assert result.diagnostics == {"result_count": 1, "top_k": 8}
+    assert result.assessment.sufficient is True
     assert result.content == "[1] 内部制度.pdf\n差旅申请需要提前审批。"
-    assert result.sources[0].source_type == "knowledge_base"
-    assert result.sources[0].source_id == "chunk-1"
-    assert result.sources[0].score == 0.91
-    assert result.sources[0].metadata["document_id"] == "doc-1"
-    assert result.to_dict()["sources"][0]["title"] == "内部制度.pdf"
+    evidence = next(iter(result.evidence))
+    assert evidence.source.kind == "knowledge_base"
+    assert evidence.id == "chunk-1"
+    assert result.evidence.traces(evidence.id)[0].scores["similarity"] == 0.91
+    assert evidence.source.document_id == "doc-1"
+    assert result.to_dict()["evidence"][0]["document_name"] == "内部制度.pdf"
 
 
 @pytest.mark.unit
 def test_rag_tool_treats_no_matches_as_a_success(monkeypatch):
-    monkeypatch.setattr(
-        rag_search,
-        "retrieve_content_with_diagnostics",
-        lambda *_args, **_kwargs: (
-            [],
-            {
-                "evidence_sufficiency": {
-                    "sufficient": False,
-                    "source": "rule",
-                    "missing_requirements": ["直接证据"],
-                }
-            },
-        ),
-    )
+    def retrieve(*args, context, **kwargs):
+        evidence = collection_from_records([])
+        report = bind_assessment(context, evidence, assessment_from_record({
+            "sufficient": False, "source": "rule", "missing_requirements": ["直接证据"],
+        }))
+        return retrieval_result(context, evidence, evidence, report, {})
+
+    monkeypatch.setattr(rag_search, "retrieve_evidence", retrieve)
 
     result = rag_search.search_knowledge_base(42, "不存在的资料")
 
     assert result.success is True
-    assert result.sources == []
+    assert len(result.evidence) == 0
     assert result.content == rag_search.EMPTY_RESULT_MESSAGE
-    assert result.metadata["result_count"] == 0
-    assert result.metadata["evidence_sufficiency"]["sufficient"] is False
+    assert result.diagnostics["result_count"] == 0
+    assert result.assessment.sufficient is False
 
 
 @pytest.mark.unit
@@ -98,17 +85,17 @@ def test_rag_tool_converts_retrieval_exception_into_failure(monkeypatch):
 
     monkeypatch.setattr(
         rag_search,
-        "retrieve_content_with_diagnostics",
+        "retrieve_evidence",
         fail_retrieval,
     )
 
     result = rag_search.search_knowledge_base(42, "测试问题")
 
     assert result.success is False
-    assert result.sources == []
+    assert len(result.evidence) == 0
     assert result.content == ""
     assert result.error == rag_search.FAILED_RESULT_MESSAGE
-    assert result.metadata["error_type"] == "ConnectionError"
+    assert result.diagnostics["error_type"] == "ConnectionError"
 
 
 @pytest.mark.unit
@@ -126,4 +113,4 @@ def test_rag_tool_rejects_invalid_model_arguments(query, top_k):
     result = rag_search.search_knowledge_base(42, query, top_k)
 
     assert result.success is False
-    assert result.metadata["error_type"] == "validation_error"
+    assert result.diagnostics["error_type"] == "validation_error"

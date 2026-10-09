@@ -26,9 +26,9 @@ else:
     raise SystemExit('数据库连接失败!')
 "
 
-# Alembic owns the complete schema. A fresh database is upgraded from the
-# initial revision; an existing database advances from its recorded revision.
-# A migration failure stops startup instead of serving against a stale schema.
+# 数据库结构由 Alembic 统一管理。新数据库从初始版本升级，
+# 已有数据库从已记录的版本继续升级。
+# 迁移失败时停止启动，避免服务在过期结构上运行。
 echo "运行数据库迁移..."
 python run_migration.py
 

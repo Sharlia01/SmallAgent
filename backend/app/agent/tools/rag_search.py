@@ -1,14 +1,14 @@
-"""Knowledge-base search exposed through the standard Agent tool protocol."""
+"""通过标准 Agent 工具协议提供知识库搜索。"""
 
-from typing import Any
-from service.core.evidence_metadata import evidence_metadata
+from service.core.query_context import QueryContext, query_context_for
+from service.core.retrieval_result import RetrievalResult, adapt_retrieval_records
 from service.core.query_contract import QueryRequest
 from service.core.query_expansion import validate_query_preservation
 
-from agent.schemas import ToolResult, ToolSource
+from agent.schemas import ToolResult
 from service.core.retrieval import (
     DEFAULT_PAGE_SIZE,
-    retrieve_content_with_diagnostics,
+    retrieve_evidence,
 )
 from utils import logger
 
@@ -18,58 +18,15 @@ EMPTY_RESULT_MESSAGE = "未在当前用户的知识库中找到足以完整回�
 FAILED_RESULT_MESSAGE = "知识库检索暂时不可用。"
 
 
-def _source_id(chunk: dict[str, Any], rank: int) -> str:
-    """Return a stable source ID, with a deterministic fallback."""
-    chunk_id = chunk.get("chunk_id")
-    if chunk_id:
-        return str(chunk_id)
-    return f"rag-{rank}"
-
-
-def _chunk_to_source(chunk: dict[str, Any], rank: int) -> ToolSource:
-    """Map the existing retrieval chunk into the provider-neutral schema."""
-    source_rank = chunk.get("rank") or rank
-    content = chunk.get("content_with_weight") or ""
-    title = chunk.get("document_name") or "未知文档"
-
-    return ToolSource(
-        source_type="knowledge_base",
-        source_id=_source_id(chunk, source_rank),
-        title=str(title),
-        content=str(content),
-        score=chunk.get("similarity"),
-        metadata={
-            **evidence_metadata(chunk),
-            "rank": source_rank,
-            "document_id": chunk.get("document_id"),
-            "chunk_id": chunk.get("chunk_id"),
-            "rerank_score": chunk.get("rerank_score"),
-            "rrf_score": chunk.get("rrf_score"),
-            "vector_similarity": chunk.get("vector_similarity"),
-            "term_similarity": chunk.get("term_similarity"),
-            "retrieval_ranks": chunk.get("retrieval_ranks") or {},
-            "retrieval_scores": chunk.get("retrieval_scores") or {},
-            "rrf_contributions": chunk.get("rrf_contributions") or {},
-            "positions": chunk.get("positions") or [],
-            "kb_id": chunk.get("kb_id"),
-            "image_id": chunk.get("image_id"),
-        },
-    )
-
-
-def _format_sources_for_agent(sources: list[ToolSource]) -> str:
-    """Build compact evidence text that can be sent back to an LLM."""
-    if not sources:
+def _format_evidence(evidence) -> str:
+    if not evidence:
         return EMPTY_RESULT_MESSAGE
-
-    sections = []
-    for index, source in enumerate(sources, start=1):
-        sections.append(f"[{index}] {source.title}\n{source.content}")
-    return "\n\n".join(sections)
+    return "\n\n".join(f"[{index}] {item.source.name}\n{item.text}"
+                        for index, item in enumerate(evidence, 1))
 
 
 class RagSearchTool:
-    """Search only the knowledge base owned by one authenticated user."""
+    """仅搜索已认证用户拥有的知识库。"""
 
     name = "search_knowledge_base"
     description = (
@@ -95,8 +52,8 @@ class RagSearchTool:
     }
 
     def __init__(self, user_id: int, *, retriever=None):
-        # Bind tenant context here instead of accepting it from model output.
-        # This prevents an Agent tool call from selecting another user's index.
+        # 在服务端绑定租户上下文，不接受模型输出的租户选择。
+        # 防止工具调用访问其他用户的知识库索引。
         self._user_id = user_id
         self._retriever = retriever
 
@@ -105,12 +62,11 @@ class RagSearchTool:
         *,
         query: str,
         top_k: int = DEFAULT_PAGE_SIZE,
-        _request: QueryRequest | None = None,
+        _context: QueryContext | None = None,
     ) -> ToolResult:
-        """Search the bound user's knowledge base.
+        """搜索当前绑定用户的知识库。
 
-        Expected operational failures are returned as ``ToolResult`` objects so
-        an Agent can observe the failure and choose a fallback path.
+        可预期的运行故障通过 ToolResult 返回，便于 Agent 观察失败并选择回退路径。
         """
         normalized_query = query.strip() if isinstance(query, str) else ""
         if not normalized_query or len(normalized_query) > 12000:
@@ -118,7 +74,7 @@ class RagSearchTool:
                 tool_name=self.name,
                 query=normalized_query,
                 error="query 必须为 1 到 12000 个字符。",
-                metadata={"error_type": "validation_error"},
+                diagnostics={"error_type": "validation_error"},
             )
 
         if (
@@ -130,18 +86,19 @@ class RagSearchTool:
                 tool_name=self.name,
                 query=normalized_query,
                 error=f"top_k 必须是 1 到 {MAX_RAG_RESULTS} 之间的整数。",
-                metadata={"error_type": "validation_error"},
+                diagnostics={"error_type": "validation_error"},
             )
 
         try:
-            context = {"request": _request} if _request is not None else {}
-            retrieve = self._retriever or retrieve_content_with_diagnostics
-            chunks, diagnostics = retrieve(
-                str(self._user_id),
-                normalized_query,
-                page_size=top_k,
-                **context,
-            )
+            context = _context or query_context_for(QueryRequest.from_user(normalized_query))
+            retrieve = self._retriever or retrieve_evidence
+            arguments = {"context": context} if _context is not None or self._retriever is None else {}
+            output = retrieve(str(self._user_id), normalized_query, page_size=top_k, **arguments)
+            if isinstance(output, RetrievalResult):
+                result = output
+            else:
+                chunks, diagnostics = output
+                result = adapt_retrieval_records(context, chunks, diagnostics)
         except Exception as error:
             logger.exception(
                 "Agent RAG 工具检索失败: user_id=%s, query=%s",
@@ -152,38 +109,26 @@ class RagSearchTool:
                 tool_name=self.name,
                 query=normalized_query,
                 error=FAILED_RESULT_MESSAGE,
-                metadata={"error_type": type(error).__name__},
+                diagnostics={"error_type": type(error).__name__},
             )
 
-        sources = [
-            _chunk_to_source(chunk, rank)
-            for rank, chunk in enumerate(chunks, start=1)
-        ]
-        if _request is not None:
-            diagnostics["agent_query"] = {
+        if _context is not None:
+            result.diagnostics["agent_query"] = {
                 "query": normalized_query,
-                "validation": validate_query_preservation(_request.resolved_question, normalized_query).__dict__,
+                "validation": validate_query_preservation(context.question, normalized_query).__dict__,
                 "used_as_user_question": False,
             }
-        if diagnostics.get("response_mode") == "clarify":
-            content = str(diagnostics.get("clarification") or "请补充查询对象。")
-        else:
-            content = _format_sources_for_agent(sources)
         return ToolResult(
-            tool_name=self.name,
-            query=normalized_query,
-            content=content,
-            sources=sources,
-            metadata={
-                "result_count": len(sources),
-                "top_k": top_k,
-                **diagnostics,
-            },
+            tool_name=self.name, query=normalized_query,
+            content=result.clarification or _format_evidence(result.evidence),
+            evidence=result.evidence, candidates=result.candidates, assessment=result.assessment,
+            clarification=result.clarification,
+            diagnostics={"result_count": len(result.evidence), "top_k": top_k, **result.diagnostics},
         )
 
-    def run_for_request(self, request: QueryRequest, *, query: str, top_k: int = DEFAULT_PAGE_SIZE) -> ToolResult:
-        """Server-only context injection, deliberately absent from tool schema."""
-        return self.run(query=query, top_k=top_k, _request=request)
+    def run_for_context(self, context: QueryContext, *, query: str, top_k: int = DEFAULT_PAGE_SIZE) -> ToolResult:
+        """共享的业务上下文由服务端传入，不暴露给模型工具参数。"""
+        return self.run(query=query, top_k=top_k, _context=context)
 
 
 def search_knowledge_base(
@@ -191,5 +136,5 @@ def search_knowledge_base(
     query: str,
     top_k: int = DEFAULT_PAGE_SIZE,
 ) -> ToolResult:
-    """Functional entry point for callers that do not manage tool instances."""
+    """为不管理工具实例的调用方提供函数式入口。"""
     return RagSearchTool(user_id=user_id).run(query=query, top_k=top_k)

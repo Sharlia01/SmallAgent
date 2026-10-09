@@ -1,4 +1,4 @@
-"""Reparse registered documents without deleting/reuploading their SQL records."""
+"""重新解析已登记文档，复用现有数据库记录。"""
 
 import argparse
 import json
@@ -20,7 +20,7 @@ def main():
     files = [path.resolve(strict=True) for path in args.file]
     if len({path.name for path in files}) != len(files):
         parser.error("Duplicate document filenames")
-    # Validate every target before any replacement. No SQL mutation is needed.
+    # 替换前先校验所有目标；此过程无需修改数据库记录。
     for path in files:
         if not path.is_file():
             parser.error(f"Not a file: {path}")

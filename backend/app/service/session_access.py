@@ -12,7 +12,7 @@ DEFAULT_SESSION_NAME = "新对话"
 def get_authenticated_user_id(
     credentials: JwtAuthorizationCredentials,
 ) -> int:
-    """Return the authenticated user id without accepting missing token claims."""
+    """返回已认证用户编号；令牌缺少必要声明时拒绝访问。"""
     subject = credentials.subject
     raw_user_id = subject.get("user_id") if isinstance(subject, dict) else None
     if isinstance(raw_user_id, bool) or not isinstance(raw_user_id, (int, str)):
@@ -43,7 +43,7 @@ def require_owned_session(
     session_id: str,
     user_id: int,
 ) -> ChatSession:
-    """Return a session only when it belongs to the authenticated user."""
+    """仅当会话属于当前已认证用户时返回该会话。"""
     chat_session = db.execute(
         select(ChatSession).where(
             ChatSession.session_id == session_id,
@@ -52,8 +52,8 @@ def require_owned_session(
     ).scalar_one_or_none()
 
     if chat_session is None:
-        # Use the same response for a missing session and somebody else's session.
-        # This avoids revealing which session ids exist.
+        # 不存在的会话与其他用户的会话使用相同响应，
+        # 避免泄露哪些会话编号实际存在。
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Session not found",

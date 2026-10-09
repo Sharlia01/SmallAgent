@@ -1,4 +1,5 @@
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2024 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,7 +18,7 @@ import os
 import logging
 from service.core.api.utils.file_utils import get_project_base_directory
 
-# Server
+# 服务端配置。
 RAG_CONF_PATH = os.path.join(get_project_base_directory(), "conf")
 
 ES = None

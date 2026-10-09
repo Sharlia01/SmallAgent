@@ -25,7 +25,7 @@ def delete_test_data():
 
 @pytest.fixture(autouse=True)
 def clean_api_data(test_database):
-    """Ensure every API test starts and ends with empty application tables."""
+    """确保每个接口测试开始和结束时，应用表均为空。"""
     delete_test_data()
 
     yield
@@ -35,6 +35,6 @@ def clean_api_data(test_database):
 
 @pytest.fixture
 def client(test_database):
-    """Provide a FastAPI test client without starting a real HTTP server."""
+    """提供 FastAPI 测试客户端，无需启动真实 HTTP 服务器。"""
     with TestClient(app) as test_client:
         yield test_client

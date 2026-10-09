@@ -63,11 +63,13 @@ def test_web_search_returns_cited_standard_result():
     assert "ref_1" not in result.content
     assert "1. [杭州天气预报]" in result.content
     assert "[杭州天气预报](https://example.com/weather)" in result.content
-    assert result.sources[0].source_type == "web"
-    assert result.sources[0].url == "https://example.com/weather"
-    assert result.sources[0].metadata["site_name"] == "示例天气网"
-    assert result.metadata["result_count"] == 1
-    assert result.metadata["document_id"].startswith("web-search-")
+    evidence = next(iter(result.evidence))
+    assert evidence.source.kind == "web"
+    assert evidence.source.url == "https://example.com/weather"
+    assert evidence.source.links[0]["metadata"]["site_name"] == "示例天气网"
+    assert evidence.text == result.content
+    assert result.diagnostics["result_count"] == 1
+    assert result.diagnostics["document_id"].startswith("web-search-")
 
 
 @pytest.mark.unit
@@ -77,7 +79,7 @@ def test_web_search_requires_api_key(monkeypatch):
     result = web_search.WebSearchTool(api_key="").run(query="最新消息")
 
     assert result.success is False
-    assert result.metadata["error_type"] == "configuration_error"
+    assert result.diagnostics["error_type"] == "configuration_error"
 
 
 @pytest.mark.unit
@@ -85,7 +87,7 @@ def test_web_search_rejects_empty_query():
     result = web_search.WebSearchTool(api_key="test-key").run(query="   ")
 
     assert result.success is False
-    assert result.metadata["error_type"] == "validation_error"
+    assert result.diagnostics["error_type"] == "validation_error"
 
 
 @pytest.mark.unit
@@ -101,7 +103,7 @@ def test_web_search_requires_verifiable_sources():
 
     assert result.success is False
     assert result.content == "杭州明天有雨。"
-    assert result.metadata["error_type"] == "empty_search_results"
+    assert result.diagnostics["error_type"] == "empty_search_results"
 
 
 @pytest.mark.unit
@@ -118,8 +120,8 @@ def test_web_search_ignores_unsafe_source_urls():
     result = tool.run(query="最新消息")
 
     assert result.success is False
-    assert result.sources == []
-    assert result.metadata["error_type"] == "empty_search_results"
+    assert len(result.evidence) == 0
+    assert result.diagnostics["error_type"] == "empty_search_results"
 
 
 @pytest.mark.unit
@@ -136,4 +138,4 @@ def test_web_search_converts_provider_error_into_failure():
 
     assert result.success is False
     assert result.error == web_search.FAILED_WEB_RESULT_MESSAGE
-    assert result.metadata["error_type"] == "TimeoutError"
+    assert result.diagnostics["error_type"] == "TimeoutError"

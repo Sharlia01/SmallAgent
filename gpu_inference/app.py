@@ -1,4 +1,4 @@
-"""Standalone HTTP service for AgentRAG embedding and reranker models."""
+"""为 AgentRAG 向量模型和重排模型提供独立 HTTP 推理服务。"""
 
 import os
 import secrets

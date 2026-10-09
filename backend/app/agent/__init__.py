@@ -1,4 +1,4 @@
-"""Agent orchestration primitives and tools."""
+"""Agent 编排基础组件与工具。"""
 
 from agent.orchestrator import (
     AgentExecution,
@@ -6,7 +6,8 @@ from agent.orchestrator import (
     AgentRun,
     MinimalAgent,
 )
-from agent.schemas import ToolResult, ToolSource
+from agent.schemas import ToolResult
+from domain.evidence import Evidence, EvidenceCollection
 
 __all__ = [
     "AgentExecution",
@@ -14,5 +15,6 @@ __all__ = [
     "AgentRun",
     "MinimalAgent",
     "ToolResult",
-    "ToolSource",
+    "Evidence",
+    "EvidenceCollection",
 ]

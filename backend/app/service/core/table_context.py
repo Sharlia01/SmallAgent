@@ -1,4 +1,4 @@
-"""Expand retrieved table rows into bounded LLM-facing table context."""
+"""将检索命中的表格行扩展为长度受限、供模型使用的表格上下文。"""
 
 from __future__ import annotations
 
@@ -36,8 +36,8 @@ def _enabled() -> bool:
 
 
 def _default_loader(reference: str) -> dict[str, Any]:
-    # Imported lazily so ordinary retrieval does not load the ingestion stack
-    # unless a new table chunk actually needs its parent object.
+    # 延迟导入解析模块，只有新表格片段需要父表对象时
+    # 才加载文档入库依赖，避免普通检索承担额外开销。
     from service.core.file_parse import load_table_object
 
     return load_table_object(reference)
@@ -49,6 +49,8 @@ def _normalized(value: Any) -> str:
 
 
 def _header_matches_question(header: str, question: str) -> bool:
+    # 表头中的单位描述数值，不属于查询的期间或指标定位词。
+    header = re.sub(r"[（(][^（）()]*[）)]", "", header)
     normalized_header = _normalized(header)
     normalized_question = _normalized(question)
     if normalized_header and normalized_header in normalized_question:
@@ -123,8 +125,8 @@ def _column_indices(
     if column_count <= max_columns:
         return list(range(column_count)), False
 
-    # Column zero is normally the row label.  Repeat it in every wide-table
-    # window and center the remaining columns around a query-matching header.
+    # 第零列通常是行标签，应在宽表的每个列窗口中保留；
+    # 其余列以匹配查询的表头为中心选择。
     value_slots = max(1, max_columns - 1)
     matching = [
         index
@@ -157,6 +159,8 @@ def _slice_rows(
             continue
         sliced.append({
             "row_index": row.get("row_index"),
+            "column_indices": available,
+            "source_row": dict(row),
             "context": str(row.get("context") or ""),
             "preamble": str(row.get("preamble") or ""),
             "headers": [headers[index] for index in available],
@@ -213,7 +217,7 @@ def expand_table_chunk_context(
     table_object: dict[str, Any] | None = None,
     loader: Callable[[str], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Return a copy with bounded parent-table context for the LLM."""
+    """返回带有界父表上下文的副本，供语言模型使用。"""
     if chunk.get("evidence_type_kwd") != "table" or not _enabled():
         return chunk
 
@@ -297,6 +301,11 @@ def expand_table_chunk_context(
         selected_positions,
         column_indices,
     )
+    # 按原始行号取回各行自己的归属，邻近行不能继承命中行的公司标签。
+    ownership = {item.get("row_index"): item for item in
+                 (table_object.get("entity_attribution") or {}).get("rows", [])}
+    for row in context_rows:
+        row["entity_attribution"] = ownership.get(row["row_index"], {})
     expanded["content_with_weight"] = content
     expanded["table_context_obj"] = {
         "policy": policy,
@@ -307,6 +316,8 @@ def expand_table_chunk_context(
         "row_indices": selected_row_indices,
         "column_indices": column_indices,
         "rows": context_rows,
+        "caption": str(cells_json.get("caption") or ""),
+        "binding_source": cells_json.get("binding_source") or "deterministic",
         "column_window": column_window,
         "truncated": truncated_rows or column_window,
         "token_count": num_tokens_from_string(content),
@@ -320,7 +331,7 @@ def expand_table_contexts(
     *,
     loader: Callable[[str], dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Expand table chunks while loading each parent object at most once."""
+    """扩展表格片段，每个父表对象最多加载一次。"""
     if not _enabled():
         return chunks
 

@@ -1,4 +1,5 @@
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2025 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -65,16 +66,11 @@ class RAGFlowPdfParser:
                 model_dir, "updown_concat_xgb.model"))
 
         self.page_from = 0
-        """
-        If you have trouble downloading HuggingFace models, -_^ this might help!!
+        """HuggingFace 模型下载失败时，可尝试配置镜像地址。
 
-        For Linux:
-        export HF_ENDPOINT=https://hf-mirror.com
-
-        For Windows:
-        Good luck
-        ^_-
-
+        Linux 环境示例：
+            export HF_ENDPOINT=https://hf-mirror.com
+        Windows 环境请按相应终端的语法设置同一环境变量。
         """
 
     def __char_width(self, c):
@@ -164,11 +160,11 @@ class RAGFlowPdfParser:
 
     @staticmethod
     def sort_X_by_page(arr, threashold):
-        # sort using y1 first and then x1
+        # 先按下边界 y1 排序，再按横坐标 x1 排序。
         arr = sorted(arr, key=lambda r: (r["page_number"], r["x0"], r["top"]))
         for i in range(len(arr) - 1):
             for j in range(i, -1, -1):
-                # restore the order using th
+                # 根据原始顺序标记 th 恢复阅读顺序。
                 if abs(arr[j + 1]["x0"] - arr[j]["x0"]) < threashold \
                         and arr[j + 1]["top"] < arr[j]["top"] \
                         and arr[j + 1]["page_number"] == arr[j]["page_number"]:
@@ -192,12 +188,12 @@ class RAGFlowPdfParser:
         MARGIN = 10
         self.tb_cpns = []
         assert len(self.page_layout) == len(self.page_images)
-        for p, tbls in enumerate(self.page_layout):  # for page
+        for p, tbls in enumerate(self.page_layout):  # 逐页处理。
             tbls = [f for f in tbls if f["type"] == "table"]
             tbcnt.append(len(tbls))
             if not tbls:
                 continue
-            for tb in tbls:  # for table
+            for tb in tbls:  # 处理表格区域。
                 left, top, right, bott = tb["x0"] - MARGIN, tb["top"] - MARGIN, \
                                          tb["x1"] + MARGIN, tb["bottom"] + MARGIN
                 left *= ZM
@@ -212,12 +208,12 @@ class RAGFlowPdfParser:
             return
         recos = self.tbl_det(imgs)
         tbcnt = np.cumsum(tbcnt)
-        for i in range(len(tbcnt) - 1):  # for page
+        for i in range(len(tbcnt) - 1):  # 逐页处理。
             pg = []
             for j, tb_items in enumerate(
-                    recos[tbcnt[i]: tbcnt[i + 1]]):  # for table
+                    recos[tbcnt[i]: tbcnt[i + 1]]):  # 处理表格区域。
                 poss = pos[tbcnt[i]: tbcnt[i + 1]]
-                for it in tb_items:  # for table components
+                for it in tb_items:  # 逐个处理表格组成区域。
                     it["x0"] = (it["x0"] + poss[j][0])
                     it["x1"] = (it["x1"] + poss[j][0])
                     it["top"] = (it["top"] + poss[j][1])
@@ -237,7 +233,7 @@ class RAGFlowPdfParser:
             eles = Recognizer.layouts_cleanup(self.boxes, eles, 5, ption)
             return Recognizer.sort_Y_firstly(eles, 0)
 
-        # add R,H,C,SP tag to boxes within table layout
+        # 为表格区域内的文本框添加行、表头、列和跨列标记 R/H/C/SP。
         headers = gather(r".*header$")
         rows = gather(r".* (row|header)")
         spans = gather(r".*spanning")
@@ -290,7 +286,7 @@ class RAGFlowPdfParser:
             self.mean_height[-1] / 3
         )
         
-        # merge chars in the same rect
+        # 合并同一矩形区域内的字符。
         for c in Recognizer.sort_Y_firstly(
                 chars, self.mean_height[pagenum - 1] // 4):
             ii = Recognizer.find_overlapped(c, bxs)
@@ -326,8 +322,7 @@ class RAGFlowPdfParser:
         assert len(self.page_images) == len(self.boxes)
         self.boxes, self.page_layout = self.layouter(
             self.page_images, self.boxes, ZM, drop=drop)
-        # cumlative Y
-        # 统一坐标系，把分页坐标转换为全局坐标
+        # 累计页高，统一坐标系，将各页坐标转换为全局坐标。
         for i in range(len(self.boxes)):
             self.boxes[i]["top"] += \
                 self.page_cum_height[self.boxes[i]["page_number"] - 1]
@@ -335,7 +330,7 @@ class RAGFlowPdfParser:
                 self.page_cum_height[self.boxes[i]["page_number"] - 1]
 
     def _text_merge(self):
-        # merge adjusted boxes
+        # 合并调整坐标后的文本框。
         bxs = self.boxes
 
         def end_with(b, txt):
@@ -347,7 +342,7 @@ class RAGFlowPdfParser:
             tt = b.get("text", "").strip()
             return tt and any([tt.find(t.strip()) == 0 for t in txts])
 
-        # horizontally merge adjacent box with the same layout
+        # 横向合并相邻且版面类型相同的文本框。
         i = 0
         while i < len(bxs) - 1:
             b = bxs[i]
@@ -358,7 +353,7 @@ class RAGFlowPdfParser:
                 continue
             if abs(self._y_dis(b, b_)
                    ) < self.mean_height[bxs[i]["page_number"] - 1] / 3:
-                # merge
+                # 合并相邻文本框。
                 bxs[i]["x1"] = b_["x1"]
                 bxs[i]["top"] = (b["top"] + b_["top"]) / 2
                 bxs[i]["bottom"] = (b["bottom"] + b_["bottom"]) / 2
@@ -380,7 +375,7 @@ class RAGFlowPdfParser:
 
             if abs(self._y_dis(b, b_)) < self.mean_height[bxs[i]["page_number"] - 1] / 5 \
                     and dis >= dis_thr and b["x1"] < b_["x1"]:
-                # merge
+                # 合并相邻文本框。
                 bxs[i]["x1"] = b_["x1"]
                 bxs[i]["top"] = (b["top"] + b_["top"]) / 2
                 bxs[i]["bottom"] = (b["bottom"] + b_["bottom"]) / 2
@@ -411,7 +406,7 @@ class RAGFlowPdfParser:
                 )[-2] in ",;:'\"，‘“、；：",
                 b_["text"].strip() and b_["text"].strip()[0] in "。；？！?”）),，、：",
             ]
-            # features for not concating
+            # 判断不应拼接的文本特征。
             feats = [
                 b.get("layoutno", 0) != b_.get("layoutno", 0),
                 b["text"].strip()[-1] in "。？！?",
@@ -421,7 +416,7 @@ class RAGFlowPdfParser:
                 b["page_number"] < b_["page_number"] and abs(
                     b["x0"] - b_["x0"]) > self.mean_width[b["page_number"] - 1] * 4,
             ]
-            # split features
+            # 计算拆分特征。
             detach_feats = [b["x1"] < b_["x0"],
                             b["x0"] > b_["x1"]]
             if (any(feats) and not any(concatting_feats)) or any(detach_feats):
@@ -433,7 +428,7 @@ class RAGFlowPdfParser:
                     ))
                 i += 1
                 continue
-            # merge up and down
+            # 合并上下相邻的文本块。
             b["bottom"] = b_["bottom"]
             b["text"] += b_["text"]
             b["x0"] = min(b["x0"], b_["x0"])
@@ -442,7 +437,7 @@ class RAGFlowPdfParser:
         self.boxes = bxs
 
     def _concat_downward(self, concat_between_pages=True):
-        # count boxes in the same row as a feature
+        # 将同一行中的文本框数量作为合并判断特征。
         for i in range(len(self.boxes)):
             mh = self.mean_height[self.boxes[i]["page_number"] - 1]
             self.boxes[i]["in_row"] = 0
@@ -458,7 +453,7 @@ class RAGFlowPdfParser:
                     break
                 j += 1
 
-        # concat between rows
+        # 在行之间拼接文本。
         boxes = deepcopy(self.boxes)
         blocks = []
         while boxes:
@@ -523,7 +518,7 @@ class RAGFlowPdfParser:
             if chunks:
                 blocks.append(chunks)
 
-        # concat within each block
+        # 拼接各文本块内部的内容。
         boxes = []
         for b in blocks:
             if len(b) == 1:
@@ -629,7 +624,7 @@ class RAGFlowPdfParser:
                               return_html, need_position):
         tables = {}
         figures = {}
-        # extract figure and table boxes
+        # 提取图片和表格文本框。
         i = 0
         lst_lout_no = ""
         nomerge_lout_no = []
@@ -666,7 +661,7 @@ class RAGFlowPdfParser:
                 continue
             i += 1
 
-        # merge table on different pages
+        # 合并跨页表格。
         nomerge_lout_no = set(nomerge_lout_no)
         tbls = sorted([(k, bxs) for k, bxs in tables.items()],
                       key=lambda x: (x[1][0]["top"], x[1][0]["x0"]))
@@ -691,7 +686,7 @@ class RAGFlowPdfParser:
         def x_overlapped(a, b):
             return not any([a["x1"] < b["x0"], a["x0"] > b["x1"]])
 
-        # find captions and pop out
+        # 查找题注，并从正文文本框集合中移出。
         i = 0
         while i < len(self.boxes):
             c = self.boxes[i]
@@ -700,7 +695,7 @@ class RAGFlowPdfParser:
                 i += 1
                 continue
 
-            # find the nearest layouts
+            # 查找距离最近的版面区域。
             def nearest(tbls):
                 nonlocal c
                 mink = ""
@@ -790,7 +785,7 @@ class RAGFlowPdfParser:
                 height += img.size[1]
             return pic
 
-        # crop figure out and add caption
+        # 裁剪图片区域并附加题注。
         for k, bxs in figures.items():
             txt = "\n".join([b["text"] for b in bxs])
             poss = []
@@ -906,8 +901,9 @@ class RAGFlowPdfParser:
                         continue
                     if mmj or \
                             (self._x_dis(boxes[i], line) < pw / 10): \
+                            # 保留原有宽度判断示例：
                             # and abs(width(boxes[i])-width_mean)/max(width(boxes[i]),width_mean)<0.5):
-                        # concat following
+                            # 拼接后续文本。
                         dfs(boxes[i], i)
                         boxes.pop(i)
                         break
@@ -958,7 +954,7 @@ class RAGFlowPdfParser:
                 self.page_chars = [[{**c, 'top': c['top'], 'bottom': c['bottom']} for c in page.dedupe_chars().chars if self._has_color(c)] for page in self.pdf.pages[page_from:page_to]]
             except Exception as e:
                 logging.warning(f"Failed to extract characters for pages {page_from}-{page_to}: {str(e)}")
-                self.page_chars = [[] for _ in range(page_to - page_from)]  # If failed to extract, using empty list instead.
+                self.page_chars = [[] for _ in range(page_to - page_from)]  # 提取失败时返回空列表。
                 
             self.total_page = len(self.pdf.pages)
         except Exception:

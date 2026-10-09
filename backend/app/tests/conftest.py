@@ -19,13 +19,13 @@ def get_alembic_config() -> Config:
 
 @pytest.fixture(scope="session")
 def test_database():
-    """Build the test schema from Alembic and reject model/schema drift."""
+    """通过 Alembic 创建测试结构，并检查模型与数据库结构是否一致。"""
     if engine.url.database != "gsk_test":
         raise RuntimeError(
             f"Tests must use gsk_test, not {engine.url.database!r}"
         )
 
-    # Clean up schemas created by older test fixtures that used create_all().
+    # 清理旧测试夹具通过 create_all() 创建的数据库结构。
     Base.metadata.drop_all(bind=engine)
     with engine.begin() as connection:
         connection.execute(text("DROP TABLE IF EXISTS alembic_version"))
@@ -43,7 +43,7 @@ def test_database():
 
 @pytest.fixture
 def db_session(test_database) -> Session:
-    """Run each database test inside a rolled-back transaction."""
+    """将每个数据库测试放在结束后回滚的事务中执行。"""
     connection = engine.connect()
     transaction = connection.begin()
 

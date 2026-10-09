@@ -1,9 +1,8 @@
-"""add relational integrity
+"""补充数据库关系完整性约束。
 
-Revision ID: f475785c40c5
-Revises: 43c6db52e840
-Create Date: 2026-08-26 08:50:25.770374
-
+版本编号：f475785c40c5
+前序版本：43c6db52e840
+创建时间：2026-08-26 08:50:25.770374
 """
 from typing import Sequence, Union
 
@@ -11,7 +10,7 @@ from alembic import op
 import sqlalchemy as sa
 
 
-# revision identifiers, used by Alembic.
+# Alembic 使用的迁移版本标识。
 revision: str = "f475785c40c5"
 down_revision: Union[str, None] = "43c6db52e840"
 branch_labels: Union[str, Sequence[str], None] = None
@@ -19,7 +18,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    """Upgrade schema."""
+    """升级数据库结构。"""
     op.create_foreign_key(
         "fk_document_uploads_session_id_sessions",
         "document_uploads",
@@ -71,7 +70,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Downgrade schema."""
+    """回退数据库结构。"""
     op.drop_constraint(
         "fk_sessions_user_id_users", "sessions", type_="foreignkey"
     )

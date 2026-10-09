@@ -1,4 +1,4 @@
-"""Regression tests for independent retrieval and rejection metrics."""
+"""独立检索指标与拒绝指标的回归测试。"""
 
 import json
 
@@ -255,7 +255,7 @@ def test_rejected_hit_keeps_pre_gate_ranking_and_serializable_evidence():
         "vector_original": 2,
     }
     assert "q_512_vec" not in json.dumps(result)
-    assert "q_512_vec" in before[1]  # Serialization does not mutate retrieval data.
+    assert "q_512_vec" in before[1]  # 序列化过程不修改原始检索数据。
     assert result["evidence_matches"][0]["matched"] is False
     assert result["evidence_matches_before_sufficiency"][0]["matched_rank"] == 2
 
@@ -343,7 +343,7 @@ def test_missing_historical_snapshot_is_unknown_even_when_output_is_nonempty(chu
 
 @pytest.mark.parametrize("decision", [
     {"source": "disabled", "sufficient": True},
-    # The checker can return its no-evidence rule before reading its enable flag.
+    # 核验器可能在读取启用开关前，先返回无证据规则判定。
     {"source": "rule", "sufficient": False, "enabled": False},
 ])
 def test_disabled_checks_are_not_counted_as_successful_gate_decisions(decision):

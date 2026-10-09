@@ -1,4 +1,4 @@
-"""Trusted user request and source-grounded query goals shared across layers."""
+"""各层共用的可信用户请求，以及带原文依据的查询目标。"""
 
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ MAX_GOALS = 8
 class QueryGoal:
     id: str
     text: str
-    # Normalized applicable constraints. Literal provenance lives separately
-    # in source_spans and constraint_provenance, never in fabricated quotes.
+    # 此处保存规范化且适用的约束；原文依据单独保存在
+    # source_spans 和 constraint_provenance 中，不能编造引文。
     constraints: tuple[str, ...] = ()
     depends_on: tuple[str, ...] = ()
     source_spans: tuple[str, ...] = ()
@@ -104,7 +104,7 @@ class QueryRequest:
         return cls(question.strip(), question.strip(), tuple(reversed(turns)), date.today().isoformat())
 
     def to_dict(self) -> dict[str, Any]:
-        # Full conversation history is intentionally not exposed in diagnostics.
+        # 诊断结果不暴露完整会话历史。
         from service.core.query_semantics import domain_policy
         return {
             "user_question": self.user_question,
@@ -178,7 +178,7 @@ def resolve_request(request: QueryRequest, *, client: Any | None = None) -> Quer
                     or not 0 <= index < len(request.history) or not isinstance(quote, str)
                     or not quote or quote not in request.history[index][1] or value not in quote):
                 raise ValueError("ungrounded context binding")
-            # Assistant-only inventions must not silently become hard facts.
+            # 仅由助手提出、用户未提供的内容不能静默成为硬事实。
             if request.history[index][0] != "user" and not any(
                 role == "user" and value in content for role, content in request.history
             ):
@@ -195,7 +195,7 @@ def resolve_request(request: QueryRequest, *, client: Any | None = None) -> Quer
 
 
 def decode_goals(raw: Any) -> tuple[QueryGoal, ...]:
-    """Decode the goal schema without accepting provenance or dependencies."""
+    """解码目标结构，不接收模型自行提供的来源证明或依赖关系。"""
     if not isinstance(raw, list) or not 1 <= len(raw) <= MAX_GOALS:
         raise QueryValidationError("invalid_goal_list", "goals must contain one to eight goals", field="goals")
     raw_ids = [item.get("id") if isinstance(item, dict) else None for item in raw]
@@ -272,6 +272,6 @@ def validate_goal_sources(goals: tuple[QueryGoal, ...], question: str) -> tuple[
 
 
 def parse_goals(raw: Any, question: str) -> tuple[QueryGoal, ...]:
-    """Compatibility entry point: decode and validate goal provenance."""
+    """兼容入口：解码查询目标并校验原文依据。"""
     goals = decode_goals(raw)
     return validate_goal_sources(goals, question)

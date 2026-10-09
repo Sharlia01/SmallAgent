@@ -1,4 +1,4 @@
-"""Pure aggregation helpers for grounded end-to-end RAG evaluation."""
+"""端到端检索增强回答评测使用的纯聚合函数。"""
 
 from __future__ import annotations
 
@@ -46,7 +46,7 @@ def _sample_ids(
     results: Iterable[dict[str, Any]],
     predicate,
 ) -> list[str]:
-    """Return stable, unique IDs for samples matching ``predicate``."""
+    """返回满足 predicate 条件的稳定、去重样本编号。"""
     sample_ids = []
     seen = set()
     for result in results:
@@ -61,7 +61,7 @@ def _sample_ids(
 def _non_perfect_sample_ids(
     results: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    """Map directional E2E metrics to samples that miss their ideal value."""
+    """将未达到理想值的端到端指标映射到相应样本。"""
     successful = [result for result in results if not result.get("error")]
     answered = [
         result for result in successful if result.get("response_mode") == "answer"
@@ -220,7 +220,7 @@ def evaluate_answer_quality(
     judge_model: str | None,
     judge_timeout: float = 20.0,
 ) -> dict[str, Any]:
-    """Evaluate answer semantics when a judge is configured."""
+    """配置评判器后，评估回答的语义正确性。"""
     if judge_client is None or not judge_model:
         return {
             "correctness_score": None,
@@ -297,7 +297,7 @@ def evaluate_sufficiency(
     sample: dict[str, Any],
     retrieval_case: dict[str, Any],
 ) -> dict[str, Any]:
-    """Compare gate output with whether this run's pre-gate evidence was complete."""
+    """将门控结果与本轮门控前证据是否完整进行比较。"""
     matches = retrieval_case.get("evidence_matches_before_sufficiency")
     explicit_expected = sample.get("expected_evidence_sufficient")
     expected = explicit_expected if isinstance(explicit_expected, bool) else None
@@ -307,9 +307,8 @@ def evaluate_sufficiency(
             and bool(matches)
             and all(match.get("matched") is True for match in matches)
         )
-        # A locator-only figure or structurally unbound table can be relevant
-        # retrieval without being usable evidence. Treat it conservatively
-        # unless the dataset explicitly overrides the sufficiency label.
+        # 仅能定位的图片或结构未绑定的表格，可能检索相关但不足以支撑回答。
+        # 除非数据集明确设置充分性标签，否则保守处理。
         chunks = {
             str(chunk.get("chunk_id") or ""): chunk
             for chunk in (

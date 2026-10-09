@@ -1,4 +1,4 @@
-"""Read-only evaluation through the actual Agent -> KB tool -> answer path."""
+"""通过真实的 Agent、知识库工具和回答路径执行只读评测。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,8 @@ from typing import Any, Callable
 from agent.orchestrator import AgentOrchestrator
 from agent.tools.rag_search import RagSearchTool
 from service.core.grounded_answer import GroundedTurnResult, _default_answer_client, DEFAULT_ANSWER_MODEL
-from service.core.retrieval import retrieve_raw_results, format_retrieval_results
+from service.core.retrieval import retrieve_evidence, format_retrieval_results
+from service.core.retrieval_result import RetrievalResult, adapt_retrieval_records, retrieval_record
 from service.core.streaming_response import collect_answer_stream
 
 
@@ -18,28 +19,33 @@ def execute_agent_turn(
     conversation_history: list[dict[str, str]] | None = None,
     answer_client: Any | None = None, answer_model: str | None = None,
     planner_client: Any | None = None, planner_model: str | None = None,
-    retrieval_function: Callable[..., dict[str, Any]] = retrieve_raw_results,
+    retrieval_function: Callable[..., RetrievalResult | dict[str, Any]] = retrieve_evidence,
     retrieval_options: dict[str, Any] | None = None,
 ) -> GroundedTurnResult:
-    """Run all query interpretation layers, without sessions or DB writes.
+    """执行查询理解的全部层次，不创建会话或写入数据库。
 
-    The corpus is deliberately KB-only: web search cannot repair an intentionally
-    unanswerable KB benchmark. Index authorization belongs to the CLI operator.
+    该语料仅用于知识库评测，网页搜索不能补全刻意设置的知识库不可回答问题。
+    索引访问权限由命令行操作人员负责确认。
     """
     client = answer_client or _default_answer_client()
     raw_runs = []
     retrieval_ms = 0.0
     started = time.perf_counter()
 
-    def retrieve(_bound_user, query, *, page_size, request=None):
+    def retrieve(_bound_user, query, *, page_size, context):
         nonlocal retrieval_ms
         options = dict(retrieval_options or {})
         options.setdefault("page_size", page_size)
         before = time.perf_counter()
-        raw = retrieval_function(index_names, query, request=request, **options)
+        if retrieval_function is retrieve_evidence:
+            options["context"] = context
+        output = retrieval_function(index_names, query, request=context.request, **options)
         retrieval_ms += (time.perf_counter() - before) * 1000
-        raw_runs.append(raw)
-        return format_retrieval_results(raw)
+        raw_runs.append(output)
+        if isinstance(output, RetrievalResult):
+            return output
+        records, diagnostics = format_retrieval_results(output)
+        return adapt_retrieval_records(context, records, diagnostics)
 
     tool = RagSearchTool(user_id=0, retriever=retrieve)
     orchestrator = AgentOrchestrator(
@@ -59,6 +65,7 @@ def execute_agent_turn(
     else:
         collected = collect_answer_stream(execution.answer_stream)
         answer, thinking = collected.answer, collected.thinking
+    raw_runs = [retrieval_record(run) if isinstance(run, RetrievalResult) else run for run in raw_runs]
     raw = dict(raw_runs[-1]) if raw_runs else {"total": 0, "chunks": []}
     raw["query_runtime"] = execution.query_runtime
     candidates = {}
@@ -76,9 +83,9 @@ def execute_agent_turn(
         raw["chunks"] = execution.retrieved_content
         raw["total"] = len(execution.retrieved_content)
     raw["agent_execution"] = {
-        "steps": execution.planning.steps, "stop_reason": execution.planning.stop_reason,
+        "steps": execution.agent_run.steps, "stop_reason": execution.agent_run.stop_reason,
         "tool_queries": [{"tool": result.tool_name, "query": result.query}
-                         for result in execution.planning.tool_results],
+                         for result in execution.agent_run.tool_results],
         "retrieval_calls": len(raw_runs),
     }
     return GroundedTurnResult(

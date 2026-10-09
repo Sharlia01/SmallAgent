@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from service.core.grounded_answer import execute_grounded_turn
+from service.core import evidence_sufficiency
 
 
 class FakeCompletions:
@@ -46,13 +47,19 @@ def test_grounded_turn_refuses_without_calling_answer_model():
     )
 
     assert result.response_mode == "refuse"
-    assert "未知指标的数值" in result.answer
+    assert "可直接支持答案的知识库证据" in result.answer
+    assert result.raw_retrieval["evidence_sufficiency"]["source"] == "rule"
     assert result.documents == []
     assert completions.calls == []
 
 
 @pytest.mark.unit
-def test_grounded_turn_uses_production_prompt_and_collects_stream():
+def test_grounded_turn_uses_production_prompt_and_collects_stream(monkeypatch):
+    monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_ENABLED", "true")
+    sufficiency = FakeCompletions(SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=
+        '{"sufficient":true,"reason":"证据完整","missing_requirements":[],"supporting_chunk_indices":[1]}'))]))
+    monkeypatch.setattr(evidence_sufficiency, "get_evidence_sufficiency_client",
+                        lambda: SimpleNamespace(chat=SimpleNamespace(completions=sufficiency)))
     stream = [
         stream_chunk("答案。##1$$"),
         stream_chunk(finish_reason="stop"),
@@ -87,3 +94,4 @@ def test_grounded_turn_uses_production_prompt_and_collects_stream():
     assert "[1] 答案证据。" in result.answer_messages[-1]["content"]
     assert completions.calls[0]["stream"] is True
     assert completions.calls[0]["temperature"] == 0
+    assert len(sufficiency.calls) == 1

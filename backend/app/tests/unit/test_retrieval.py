@@ -1,7 +1,10 @@
+from service.core.evidence_adapter import reference_records
+from service.core.evidence_adapter import collection_from_records
+from service.core.retrieval_result import retrieval_result
 import pytest
 
 from service.core import retrieval
-from service.core.evidence_sufficiency import EvidenceSufficiencyDecision
+from domain.assessment import EvidenceAssessment
 from service.core.query_expansion import (
     QueryExpansionResult,
     validate_query_preservation,
@@ -113,13 +116,13 @@ def test_dealer_retrieval_times_initial_retrieval_and_rerank(monkeypatch):
     }
 
 
-# 用例功能：验证原始检索入口会将生产检索参数完整传给 Dealer。
+# 用例功能：验证类型化检索入口会将生产检索参数完整传给 Dealer。
 # 执行步骤：
 # 1. 用可记录调用参数的 FakeDealer 替换真实检索器。
 # 2. 使用自定义页大小、相似度阈值和向量权重执行检索。
 # 3. 验证问题、租户索引和各项 RetrievalOptions 传递正确。
 @pytest.mark.unit
-def test_retrieve_raw_results_reuses_production_options(monkeypatch):
+def test_retrieve_evidence_reuses_production_options(monkeypatch):
     calls = []
 
     class FakeDealer:
@@ -167,7 +170,7 @@ def test_retrieve_raw_results_reuses_production_options(monkeypatch):
         ),
     )
 
-    result = retrieval.retrieve_raw_results(
+    result = retrieval.retrieve_evidence(
         "42",
         "测试问题",
         page_size=8,
@@ -175,7 +178,7 @@ def test_retrieve_raw_results_reuses_production_options(monkeypatch):
         vector_similarity_weight=0.7,
     )
 
-    assert result["chunks"] == []
+    assert reference_records(result.evidence) == []
     assert calls[0]["question"] == "测试问题"
     assert calls[0]["keyword_question"] == "测试问题 规范化 扩展"
     assert calls[0]["tenant_ids"] == "42"
@@ -189,12 +192,12 @@ def test_retrieve_raw_results_reuses_production_options(monkeypatch):
     assert options.rrf_k == 60
     assert options.final_reranker_weight == pytest.approx(0.7)
     assert options.final_rrf_k == 10
-    assert result["query_rewrite"] == {
+    assert result.diagnostics["query_rewrite"] == {
         "original": "测试问题",
         "rewritten": "测试问题 规范化",
         "changed": True,
     }
-    assert result["query_intent"] == {
+    assert result.analysis.to_dict() == {
         "intent": "colloquial_lookup",
         "need_rewrite": True,
         "target_count": 1,
@@ -209,19 +212,19 @@ def test_retrieve_raw_results_reuses_production_options(monkeypatch):
         "task_types": (),
         "clarification": None,
     }
-    assert result["retrieval_route"]["mode"] == "single"
-    assert result["retrieval_plan"] == {
+    assert result.diagnostics["retrieval_route"]["mode"] == "single"
+    assert result.diagnostics["retrieval_plan"] == {
         "mode": "single",
         "subqueries": [],
         "source": "none",
         "fallback_reason": None,
     }
-    assert result["query_transform"]["expanded"] == "测试问题 规范化 扩展"
-    assert result["query_transform"]["effective_query"] == (
+    assert result.diagnostics["query_transform"]["expanded"] == "测试问题 规范化 扩展"
+    assert result.diagnostics["query_transform"]["effective_query"] == (
         "测试问题 规范化 扩展"
     )
-    assert result["query_transform"]["expansion_applied"] is True
-    assert set(result["stage_latency_ms"]) == {
+    assert result.diagnostics["query_transform"]["expansion_applied"] is True
+    assert set(result.diagnostics["stage_latency_ms"]) == {
         "query_transform",
         "initial_retrieval",
         "rerank",
@@ -231,7 +234,7 @@ def test_retrieve_raw_results_reuses_production_options(monkeypatch):
         "other",
         "total",
     }
-    assert result["stage_latency_ms"]["multi_hop"] is None
+    assert result.diagnostics["stage_latency_ms"]["multi_hop"] is None
 
 
 @pytest.mark.unit
@@ -257,8 +260,8 @@ def test_parallel_plan_failure_falls_back_and_keeps_attempt_history(monkeypatch)
         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("parallel failed")),
     )
     monkeypatch.setattr(
-        retrieval, "check_evidence_sufficiency",
-        lambda _question, _chunks: EvidenceSufficiencyDecision(
+        retrieval, "verify_evidence",
+        lambda _question, _chunks, **kwargs: EvidenceAssessment(
             sufficient=True,
             reason="回退证据足够",
             missing_requirements=[],
@@ -269,15 +272,15 @@ def test_parallel_plan_failure_falls_back_and_keeps_attempt_history(monkeypatch)
         ),
     )
 
-    result = retrieval.retrieve_raw_results("42", "原始问题")
+    result = retrieval.retrieve_evidence("42", "原始问题")
 
     assert calls == ["原始问题"]
-    assert result["chunks"][0]["chunk_id"] == "fallback"
-    assert result["parallel_retrieval"]["applied"] is False
-    assert result["plan_execution"]["fallback_applied"] is True
-    assert result["plan_execution"]["requested_plan_execution_success"] is False
-    assert result["plan_execution"]["final_execution_success"] is True
-    assert [attempt["mode"] for attempt in result["plan_execution"]["attempts"]] == [
+    assert reference_records(result.evidence)[0]["chunk_id"] == "fallback"
+    assert result.diagnostics["parallel_retrieval"]["applied"] is False
+    assert result.diagnostics["plan_execution"]["fallback_applied"] is True
+    assert result.diagnostics["plan_execution"]["requested_plan_execution_success"] is False
+    assert result.diagnostics["plan_execution"]["final_execution_success"] is True
+    assert [attempt["mode"] for attempt in result.diagnostics["plan_execution"]["attempts"]] == [
         "parallel", "single",
     ]
 
@@ -301,19 +304,19 @@ def test_disabled_graph_plan_records_skip_before_single_fallback(monkeypatch):
         ),
     )
 
-    result = retrieval.retrieve_raw_results("42", "原始问题")
+    result = retrieval.retrieve_evidence("42", "原始问题")
 
     assert calls == ["原始问题"]
-    assert result["retrieval_graph"]["applied"] is False
-    assert result["plan_execution"]["executed_mode"] == "single"
-    assert result["plan_execution"]["fallback_applied"] is True
-    assert [attempt["status"] for attempt in result["plan_execution"]["attempts"]] == [
+    assert result.diagnostics["retrieval_graph"]["applied"] is False
+    assert result.diagnostics["plan_execution"]["executed_mode"] == "single"
+    assert result.diagnostics["plan_execution"]["fallback_applied"] is True
+    assert [attempt["status"] for attempt in result.diagnostics["plan_execution"]["attempts"]] == [
         "skipped", "succeeded",
     ]
 
 
 @pytest.mark.unit
-def test_retrieve_raw_results_skips_rewriter_for_precise_query(monkeypatch):
+def test_retrieve_evidence_skips_rewriter_for_precise_query(monkeypatch):
     calls = []
 
     class FakeDealer:
@@ -347,17 +350,17 @@ def test_retrieve_raw_results_skips_rewriter_for_precise_query(monkeypatch):
         ),
     )
 
-    result = retrieval.retrieve_raw_results("42", "表5的归母净利润是多少？")
+    result = retrieval.retrieve_evidence("42", "表5的归母净利润是多少？")
 
     assert calls[0]["question"] == "表5的归母净利润是多少？"
     assert calls[0]["keyword_question"] == "表5的归母净利润是多少？"
-    assert result["query_rewrite"]["changed"] is False
-    assert result["query_intent"]["need_rewrite"] is False
-    assert result["query_transform"]["source"] == "skipped"
+    assert result.diagnostics["query_rewrite"]["changed"] is False
+    assert result.analysis.to_dict()["need_rewrite"] is False
+    assert result.diagnostics["query_transform"]["source"] == "skipped"
 
 
 @pytest.mark.unit
-def test_retrieve_raw_results_removes_insufficient_evidence(monkeypatch):
+def test_retrieve_evidence_removes_insufficient_evidence(monkeypatch):
     class FakeDealer:
         @staticmethod
         def retrieval(**_kwargs):
@@ -386,8 +389,8 @@ def test_retrieve_raw_results_removes_insufficient_evidence(monkeypatch):
     )
     monkeypatch.setattr(
         retrieval,
-        "check_evidence_sufficiency",
-        lambda _question, _chunks: EvidenceSufficiencyDecision(
+        "verify_evidence",
+        lambda _question, _chunks, **kwargs: EvidenceAssessment(
             sufficient=False,
             reason="只有上半年数据",
             missing_requirements=["2025年全年实际数据"],
@@ -398,29 +401,24 @@ def test_retrieve_raw_results_removes_insufficient_evidence(monkeypatch):
         ),
     )
 
-    result = retrieval.retrieve_raw_results(
+    result = retrieval.retrieve_evidence(
         "42",
         "2025年全年实际营业收入是多少？",
     )
 
-    assert result["chunks"] == []
-    assert result["doc_aggs"] == []
-    assert result["total"] == 0
-    assert result["total_before_evidence_sufficiency"] == 12
-    assert result["chunks_before_sufficiency"] == [
-        {
-            "chunk_id": "half-year",
-            "content_with_weight": "2025年上半年营业收入50亿元。",
-        }
-    ]
-    assert result["evidence_sufficiency"]["sufficient"] is False
-    assert result["evidence_sufficiency"]["evaluated_chunk_ids"] == [
+    assert reference_records(result.evidence) == []
+    assert result.total_candidates == 12
+    assert len(result.evidence) == 0
+    assert result.diagnostics["total_before_evidence_sufficiency"] == 12
+    assert [item.text for item in result.candidates] == ["2025年上半年营业收入50亿元。"]
+    assert result.assessment.to_dict()["sufficient"] is False
+    assert result.assessment.to_dict()["evaluated_chunk_ids"] == [
         "half-year"
     ]
 
 
 @pytest.mark.unit
-def test_retrieve_raw_results_keeps_sufficient_evidence(monkeypatch):
+def test_retrieve_evidence_keeps_sufficient_evidence(monkeypatch):
     original_chunks = [
         {
             "chunk_id": "full-year",
@@ -450,8 +448,8 @@ def test_retrieve_raw_results_keeps_sufficient_evidence(monkeypatch):
     )
     monkeypatch.setattr(
         retrieval,
-        "check_evidence_sufficiency",
-        lambda _question, _chunks: EvidenceSufficiencyDecision(
+        "verify_evidence",
+        lambda _question, _chunks, **kwargs: EvidenceAssessment(
             sufficient=True,
             reason="已提供全年数据",
             missing_requirements=[],
@@ -462,17 +460,17 @@ def test_retrieve_raw_results_keeps_sufficient_evidence(monkeypatch):
         ),
     )
 
-    result = retrieval.retrieve_raw_results(
+    result = retrieval.retrieve_evidence(
         "42",
         "2025年全年营业收入是多少？",
     )
 
-    assert result["chunks"] == original_chunks
-    assert result["total"] == 1
-    assert result["total_before_evidence_sufficiency"] == 1
-    assert result["chunks_before_sufficiency"] == original_chunks
-    assert result["chunks_before_sufficiency"] is not result["chunks"]
-    assert result["evidence_sufficiency"]["sufficient"] is True
+    assert result.evidence.version == collection_from_records(original_chunks).version
+    assert result.total_candidates == 1
+    assert result.diagnostics["total_before_evidence_sufficiency"] == 1
+    assert result.candidates.version == result.evidence.version
+    assert result.evidence.get("full-year") is result.candidates.get("full-year")
+    assert result.assessment.to_dict()["sufficient"] is True
 
 
 @pytest.mark.unit
@@ -509,9 +507,9 @@ def test_table_context_expands_before_sufficiency_check(monkeypatch):
         }],
     )
 
-    def check(_question, chunks):
-        assert chunks[0]["content_with_weight"] == "扩展后的表格上下文"
-        return EvidenceSufficiencyDecision(
+    def check(_question, chunks, **kwargs):
+        assert next(iter(chunks)).text == "扩展后的表格上下文"
+        return EvidenceAssessment(
             sufficient=True,
             reason="上下文完整",
             missing_requirements=[],
@@ -521,12 +519,12 @@ def test_table_context_expands_before_sufficiency_check(monkeypatch):
             evaluated_chunk_ids=["table-row"],
         )
 
-    monkeypatch.setattr(retrieval, "check_evidence_sufficiency", check)
+    monkeypatch.setattr(retrieval, "verify_evidence", check)
 
-    result = retrieval.retrieve_raw_results("42", "表格问题")
+    result = retrieval.retrieve_evidence("42", "表格问题")
 
-    assert result["chunks"][0]["content_with_weight"] == "扩展后的表格上下文"
-    assert result["chunks_before_sufficiency"][0]["content_with_weight"] == (
+    assert reference_records(result.evidence)[0]["content_with_weight"] == "扩展后的表格上下文"
+    assert reference_records(result.candidates)[0]["content_with_weight"] == (
         "扩展后的表格上下文"
     )
 
@@ -627,10 +625,10 @@ def test_sequential_retrieval_extracts_bridge_and_preserves_each_hop(
     )
     monkeypatch.setattr(
         retrieval,
-        "check_evidence_sufficiency",
-        lambda question, chunks: (
+        "verify_evidence",
+        lambda question, chunks, **kwargs: (
             sufficiency_calls.append((question, chunks))
-            or EvidenceSufficiencyDecision(
+            or EvidenceAssessment(
                 sufficient=True,
                 reason="评级和定义均已覆盖",
                 missing_requirements=[],
@@ -642,7 +640,7 @@ def test_sequential_retrieval_extracts_bridge_and_preserves_each_hop(
         ),
     )
 
-    result = retrieval.retrieve_raw_results("42", original_question)
+    result = retrieval.retrieve_evidence("42", original_question)
 
     assert len(calls) == 2
     assert calls[0]["question"] == original_question
@@ -650,37 +648,37 @@ def test_sequential_retrieval_extracts_bridge_and_preserves_each_hop(
         "“优于大市”的评级定义和评级标准是什么？"
     )
     assert calls[1]["options"].doc_ids == ["doc-1"]
-    assert [chunk["chunk_id"] for chunk in result["chunks"]] == [
+    assert [chunk["chunk_id"] for chunk in reference_records(result.evidence)] == [
         "rating",
         "definition",
     ]
-    assert result["retrieval_fusion"]["method"] == (
+    assert result.diagnostics["retrieval_fusion"]["method"] == (
         "sequential_original_question_rerank"
     )
     assert final_rerank_calls == [(original_question, [
         "维持“优于大市”评级。",
         "优于大市：股价表现优于市场代表性指数10%以上。",
     ])]
-    assert result["retrieval_fusion"]["final_rerank"]["source"] == "model"
-    assert result["chunks"][0]["rerank_score"] == 0.98
-    assert result["sequential_retrieval"]["bridge"]["value"] == (
+    assert result.diagnostics["retrieval_fusion"]["final_rerank"]["source"] == "model"
+    assert reference_records(result.evidence)[0]["rerank_score"] == 0.98
+    assert result.diagnostics["sequential_retrieval"]["bridge"]["value"] == (
         "优于大市"
     )
-    assert result["chunks"][0]["sequential_subqueries"][0][
+    assert reference_records(result.evidence)[0]["sequential_subqueries"][0][
         "subquery_id"
     ] == "rating_lookup"
     assert [
         item["subquery_id"]
-        for item in result["chunks"][0]["sequential_subqueries"]
+        for item in reference_records(result.evidence)[0]["sequential_subqueries"]
     ] == ["rating_lookup", "rating_definition"]
-    assert result["chunks"][1]["sequential_subqueries"][0][
+    assert reference_records(result.evidence)[1]["sequential_subqueries"][0][
         "subquery_id"
     ] == "rating_definition"
     assert len(sufficiency_calls) == 1
     assert len(sufficiency_calls[0][1]) == 2
-    assert result["chunks_before_sufficiency"] == sufficiency_calls[0][1]
-    assert result["stage_latency_ms"]["multi_hop"] is not None
-    assert result["stage_latency_ms"]["rerank"] >= 0
+    assert collection_from_records(reference_records(result.candidates)).version == sufficiency_calls[0][1].version
+    assert result.diagnostics["stage_latency_ms"]["multi_hop"] is not None
+    assert result.diagnostics["stage_latency_ms"]["rerank"] >= 0
 
 
 @pytest.mark.unit
@@ -760,34 +758,35 @@ def test_parallel_retrieval_reserves_coverage_for_every_subquery(monkeypatch):
     )
     monkeypatch.setattr(
         retrieval,
-        "check_evidence_sufficiency",
-        lambda _question, chunks: EvidenceSufficiencyDecision(
+        "verify_evidence",
+        lambda _question, chunks, **kwargs: EvidenceAssessment(
             sufficient=True,
             reason="两个指标均有证据",
             missing_requirements=[],
             supporting_chunk_indices=[1, 2],
             source="model",
             evaluated_chunk_count=len(chunks),
-            evaluated_chunk_ids=[chunk["chunk_id"] for chunk in chunks],
+            evaluated_chunk_ids=[chunk.id for chunk in chunks],
         ),
     )
 
-    result = retrieval.retrieve_raw_results(
+    result = retrieval.retrieve_evidence(
         "42",
         original_question,
         page_size=5,
     )
 
-    assert [call["question"] for call in calls] == [
+    # 并行节点的启动顺序由线程调度决定；仍检查查询及调用数量完全一致。
+    assert sorted(call["question"] for call in calls) == sorted([
         "国电电力2025E每股收益是多少？",
         "国电电力2025E每股红利是多少？",
-    ]
+    ])
     assert all(call["options"].page_size == 10 for call in calls)
-    result_ids = [chunk["chunk_id"] for chunk in result["chunks"]]
+    result_ids = [chunk["chunk_id"] for chunk in reference_records(result.evidence)]
     assert "dividend-1" in result_ids
     assert "dividend-2" in result_ids
     assert len(result_ids) == 5
-    assert result["parallel_retrieval"] == {
+    assert result.diagnostics["parallel_retrieval"] == {
         "applied": True,
         "coverage_per_subquery": 2,
         "steps": [
@@ -801,14 +800,14 @@ def test_parallel_retrieval_reserves_coverage_for_every_subquery(monkeypatch):
             },
         ],
     }
-    assert result["retrieval_fusion"]["final_rerank"][
+    assert result.diagnostics["retrieval_fusion"]["final_rerank"][
         "coverage_chunk_ids_by_subquery"
     ] == {
         "eps_lookup": ["eps-1", "eps-2"],
         "dividend_lookup": ["dividend-1", "dividend-2"],
     }
     dividend = next(
-        chunk for chunk in result["chunks"]
+        chunk for chunk in reference_records(result.evidence)
         if chunk["chunk_id"] == "dividend-1"
     )
     assert dividend["final_ranking"]["coverage_reserved"] is True
@@ -1126,25 +1125,25 @@ def test_parallel_retrieval_prefers_exact_distinct_metric_evidence(
     )
     monkeypatch.setattr(
         retrieval,
-        "check_evidence_sufficiency",
-        lambda _question, chunks: EvidenceSufficiencyDecision(
+        "verify_evidence",
+        lambda _question, chunks, **kwargs: EvidenceAssessment(
             sufficient=True,
             reason="费用率和费用金额均有精确证据",
             missing_requirements=[],
             supporting_chunk_indices=[1, 2],
             source="model",
             evaluated_chunk_count=len(chunks),
-            evaluated_chunk_ids=[chunk["chunk_id"] for chunk in chunks],
+            evaluated_chunk_ids=[chunk.id for chunk in chunks],
         ),
     )
 
-    result = retrieval.retrieve_raw_results(
+    result = retrieval.retrieve_evidence(
         "42",
         original_question,
         page_size=4,
     )
 
-    result_ids = [chunk["chunk_id"] for chunk in result["chunks"]]
+    result_ids = [chunk["chunk_id"] for chunk in reference_records(result.evidence)]
     assert result_ids[:2] == ["amount-cash-flow", "exact-rate"]
     assert "exact-rate" in result_ids
     assert "amount-cash-flow" in result_ids
@@ -1157,7 +1156,7 @@ def test_parallel_retrieval_prefers_exact_distinct_metric_evidence(
         "amount-cash-flow",
         "amount-profit-table",
     }.issubset(result_ids)
-    assert result["retrieval_fusion"]["final_rerank"][
+    assert result.diagnostics["retrieval_fusion"]["final_rerank"][
         "coverage_chunk_ids_by_subquery"
     ] == {
         "rate": ["exact-rate", "approximate-figure"],
@@ -1749,16 +1748,15 @@ def test_retrieval_result_preserves_rrf_and_branch_diagnostics():
 
 # 用例功能：验证面向聊天的检索结果会保留排名、相似度和来源元数据。
 # 执行步骤：
-# 1. 用包含一条完整 chunk 元数据的伪结果替换底层检索。
-# 2. 调用 retrieve_content 生成聊天使用的紧凑结果。
+# 1. 用包含一条完整 chunk 元数据的类型化结果替换底层检索。
+# 2. 调用 retrieve_evidence，再从证据集合导出前端记录。
 # 3. 验证文档路径已转为文件名，且排名、分数、位置和标识字段均被保留。
 @pytest.mark.unit
-def test_retrieve_content_preserves_ranking_metadata(monkeypatch):
+def test_retrieve_evidence_preserves_ranking_metadata_at_output(monkeypatch):
     monkeypatch.setattr(
         retrieval,
-        "retrieve_raw_results",
-        lambda *_args, **_kwargs: {
-            "chunks": [
+        "_retrieve_evidence_result",
+        lambda *_args, context, **_kwargs: retrieval_result(context, collection_from_records([
                 {
                     "chunk_id": "chunk-1",
                     "doc_id": "doc-1",
@@ -1794,11 +1792,10 @@ def test_retrieve_content_preserves_ranking_metadata(monkeypatch):
                     "kb_id": "42",
                     "image_id": "image-1",
                 }
-            ]
-        },
+            ]), collection_from_records([]), None, {}),
     )
 
-    result = retrieval.retrieve_content("42", "测试问题")
+    result = reference_records(retrieval.retrieve_evidence("42", "测试问题").evidence)
 
     assert result == [
         {
@@ -1808,6 +1805,7 @@ def test_retrieve_content_preserves_ranking_metadata(monkeypatch):
             "document_id": "doc-1",
             "document_name": "国电电力.pdf",
             "content_with_weight": "证据内容",
+            "source_type": "knowledge_base",
             "similarity": 0.91,
             "rerank_score": 0.91,
             "rrf_score": 0.032,
@@ -1834,8 +1832,6 @@ def test_retrieve_content_preserves_ranking_metadata(monkeypatch):
                 "retrieval_rrf_rank": 2,
                 "final_fusion_score": 0.08,
                 },
-                "sequential_subqueries": [],
-                "parallel_subqueries": [],
                 "positions": [[5, 10]],
             "kb_id": "42",
             "image_id": "image-1",

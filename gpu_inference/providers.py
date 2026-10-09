@@ -1,4 +1,4 @@
-"""Local model engines used by the standalone GPU inference service."""
+"""独立 GPU 推理服务使用的本地模型引擎。"""
 
 from pathlib import Path
 from threading import Lock

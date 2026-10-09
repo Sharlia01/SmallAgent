@@ -1,3 +1,5 @@
+from domain.facts import FactEvidenceBundle
+from service.core.evidence_adapter import collection_from_records
 from types import SimpleNamespace
 
 import pytest
@@ -53,11 +55,10 @@ def test_model_accepts_evidence_that_covers_every_requirement(monkeypatch):
         '"missing_requirements":[],"supporting_chunk_indices":[1,2]}'
     )
 
-    decision = evidence_sufficiency.check_evidence_sufficiency(
-        "2025年全年营业收入和归母净利润是多少？",
-        chunks(),
+    decision = evidence_sufficiency.assess_evidence_sufficiency("2025年全年营业收入和归母净利润是多少？",
+        collection_from_records(chunks()),
         client=fake_client(completions),
-    )
+        facts=FactEvidenceBundle())
 
     assert decision.sufficient is True
     assert decision.source == "model"
@@ -97,11 +98,10 @@ def test_system_prompt_preserves_company_internal_entity_scope(monkeypatch):
         },
     ]
 
-    decision = evidence_sufficiency.check_evidence_sufficiency(
-        "先找出归母净利润最高的电源板块，再说明该类电源的发电量。",
-        company_segments,
+    decision = evidence_sufficiency.assess_evidence_sufficiency("先找出归母净利润最高的电源板块，再说明该类电源的发电量。",
+        collection_from_records(company_segments),
         client=fake_client(completions),
-    )
+        facts=FactEvidenceBundle())
 
     assert decision.sufficient is True
     system_prompt = completions.calls[0]["messages"][0]["content"]
@@ -122,16 +122,15 @@ def test_model_rejects_partial_evidence_and_names_missing_requirement(
         '"supporting_chunk_indices":[1]}'
     )
 
-    decision = evidence_sufficiency.check_evidence_sufficiency(
-        "2025年全年实际营业收入是多少？",
-        [
+    decision = evidence_sufficiency.assess_evidence_sufficiency("2025年全年实际营业收入是多少？",
+        collection_from_records([
             {
                 "chunk_id": "half-year",
                 "content_with_weight": "2025年上半年营业收入为50亿元。",
             }
-        ],
+        ]),
         client=fake_client(completions),
-    )
+        facts=FactEvidenceBundle())
 
     assert decision.sufficient is False
     assert decision.missing_requirements == ["2025年全年实际数据"]
@@ -143,11 +142,10 @@ def test_empty_evidence_is_rejected_without_calling_model(monkeypatch):
     monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_ENABLED", "true")
     completions = FakeCompletions(error=AssertionError("must not be called"))
 
-    decision = evidence_sufficiency.check_evidence_sufficiency(
-        "这份报告的收入是多少？",
-        [],
+    decision = evidence_sufficiency.assess_evidence_sufficiency("这份报告的收入是多少？",
+        collection_from_records([]),
         client=fake_client(completions),
-    )
+        facts=FactEvidenceBundle())
 
     assert decision.sufficient is False
     assert decision.source == "rule"
@@ -164,13 +162,13 @@ def test_preparation_keeps_every_returned_top_chunk_within_total_budget():
         for index in range(1, 21)
     ]
 
-    prepared = evidence_sufficiency._prepare_evidence(source_chunks)
+    prepared = evidence_sufficiency._prepare_evidence(collection_from_records(source_chunks))
 
     assert len(prepared) == 20
-    assert [item["chunk_id"] for item in prepared] == [
+    assert [item.evidence.id for item in prepared] == [
         f"chunk-{index}" for index in range(1, 21)
     ]
-    assert sum(len(item["content"]) for item in prepared) <= (
+    assert sum(len(item.text) for item in prepared) <= (
         evidence_sufficiency.MAX_EVIDENCE_TOTAL_CHARS
     )
 
@@ -181,11 +179,10 @@ def test_provider_failure_is_fail_closed_by_default(monkeypatch):
     monkeypatch.delenv("RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN", raising=False)
     completions = FakeCompletions(error=TimeoutError("provider timeout"))
 
-    decision = evidence_sufficiency.check_evidence_sufficiency(
-        "2025年全年营业收入是多少？",
-        chunks(),
+    decision = evidence_sufficiency.assess_evidence_sufficiency("2025年全年营业收入是多少？",
+        collection_from_records(chunks()),
         client=fake_client(completions),
-    )
+        facts=FactEvidenceBundle())
 
     assert decision.sufficient is False
     assert decision.source == "fallback"
@@ -198,11 +195,10 @@ def test_provider_failure_can_fail_open(monkeypatch):
     monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN", "true")
     completions = FakeCompletions(error=TimeoutError("provider timeout"))
 
-    decision = evidence_sufficiency.check_evidence_sufficiency(
-        "2025年全年营业收入是多少？",
-        chunks(),
+    decision = evidence_sufficiency.assess_evidence_sufficiency("2025年全年营业收入是多少？",
+        collection_from_records(chunks()),
         client=fake_client(completions),
-    )
+        facts=FactEvidenceBundle())
 
     assert decision.sufficient is True
     assert decision.source == "fallback"
@@ -214,11 +210,10 @@ def test_disabled_check_preserves_retrieved_evidence(monkeypatch):
     monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_ENABLED", "false")
     completions = FakeCompletions(error=AssertionError("must not be called"))
 
-    decision = evidence_sufficiency.check_evidence_sufficiency(
-        "2025年全年营业收入是多少？",
-        chunks(),
+    decision = evidence_sufficiency.assess_evidence_sufficiency("2025年全年营业收入是多少？",
+        collection_from_records(chunks()),
         client=fake_client(completions),
-    )
+        facts=FactEvidenceBundle())
 
     assert decision.sufficient is True
     assert decision.source == "disabled"

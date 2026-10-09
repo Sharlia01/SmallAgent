@@ -285,7 +285,7 @@ def test_e2e_summary_aggregates_retrieval_scores_and_slices(top_k):
     assert failures["post_gate_metrics"][f"mrr_at_{top_k}"] == ["rejected"]
     assert failures["refusal_metrics"]["over_refusal_rate"] == ["rejected"]
 
-    # Both runners must keep identical denominators, scores and diagnostics.
+    # 两个评测执行器必须使用相同的分母、得分和诊断规则。
     retrieval_summary = build_summary(cases, top_k=top_k)
     pairs = [(overall, retrieval_summary["overall"])]
     pairs.extend(

@@ -1,4 +1,4 @@
-"""Run with: python -m unittest discover -s evals -p test_html_report.py."""
+"""运行方式：python -m unittest discover -s evals -p test_html_report.py。"""
 
 import unittest
 

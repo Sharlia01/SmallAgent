@@ -1,4 +1,5 @@
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2025 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -47,7 +48,7 @@ def draw_box(im, result, lables, threshold=0.5):
             width=draw_thickness,
             fill=color)
 
-        # draw label
+        # 绘制类别标签。
         text = "{} {:.4f}".format(dt["type"], dt["score"])
         tw, th = imagedraw_textsize_c(draw, text)
         draw.rectangle(
@@ -57,11 +58,12 @@ def draw_box(im, result, lables, threshold=0.5):
 
 
 def get_color_map_list(num_classes):
-    """
-    Args:
-        num_classes (int): number of class
-    Returns:
-        color_map (list): RGB color list
+    """生成各类别使用的颜色。
+
+    参数：
+        num_classes（int）：类别数量。
+    返回：
+        color_map（list）：RGB 颜色列表。
     """
     color_map = num_classes * [0, 0, 0]
     for i in range(0, num_classes):

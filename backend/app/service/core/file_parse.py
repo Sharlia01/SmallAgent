@@ -16,6 +16,9 @@ from service.core.rag.utils.es_conn import ESConnection
 from service.core.api.utils.file_utils import get_project_base_directory
 from service.core.evidence_metadata import evidence_metadata
 from service.core.table_models import TABLE_PARSER_VERSION
+from service.core.entity_attribution import (
+    annotate_chunk, annotate_document, annotate_table_object, get_entity_registry,
+)
 
 PARSER_VERSION = TABLE_PARSER_VERSION
 
@@ -27,7 +30,7 @@ def _save_evidence_image(image, index_name: str, doc_id: str) -> str:
     buffer = BytesIO()
     image.save(buffer, format="PNG")
     data = buffer.getvalue()
-    # Hash tenant and document identifiers instead of accepting path fragments.
+    # 对租户和文档编号计算摘要，避免将外部输入直接作为路径片段。
     tenant = _tenant_storage_key(index_name)
     relative = Path("storage/evidence") / tenant / doc_id / (hashlib.sha256(data).hexdigest() + ".png")
     path = Path(get_project_base_directory()) / relative
@@ -43,13 +46,17 @@ def _save_table_object(
     doc_id: str,
     file_name: str,
     image_ref: str | None,
+    entity_annotation: dict[str, Any] | None = None,
 ) -> str:
-    """Persist a content-addressed parent object outside the chunk index."""
+    """将按内容寻址的父表对象保存到片段索引之外。"""
     table_id = str(table_object.get("table_id") or "")
     if not re.fullmatch(r"[0-9a-f]{64}", table_id):
         raise ValueError("Table object requires a SHA-256 table_id")
 
     payload = json.loads(json.dumps(table_object, ensure_ascii=False))
+    if entity_annotation is not None:
+        # 将实体标注信息添加到payload中
+        payload["entity_attribution"] = entity_annotation
     provenance = payload.setdefault("provenance", {})
     provenance.update({
         "doc_id": doc_id,
@@ -81,7 +88,7 @@ def _save_table_object(
 
 
 def load_table_object(reference: str) -> dict[str, Any]:
-    """Load a saved parent object while rejecting paths outside storage."""
+    """读取已保存的父表对象，并拒绝访问存储目录以外的路径。"""
     base = Path(get_project_base_directory()).resolve()
     path = (base / reference).resolve()
     table_root = (base / "storage/table_objects").resolve()
@@ -104,15 +111,13 @@ def batch_generate_embeddings(
     texts: List[str],
     batch_size: int | None = None,
 ) -> List[List[float]]:
-    """
-    批量生成文本的向量嵌入
-    
-    Args:
-        texts: 文本列表
-        batch_size: Embedding 推理批处理大小，不传时读取环境变量
-    
-    Returns:
-        向量列表
+    """批量生成文本向量。
+
+    参数：
+        texts：文本列表。
+        batch_size：向量推理批量大小，未传入时读取环境变量。
+    返回：
+        向量列表。
     """
     embeddings = generate_embedding(texts, batch_size=batch_size)
     if len(embeddings) != len(texts):
@@ -127,17 +132,19 @@ def process_items(
     file_name: str,
     index_name: str,
 ) -> List[Dict[str, Any]]:
+    """批量处理文档数据项。
+
+    参数：
+        items：数据项列表。
+        file_name：文件名。
+        index_name：Elasticsearch 索引名称。
+    返回：
+        处理后的数据项列表。
     """
-    批量处理数据项
-    
-    Args:
-        items: 数据项列表
-        file_name: 文件名
-        index_name: ES索引名称
-    
-    Returns:
-        处理后的数据项列表
-    """
+
+    # 获取实体注册表并对文档进行注释
+    registry = get_entity_registry()
+    document_annotation = annotate_document(items, file_name, registry)
     # 准备批量处理的数据
     texts = [
         item.get("table_semantic_text_with_weight")
@@ -161,9 +168,10 @@ def process_items(
                     or item["content_with_weight"]]
         chunck_id = hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
 
-        # 构建数据字典
+        # annotate_chunk表示给每个chunk进行实体标注
         d = {
             **evidence_metadata(item),
+            **annotate_chunk(item, document_annotation, registry),
             "parser_version_kwd": PARSER_VERSION,
             "id": chunck_id,
             "content_ltks": item["content_ltks"],
@@ -202,6 +210,7 @@ def process_items(
                     doc_id,
                     file_name,
                     image_ref,
+                    annotate_table_object(table_object, document_annotation, registry),
                 )
             d["table_object_ref_kwd"] = table_object_refs[table_id]
 
@@ -213,13 +222,12 @@ def process_items(
 
 
 def execute_insert_process(file_path: str, file_name: str, index_name: str):
-    """
-    执行文档处理和插入 Elasticsearch 的函数
-    
-    Args:
-        file_path: 文件路径
-        file_name: 文件名
-        index_name: ES索引名称
+    """处理文档并写入 Elasticsearch。
+
+    参数：
+        file_path：文件路径。
+        file_name：文件名。
+        index_name：Elasticsearch 索引名称。
     """
     # 解析文档
     documents = parse(file_path)

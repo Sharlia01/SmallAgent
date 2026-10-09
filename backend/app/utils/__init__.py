@@ -1,4 +1,4 @@
-# set global timezone
+# 设置全局时区。
 from time import tzset
 tzset()
 

@@ -1,0 +1,61 @@
+{
+  "version": "1",
+  "entities": [
+    {
+      "entity_id": "company:cn:600795",
+      "canonical_name": "国电电力",
+      "kind": "company",
+      "aliases": [],
+      "stock_codes": ["600795.SH"],
+      "source": "国电电力.pdf 首页的公司名称和股票代码"
+    },
+    {
+      "entity_id": "company:cn:603193",
+      "canonical_name": "润本股份",
+      "kind": "company",
+      "aliases": [],
+      "stock_codes": ["603193.SH"],
+      "source": "润本股份.pdf 首页的公司名称和股票代码"
+    },
+    {
+      "entity_id": "company:cn:600011",
+      "canonical_name": "华能国际",
+      "kind": "company",
+      "aliases": [],
+      "stock_codes": ["600011.SH"],
+      "source": "国电电力.pdf 可比公司估值表的公司简称与代码列"
+    },
+    {
+      "entity_id": "company:cn:001289",
+      "canonical_name": "龙源电力",
+      "kind": "company",
+      "aliases": [],
+      "stock_codes": ["001289.SZ"],
+      "source": "国电电力.pdf 可比公司估值表的公司简称与代码列"
+    },
+    {
+      "entity_id": "company:cn:600027",
+      "canonical_name": "华电国际",
+      "kind": "company",
+      "aliases": [],
+      "stock_codes": ["600027.SH"],
+      "source": "国电电力.pdf 可比公司估值表的公司简称与代码列"
+    },
+    {
+      "entity_id": "publisher:guosen-securities",
+      "canonical_name": "国信证券",
+      "kind": "publisher",
+      "aliases": [],
+      "stock_codes": [],
+      "source": "国电电力.pdf 的国信证券经济研究所署名"
+    },
+    {
+      "entity_id": "publisher:huayuan-securities",
+      "canonical_name": "华源证券",
+      "kind": "publisher",
+      "aliases": [],
+      "stock_codes": [],
+      "source": "润本股份.pdf 的华源证券研究所署名"
+    }
+  ]
+}

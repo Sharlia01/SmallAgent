@@ -1,4 +1,4 @@
-"""Download a reproducible local BGE reranker snapshot before starting the API."""
+"""在启动接口服务之前，下载版本固定、可复现的本地 BGE 重排模型。"""
 
 import argparse
 from pathlib import Path

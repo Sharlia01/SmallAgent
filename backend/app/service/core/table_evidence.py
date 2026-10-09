@@ -1,4 +1,4 @@
-"""Turn recognized tables into self-contained rows."""
+"""将已识别表格转换为上下文完整的独立行。"""
 
 import base64
 from dataclasses import dataclass
@@ -119,7 +119,7 @@ def _year_label(text):
 
 
 def _canonical_table_row(caption, context, headers, cells, preamble=""):
-    """Render one validated table row as searchable text and safe HTML."""
+    """将一条已校验表格行渲染为检索文本和经过转义的 HTML。"""
     title = "；".join(part for part in (caption, context) if part)
     bound = "；".join(
         f"{header}：{cell}"
@@ -188,7 +188,7 @@ def _validated_visual_rows(rows):
 
 
 def bind_table_rows(html: str) -> list[dict]:
-    """Keep ambiguous tables intact; never invent headers for numeric rows."""
+    """保留结构不明确的完整表格，不为数值行编造表头。"""
     parser = TableParser()
     try:
         parser.feed(html)
@@ -201,8 +201,8 @@ def bind_table_rows(html: str) -> list[dict]:
     if not grid:
         return fallback
 
-    # OCR commonly labels the first key/value pair as <th>. For narrow tables,
-    # require a recognizable column heading instead of turning values into labels.
+    # OCR 常将第一组键值对标成 th；对于窄表，
+    # 必须识别出有效列标题，不能将普通数值误当成表头。
     first = next((row for row in parser.rows if len(row) > 1), [])
     if len(grid[0]) == 2 and first:
         heading = re.sub(r"\s|[：:]", "", first[0].text).casefold()
@@ -221,7 +221,7 @@ def bind_table_rows(html: str) -> list[dict]:
     previous_label = ""
     for r, row in enumerate(grid):
         raw = parser.rows[r]
-        # Full-width units/section labels apply to subsequent rows, not columns.
+        # 占据整行的单位或章节标签作用于后续行，不能作为列标题。
         if len(raw) == 1 and raw[0].colspan == len(row) and len(row) > 1:
             if raw[0].text:
                 if headers and not re.search(r"单位\s*[:：]", raw[0].text):
@@ -230,14 +230,14 @@ def bind_table_rows(html: str) -> list[dict]:
                     context.append(raw[0].text)
             continue
         has_values = any(_numeric_cell(cell.text) and not _year_label(cell.text) for cell in raw)
-        # OCR tags negative/accounting values as <th> surprisingly often.
+        # OCR 经常将负数或会计格式数值误标为 th 表头。
         explicit_header = all(cell.header and cell.scope != "row" for cell in raw) and not has_values
         inferred_header = (
             not headers and not result and len(raw) > 1
             and not has_values
         )
         if explicit_header or inferred_header:
-            # A repeated header inside the body starts a new header block.
+            # 正文中的重复表头表示新的表头区段开始。
             if result and not previous_header:
                 headers = []
             headers.append(row)
@@ -250,7 +250,7 @@ def bind_table_rows(html: str) -> list[dict]:
             (not upper[c] or not upper[c].text) and lower[c] and lower[c].text
             for upper, lower in zip(headers, headers[1:]) for c in range(1, len(row))
         ):
-            # Missing colspan information cannot be reconstructed from whitespace.
+            # 不能仅靠空白字符推测缺失的跨列信息。
             return fallback
 
         # 按列索引把多层表头拼成每列的标签
@@ -291,11 +291,10 @@ def bind_table_rows(html: str) -> list[dict]:
 
 
 def extract_visual_table(image, html: str, *, client=None) -> list[dict]:
-    """Use the configured vision model to bind an ambiguous table image.
+    """使用配置的视觉模型为结构不明确的表格图像建立绑定。
 
-    An empty list means that visual extraction was unavailable, failed, or did
-    not produce data that passed validation.  The caller can then safely fall
-    back to the original unbound HTML.
+    空列表表示视觉抽取不可用、执行失败，或输出未通过校验；
+    调用方此时可回退原始、未绑定的 HTML 表格。
     """
     model = os.getenv("FIGURE_VISION_MODEL", "").strip()
     api_key = os.getenv("FIGURE_VISION_API_KEY") or os.getenv("DASHSCOPE_API_KEY", "")
@@ -398,12 +397,12 @@ def _select_table_records(image, html: str, *, client=None) -> list[dict]:
 
 
 def table_evidence(image, html: str, *, client=None) -> list[dict]:
-    """Compatibility API returning the searchable row evidence only."""
+    """兼容入口，仅返回可搜索的行级证据。"""
     return _select_table_records(image, html, client=client)
 
 
 def _normalized_parser_cells(html: str) -> dict:
-    """Serialize the parser grid, including explicit merged-cell references."""
+    """序列化解析网格，保留明确的合并单元格引用。"""
     raw_text = " ".join(unescape(re.sub(r"<[^>]+>", " ", html)).split())
     parser = TableParser()
     try:
@@ -460,7 +459,7 @@ def parse_table_object(
     provenance: dict,
     client=None,
 ) -> TableObject:
-    """Build the complete fact object before deriving searchable chunks."""
+    """先构建完整表格事实对象，再生成可搜索的子片段。"""
     records = _select_table_records(image, html, client=client)
     parser_cells = _normalized_parser_cells(html)
     first = records[0] if records else {}

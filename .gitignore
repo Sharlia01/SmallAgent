@@ -1,15 +1,15 @@
-# Secrets and local environment files
+# 密钥和本地环境配置文件
 **/.env
 **/.env.*
 !**/.env.example
 
-# macOS and editor files
+# macOS 和编辑器生成的文件
 .DS_Store
 **/.DS_Store
 .idea/
 .vscode/
 
-# Python caches and local environments
+# Python 缓存和本地虚拟环境
 **/__pycache__/
 *.py[cod]
 .pytest_cache/
@@ -18,18 +18,18 @@
 .venv/
 venv/
 
-# Frontend dependencies and build output
+# 前端依赖和构建产物
 frontend/node_modules/
 frontend/dist/
 
-# Logs and temporary runtime files
+# 日志和运行时临时文件
 *.log
 backend/storage/
 backend/app/storage/
 backend/app/service/core/storage/
 backend/evals/results/
 
-# Locally uploaded or test documents
+# 本地上传文件和测试文档
 backend/pdf/
 backend/*.pdf
 backend/*.doc
@@ -39,13 +39,13 @@ backend/*.xlsx
 backend/*.ppt
 backend/*.pptx
 
-# Large local archives and instructional media
+# 大型本地归档和教学媒体文件
 backend/nltk_data/**/*.zip
 *.mp4
 wsl启动rag项目/
 .vscode/
 
-# Machine-learning model artifacts (keep locally, do not publish)
+# 机器学习模型文件：保留在本地，不提交到仓库
 *.onnx
 *.trie
 *.model

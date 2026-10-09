@@ -1,4 +1,5 @@
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2025 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -135,7 +136,7 @@ def forEdu(cv):
             if d:
                 deg.append(d)
 
-            # for first degree
+            # 处理第一学历。
             if not fdeg and d in ["中专", "专升本", "专科", "本科", "大专"]:
                 fdeg = [d]
                 if n.get("school_name"):
@@ -525,7 +526,7 @@ def parse(cv):
 
     keys = list(cv.keys())
     for k in keys:
-        # deal with json objects
+        # 处理 JSON 对象。
         if k.find("_obj") > 0:
             try:
                 cv[k] = json_loads(cv[k])
@@ -546,13 +547,13 @@ def parse(cv):
                 logging.exception("parse {} {}".format(str(traceback.format_exc()), cv[k]))
                 cv[k] = []
 
-        # tokenize fields
+        # 对文本字段进行分词。
         if k in tks_fld:
             cv[f"{k}_tks"] = rag_tokenizer.tokenize(cv[k])
             if k in small_tks_fld:
                 cv[f"{k}_sm_tks"] = rag_tokenizer.tokenize(cv[f"{k}_tks"])
 
-        # keyword fields
+        # 处理关键词字段。
         if k in kwd_fld:
             cv[f"{k}_kwd"] = [n.lower()
                                            for n in re.split(r"[\t,，；;. ]",
@@ -563,7 +564,7 @@ def parse(cv):
             cv[f"{k}_int"] = cv[k]
 
     cv["email_kwd"] = cv.get("email_tks", "").replace(" ", "")
-    # for name field
+    # 处理姓名字段。
     if cv.get("name"):
         nm = re.sub(r"[\n——\-\(（\+].*", "", cv["name"].strip())
         nm = re.sub(r"[ \t　]+", " ", nm)
@@ -579,7 +580,7 @@ def parse(cv):
         cv["name"] = nm.strip()
         name = cv["name"]
 
-        # name pingyin and its prefix
+        # 生成姓名拼音及其前缀。
         cv["name_py_tks"] = " ".join(PY.get_pinyins(nm[:20], '')) + " " + " ".join(PY.get_pinyins(nm[:20], ' '))
         cv["name_py_pref0_tks"] = ""
         cv["name_py_pref_tks"] = ""
@@ -606,7 +607,7 @@ def parse(cv):
         else:
             cv["phone"] = r.group(1)
 
-    # deal with date  fields
+    # 处理日期字段。
     if cv.get("updated_at") and isinstance(cv["updated_at"], datetime.datetime):
         cv["updated_at_dt"] = cv["updated_at"].strftime('%Y-%m-%d %H:%M:%S')
     else:
@@ -618,12 +619,12 @@ def parse(cv):
         if not d:
             d = "01"
         cv["updated_at_dt"] = "%s-%02d-%02d 00:00:00" % (y, int(m), int(d))
-        # long text tokenize
+        # 对长文本字段进行分词。
 
     if cv.get("responsibilities"):
         cv["responsibilities_ltks"] = rag_tokenizer.tokenize(rmHtmlTag(cv["responsibilities"]))
 
-    # for yes or no field
+    # 处理是非类型字段。
     fea = []
     for f, y, n in is_fld:
         if f not in cv:

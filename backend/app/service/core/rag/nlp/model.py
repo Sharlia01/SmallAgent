@@ -99,7 +99,7 @@ def _post_remote_json(
     max_retries: int,
     headers: dict[str, str] | None = None,
 ) -> dict:
-    """POST one idempotent inference request with bounded transient retries."""
+    """发送幂等推理请求，并在有界预算内重试临时故障。"""
     retryable_statuses = {408, 429, 500, 502, 503, 504}
     last_error: Exception | None = None
     for attempt in range(max_retries + 1):
@@ -144,7 +144,7 @@ def _convert_reranker_scores(
     if source_mode == target_mode:
         return scores
     if source_mode == "raw_logits" and target_mode == "probability":
-        # This stable form avoids overflow for large negative logits.
+        # 这种稳定计算形式可避免较大负数输入导致指数运算溢出。
         positive = scores >= 0
         converted = np.empty_like(scores, dtype=float)
         converted[positive] = 1.0 / (1.0 + np.exp(-scores[positive]))
@@ -166,7 +166,7 @@ def _convert_reranker_scores(
 
 @lru_cache(maxsize=1)
 def get_embedding_model():
-    """Load the local Sentence Transformers model once per API process."""
+    """每个接口服务进程只加载一次本地向量模型。"""
     model_path = Path(
         os.getenv("EMBEDDING_MODEL_PATH", DEFAULT_EMBEDDING_MODEL_PATH)
     ).expanduser()
@@ -198,7 +198,7 @@ def get_embedding_model():
 
 @lru_cache(maxsize=1)
 def get_reranker_model():
-    """Load the local cross-encoder reranker once per API process."""
+    """每个接口服务进程只加载一次本地交叉编码重排模型。"""
     model_path = Path(
         os.getenv("RERANKER_MODEL_PATH", DEFAULT_RERANKER_MODEL_PATH)
     ).expanduser()
@@ -634,7 +634,7 @@ def get_reranker_provider() -> RerankerProvider:
 
 
 def clear_inference_caches() -> None:
-    """Clear provider/model caches after changing inference configuration."""
+    """推理配置变更后清空提供方和模型缓存。"""
     _build_embedding_provider.cache_clear()
     _build_reranker_provider.cache_clear()
     get_embedding_model.cache_clear()
@@ -675,7 +675,7 @@ def get_chat_completion_block(session_id, question, references):
         return f"Error: {str(e)}"
 
 def rerank_similarity(query, texts, *, batch_size: int | None = None):
-    """Score query-document pairs with the configured reranker provider."""
+    """使用已配置的重排提供方为问题与文档对计算分数。"""
     if not isinstance(query, str):
         raise TypeError("query must be a string")
     if isinstance(texts, str):
@@ -729,11 +729,10 @@ def generate_embedding(
     *,
     batch_size: int | None = None,
 ) -> list[float] | list[list[float]]:
-    """Generate normalized embeddings with the configured provider.
+    """使用已配置的提供方生成归一化向量。
 
-    A single string returns one vector. A list returns vectors in the same
-    order. Raising on model or inference failures prevents uploads from being
-    recorded with missing embeddings.
+    单个字符串返回一个向量；字符串列表返回顺序对应的向量列表。
+    模型或推理失败时抛出异常，防止上传记录缺少向量却仍被标记为成功。
     """
     if isinstance(text, str):
         texts = [text]

@@ -1,4 +1,4 @@
-"""Check whether retrieved chunks fully support a knowledge-base answer."""
+"""检查检索片段是否完整支持知识库回答。"""
 
 from __future__ import annotations
 
@@ -6,21 +6,24 @@ import json
 import logging
 import os
 import re
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Any
 from uuid import uuid4
 
 from dotenv import load_dotenv
 from openai import OpenAI, APIConnectionError, APIStatusError
-from service.core.evidence_metadata import evidence_metadata
+from domain.assessment import EvidenceAssessment, EvidenceAssessmentSource
+from domain.facts import FactEvidenceBundle
+from domain.evidence import Evidence, EvidenceCollection, plain
 from service.core.query_contract import QueryGoal
 from service.core.query_runtime import (
     model_completion, current_runtime, observation_context, record_observation,
     failure_details, observe_contract, QueryBudgetExceeded,
 )
 from service.core.derived_evidence import build_derived_evidence
-
+from service.core.financial_facts import project_fact_context
+from service.core.evidence_adapter import structure_record
 
 load_dotenv()
 
@@ -35,13 +38,6 @@ MAX_EVIDENCE_TOTAL_CHARS = 12000
 MAX_EVIDENCE_REASON_CHARS = 300
 MAX_MISSING_REQUIREMENTS = 8
 MAX_MISSING_REQUIREMENT_CHARS = 160
-
-EvidenceSufficiencySource = Literal[
-    "model",
-    "rule",
-    "fallback",
-    "disabled",
-]
 
 EVIDENCE_SUFFICIENCY_SYSTEM_PROMPT = """
 你是知识库 RAG 的证据充分性校验器。你只判断候选证据是否能够完整回答用户问题，不要自己回答问题。
@@ -74,29 +70,6 @@ EVIDENCE_SUFFICIENCY_SYSTEM_PROMPT = """
 
 sufficient 为 true 时，missing_requirements 必须为空数组。索引从 1 开始，只列出真正支持回答的片段。
 """.strip()
-
-
-@dataclass(frozen=True)
-class EvidenceSufficiencyDecision:
-    """Structured answerability decision for the final retrieved chunks."""
-
-    sufficient: bool    # 现有证据是否完整
-    reason: str         # 简短说明判定原因
-    missing_requirements: list[str]    #还差什么要求
-    supporting_chunk_indices: list[int] #支撑结论的chunk下标
-    source: EvidenceSufficiencySource   # 判定不充分的来源 无证据/功能关闭/LLM判定
-    evaluated_chunk_count: int           #评估的候选证据数量，这次校验实际看了多少个chunk
-    evaluated_chunk_ids: list[str]       #被评估的chunk ID列表
-    goal_coverage: list[dict[str, Any]] = field(default_factory=list)
-    derived_evidence: list[dict[str, Any]] = field(default_factory=list)
-    used_derived_evidence_ids: list[str] = field(default_factory=list)
-    verification_status: str = "completed"
-    failure_kind: str | None = None
-    failure: dict[str, Any] | None = None
-    attempts: int = 0
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
 
 
 def _environment_flag(name: str, default: bool) -> bool:
@@ -150,149 +123,186 @@ def _normalize_short_text(value: Any, *, maximum: int) -> str:
     return normalized
 
 
-def _parse_decision(
-    content: str,
+def _parse_missing_requirements(raw_missing: Any, *, sufficient: bool) -> list[str]:
+    """校验缺失要求，并检查其与充分性结论的一致性。"""
+    if not isinstance(raw_missing, list):
+        raise ValueError("missing_requirements must be a list")
+    if len(raw_missing) > MAX_MISSING_REQUIREMENTS:
+        raise ValueError("too many missing evidence requirements")
+    missing = [_normalize_short_text(item, maximum=MAX_MISSING_REQUIREMENT_CHARS) for item in raw_missing]
+    if sufficient and missing:
+        raise ValueError("sufficient evidence cannot have missing requirements")
+    if not sufficient and not missing:
+        raise ValueError("insufficient evidence must name missing requirements")
+    return missing
+
+
+def _parse_supporting_indices(raw_indices: Any, *, chunk_count: int) -> list[int]:
+    """校验模型引用序号并保留首次出现的顺序。"""
+    if not isinstance(raw_indices, list):
+        raise ValueError("supporting_chunk_indices must be a list")
+    if not all(type(index) is int and 1 <= index <= chunk_count for index in raw_indices):
+        raise ValueError("supporting chunk index is out of range")
+    return list(dict.fromkeys(raw_indices))
+
+
+def _resolve_calculation_citations(
+    used: Any, derived: list[dict[str, Any]],
+) -> tuple[list[str], list[int]]:
+    """将模型使用的计算 ID 解析为已支持计算及其来源引用。"""
+    supported = {item["id"]: item for item in derived if item["status"] == "supported"}
+    if not isinstance(used, list) or not all(isinstance(key, str) and key in supported for key in used):
+        raise ValueError("unknown or unsupported derived evidence id")
+    indices = [index for key in used for index in supported[key]["supporting_chunk_indices"]]
+    return list(dict.fromkeys(used)), indices
+
+
+def _parse_goal_support(
+    item: Any, *, expected_ids: set[str], chunk_count: int, chunk_ids: list[str],
+) -> dict[str, Any]:
+    """校验一个目标的支持状态，并将模型序号转换为稳定来源 ID。"""
+    if not isinstance(item, dict) or item.get("goal_id") not in expected_ids:
+        raise ValueError("invalid evidence goal id")
+    status = item.get("status")
+    indices = item.get("supporting_chunk_indices", [])
+    if status not in {"supported", "missing", "conflict"} or not isinstance(indices, list):
+        raise ValueError("invalid goal coverage")
+    if not all(type(index) is int and 1 <= index <= chunk_count for index in indices):
+        raise ValueError("invalid goal evidence indices")
+    if status == "supported" and not indices:
+        raise ValueError("supported goal needs evidence")
+    return {"goal_id": item["goal_id"], "status": status,
+            "supporting_chunk_ids": [chunk_ids[index - 1] for index in dict.fromkeys(indices)]}
+
+
+def _parse_goal_coverage(
+    raw_coverage: Any, *, goals: tuple[QueryGoal, ...], sufficient: bool,
+    chunk_count: int, chunk_ids: list[str],
+) -> list[dict[str, Any]]:
+    """确认所有目标恰好被评估一次，并与整体结论一致。"""
+    if not goals:
+        return []
+    expected = {goal.id for goal in goals}
+    if not isinstance(raw_coverage, list) or len(raw_coverage) != len(expected):
+        raise ValueError("verifier must evaluate every goal")
+    coverage = [_parse_goal_support(item, expected_ids=expected, chunk_count=chunk_count, chunk_ids=chunk_ids)
+                for item in raw_coverage]
+    if {item["goal_id"] for item in coverage} != expected:
+        raise ValueError("duplicate or missing evidence goal id")
+    if sufficient and any(item["status"] != "supported" for item in coverage):
+        raise ValueError("sufficiency disagrees with goal coverage")
+    return coverage
+
+
+def _parse_assessment(
+    payload: Any,
     *,
     chunk_count: int,
     chunk_ids: list[str],
     goals: tuple[QueryGoal, ...] = (),
     derived_evidence: list[dict[str, Any]] | None = None,
-) -> EvidenceSufficiencyDecision:
-    payload = json.loads(content)
+) -> EvidenceAssessment:
+    """组织模型判定各字段的契约校验，再构造未绑定范围的报告。"""
     if not isinstance(payload, dict):
         raise ValueError("evidence sufficiency response must be a JSON object")
-
     sufficient = payload.get("sufficient")
     if not isinstance(sufficient, bool):
         raise ValueError("evidence sufficiency value must be a boolean")
-
-    reason = _normalize_short_text(
-        payload.get("reason"),
-        maximum=MAX_EVIDENCE_REASON_CHARS,
-    )
-
-    raw_missing = payload.get("missing_requirements")
-    if not isinstance(raw_missing, list):
-        raise ValueError("missing_requirements must be a list")
-    if len(raw_missing) > MAX_MISSING_REQUIREMENTS:
-        raise ValueError("too many missing evidence requirements")
-    missing_requirements = [
-        _normalize_short_text(
-            item,
-            maximum=MAX_MISSING_REQUIREMENT_CHARS,
-        )
-        for item in raw_missing
-    ]
-    if sufficient and missing_requirements:
-        raise ValueError("sufficient evidence cannot have missing requirements")
-    if not sufficient and not missing_requirements:
-        raise ValueError("insufficient evidence must name missing requirements")
-
-    raw_indices = payload.get("supporting_chunk_indices")
-    if not isinstance(raw_indices, list):
-        raise ValueError("supporting_chunk_indices must be a list")
-    if not all(
-        isinstance(index, int)
-        and not isinstance(index, bool)
-        and 1 <= index <= chunk_count
-        for index in raw_indices
-    ):
-        raise ValueError("supporting chunk index is out of range")
-    supporting_chunk_indices = list(dict.fromkeys(raw_indices))
-    derived_evidence = derived_evidence or []
-    derived_by_id = {item["id"]: item for item in derived_evidence if item["status"] == "supported"}
-    used = payload.get("derived_evidence_ids", [])
-    if not isinstance(used, list) or not all(isinstance(key, str) and key in derived_by_id for key in used):
-        raise ValueError("unknown or unsupported derived evidence id")
-    for key in used:
-        supporting_chunk_indices.extend(derived_by_id[key]["supporting_chunk_indices"])
-    supporting_chunk_indices = list(dict.fromkeys(supporting_chunk_indices))
-    if sufficient and not supporting_chunk_indices:
+    reason = _normalize_short_text(payload.get("reason"), maximum=MAX_EVIDENCE_REASON_CHARS)
+    missing = _parse_missing_requirements(payload.get("missing_requirements"), sufficient=sufficient)
+    indices = _parse_supporting_indices(payload.get("supporting_chunk_indices"), chunk_count=chunk_count)
+    derived = derived_evidence or []
+    used, calculated_indices = _resolve_calculation_citations(payload.get("derived_evidence_ids", []), derived)
+    indices = list(dict.fromkeys([*indices, *calculated_indices]))
+    if sufficient and not indices:
         raise ValueError("sufficient evidence must cite a supporting chunk")
-
-    coverage = []
-    if goals:
-        raw_coverage = payload.get("goal_coverage")
-        expected = {goal.id for goal in goals}
-        if not isinstance(raw_coverage, list) or len(raw_coverage) != len(expected):
-            raise ValueError("verifier must evaluate every goal")
-        for item in raw_coverage:
-            if not isinstance(item, dict) or item.get("goal_id") not in expected:
-                raise ValueError("invalid evidence goal id")
-            status = item.get("status")
-            indices = item.get("supporting_chunk_indices", [])
-            if status not in {"supported", "missing", "conflict"} or not isinstance(indices, list):
-                raise ValueError("invalid goal coverage")
-            if not all(type(i) is int and 1 <= i <= chunk_count for i in indices):
-                raise ValueError("invalid goal evidence indices")
-            if status == "supported" and not indices:
-                raise ValueError("supported goal needs evidence")
-            coverage.append({"goal_id": item["goal_id"], "status": status,
-                             "supporting_chunk_ids": [chunk_ids[i - 1] for i in dict.fromkeys(indices)]})
-        if {item["goal_id"] for item in coverage} != expected:
-            raise ValueError("duplicate or missing evidence goal id")
-        if sufficient and any(item["status"] != "supported" for item in coverage):
-            raise ValueError("sufficiency disagrees with goal coverage")
-
-    return EvidenceSufficiencyDecision(
-        sufficient=sufficient,
-        reason=reason,
-        missing_requirements=missing_requirements,
-        supporting_chunk_indices=supporting_chunk_indices,
-        source="model",
-        evaluated_chunk_count=chunk_count,
-        evaluated_chunk_ids=chunk_ids,
-        goal_coverage=coverage,
-        derived_evidence=derived_evidence,
-        used_derived_evidence_ids=list(dict.fromkeys(used)),
+    coverage = _parse_goal_coverage(payload.get("goal_coverage"), goals=goals, sufficient=sufficient,
+                                    chunk_count=chunk_count, chunk_ids=chunk_ids)
+    return EvidenceAssessment(
+        sufficient=sufficient, reason=reason, missing_requirements=missing,
+        supporting_chunk_indices=indices, source="model", evaluated_chunk_count=chunk_count,
+        evaluated_chunk_ids=chunk_ids, goal_coverage=coverage,
+        facts=FactEvidenceBundle(derived_evidence=derived), used_derived_evidence_ids=used,
     )
 
-# 从原始chunks里提取出可用于证据充分性校验的内容，限制总长度和每个chunk的长度，避免模型处理过长文本导致超时或返回错误。
-def _prepare_evidence(chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    candidates = []
-    for chunk in chunks[:MAX_EVIDENCE_CHUNKS]:
-        content = chunk.get("content_with_weight") or chunk.get("content_ltks")
-        if not isinstance(content, str) or not content.strip():
-            continue
-        candidates.append((chunk, content.strip()))
 
+@dataclass(frozen=True)
+class VerificationItem:
+    """有界模型输入；保留原证据引用，裁剪正文不修改来源身份。"""
+
+    evidence: Evidence
+    text: str
+    financial: bool = False
+
+    def model_record(self, index: int) -> dict[str, Any]:
+        item = self.evidence
+        metadata = structure_record(item.structure)
+        metadata["evidence_type_kwd"] = item.structure.kind
+        if item.structure.kind == "table":
+            metadata["table_binding_kwd"] = item.structure.table.binding
+        if item.structure.kind == "figure":
+            metadata["visual_status_kwd"] = item.structure.figure.status
+        if item.structure.locator:
+            metadata["locator_kwd"] = item.structure.locator
+        if item.location.page_number is not None:
+            metadata["page_num_int"] = plain(item.location.page_number)
+        if self.financial:
+            metadata = {key: value for key, value in metadata.items() if key in {
+                "evidence_type_kwd", "page_num_int", "table_binding_kwd", "visual_status_kwd",
+            }}
+        metadata.pop("entity_attribution_obj", None)
+        return {"index": index, "chunk_id": item.id, "document_id": item.source.document_id,
+                "document_name": item.source.name, "content": self.text, **metadata}
+
+
+def _prepare_evidence(evidence: EvidenceCollection, facts: FactEvidenceBundle | None = None) -> tuple[VerificationItem, ...]:
+    """从原对象生成有界输入，模型序号只对应实际发送的证据。"""
+    facts = facts or FactEvidenceBundle()
+    blocks = project_fact_context(evidence, facts)
+    candidates = [block for block in blocks if block.text.strip()][:MAX_EVIDENCE_CHUNKS]
     if not candidates:
-        return []
-
-    per_chunk_budget = min(
-        MAX_EVIDENCE_CHARS_PER_CHUNK,
-        max(1, MAX_EVIDENCE_TOTAL_CHARS // len(candidates)),
-    )
-    prepared = []
-    for chunk, content in candidates:
-        content = content[:per_chunk_budget]
-        prepared.append(
-            {
-                "index": len(prepared) + 1,
-                "chunk_id": str(chunk.get("chunk_id") or ""),
-                "document_id": str(chunk.get("doc_id") or chunk.get("document_id") or ""),
-                "document_name": str(
-                    chunk.get("docnm_kwd")
-                    or chunk.get("document_name")
-                    or ""
-                ),
-                "content": content,
-                **evidence_metadata(chunk),
-            }
-        )
-    return prepared
+        return ()
+    budget = min(MAX_EVIDENCE_CHARS_PER_CHUNK, max(1, MAX_EVIDENCE_TOTAL_CHARS // len(candidates)))
+    return tuple(VerificationItem(evidence.get(block.evidence_id), block.text.strip()[:budget], facts.applicable)
+                 for block in candidates)
 
 
-def _fallback_decision(
-    evidence: list[dict[str, Any]],
+def _bind_fact_support(assessment: EvidenceAssessment, bundle: FactEvidenceBundle) -> EvidenceAssessment:
+    """将模型引用映射到各财务目标的服务端已核验事实。"""
+    if not bundle.applicable:
+        return replace(assessment, facts=bundle)
+    cited = {assessment.evaluated_chunk_ids[index - 1] for index in assessment.supporting_chunk_indices}
+    supported_ids = [fact.fact_id for fact in bundle.facts
+                     if fact.fact_id in bundle.selected_fact_ids and fact.source["chunk_id"] in cited]
+    coverage = []
+    for entry in assessment.goal_coverage:
+        local_chunks = set(entry.get("supporting_chunk_ids") or [])
+        allowed = {match["fact_id"] for match in bundle.matches
+                   if match["goal_id"] == entry["goal_id"] and match["status"] == "usable"}
+        ids = [fact.fact_id for fact in bundle.facts if fact.fact_id in allowed and fact.source["chunk_id"] in local_chunks]
+        if entry["status"] == "supported":
+            for required in bundle.goal_coverage:
+                if required["goal_id"] == entry["goal_id"] and required["supporting_fact_ids"] and not set(
+                    required["supporting_fact_ids"]).intersection(ids):
+                    raise ValueError("goal citation does not support its verified financial fact")
+        coverage.append({**entry, "supporting_fact_ids": ids})
+    if assessment.sufficient:
+        for required in bundle.goal_coverage:
+            if required["supporting_fact_ids"] and not set(required["supporting_fact_ids"]).intersection(supported_ids):
+                raise ValueError("answer citation does not support its verified financial fact")
+    return replace(assessment, facts=bundle, goal_coverage=coverage)
+
+
+def _fallback_assessment(
+    evidence: tuple[VerificationItem, ...],
     *, error: Exception | None = None, failure_kind: str = "verification_unavailable",
     attempts: int = 0, derived_evidence: list[dict[str, Any]] | None = None,
-) -> EvidenceSufficiencyDecision:
+) -> EvidenceAssessment:
     fail_open = _environment_flag(
         "RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN",
         False,
     )
-    return EvidenceSufficiencyDecision(
+    return EvidenceAssessment(
         sufficient=fail_open,
         reason=(
             "证据充分性校验失败，保留原检索结果"
@@ -303,10 +313,10 @@ def _fallback_decision(
         supporting_chunk_indices=[],
         source="fallback",
         evaluated_chunk_count=len(evidence),
-        evaluated_chunk_ids=[item["chunk_id"] for item in evidence],
-        verification_status="unavailable", failure_kind=failure_kind,
-        failure=failure_details(error) if error else None, attempts=attempts,
-        derived_evidence=derived_evidence or [],
+        evaluated_chunk_ids=[item.evidence.id for item in evidence],
+        verification_status="unavailable",
+        diagnostics={"failure_kind": failure_kind, "failure": failure_details(error) if error else None, "attempts": attempts},
+        facts=FactEvidenceBundle(derived_evidence=derived_evidence or []),
     )
 
 
@@ -315,175 +325,290 @@ def _retryable_transport(error: Exception) -> bool:
         isinstance(error, APIStatusError) and (error.status_code == 408 or error.status_code >= 500)
     )
 
-
-def check_evidence_sufficiency(
+def assess_evidence_sufficiency(
     question: str,
-    chunks: list[dict[str, Any]],
+    sources: EvidenceCollection,
     *,
+    facts: FactEvidenceBundle,
     client: Any | None = None,
     goals: tuple[QueryGoal, ...] = (),
-) -> EvidenceSufficiencyDecision:
-    """Return whether the final chunks explicitly cover the whole question."""
-
-    # 规范化问题，把chunks整理成规整的证据列表，并抽出chunk_ids用于后续记录。
+    require_semantic: bool = True,
+) -> EvidenceAssessment:
+    """按输入规则、视觉规则、执行策略和模型评估的顺序判断问题覆盖。"""
     normalized_question = question.strip() if isinstance(question, str) else ""
-    evidence = _prepare_evidence(chunks if isinstance(chunks, list) else [])
-    chunk_ids = [item["chunk_id"] for item in evidence]
-
-    if not normalized_question:
-        return EvidenceSufficiencyDecision(
-            sufficient=False,
-            reason="查询为空，无法校验证据充分性",
-            missing_requirements=["有效用户问题"],
-            supporting_chunk_indices=[],
-            source="rule",
-            evaluated_chunk_count=len(evidence),
-            evaluated_chunk_ids=chunk_ids,
-        )
-
-    if not evidence:
-        return EvidenceSufficiencyDecision(
-            sufficient=False,
-            reason="没有可用的候选证据",
-            missing_requirements=["可直接支持答案的知识库证据"],
-            supporting_chunk_indices=[],
-            source="rule",
-            evaluated_chunk_count=0,
-            evaluated_chunk_ids=[],
-        )
-
-    # A disabled/failed verifier must not promote OCR-only figures to visual facts.
-    # 如果问题明显是问图表视觉事实，而候选证据中只有图表OCR和题注，没有提取的视觉事实，则判定为不充分。
-    visual_question = bool(re.search(
-        r"柱|曲线|折线|饼图|图例|颜色|零轴|正负|为负|负值|趋势|增速|最高|最低|"
-        r"展示.*季度|哪.*(?:年|季度)|bar|curve|legend|trend|negative",
-        normalized_question, re.I,
-    ))
-    only_unread_figures = all(
-        item.get("evidence_type_kwd") == "figure"
-        and item.get("visual_status_kwd") != "extracted"
-        for item in evidence
-    )
-    if visual_question and only_unread_figures:
-        return EvidenceSufficiencyDecision(
-            sufficient=False,
-            reason="只找到图表文字定位信息，尚未提取回答所需的视觉事实",
-            missing_requirements=["图表视觉事实或明确描述该事实的正文证据"],
-            supporting_chunk_indices=[], source="rule",
-            evaluated_chunk_count=len(evidence), evaluated_chunk_ids=chunk_ids,
-        )
-
+    evidence = _prepare_evidence(sources, facts)
+    input_assessment = _check_required_inputs(normalized_question, evidence, facts, require_semantic=require_semantic)
+    if input_assessment is not None:
+        return input_assessment
+    # 视觉事实要求在跳过语义检查或关闭模型时仍然生效。
+    visual_assessment = _check_visual_support(normalized_question, evidence)
+    if visual_assessment is not None:
+        return visual_assessment
+    if not require_semantic:
+        return _accept_without_semantic_check(evidence, facts, reason="当前路径无需额外语义充分性检查")
     if not _environment_flag("RAG_EVIDENCE_SUFFICIENCY_ENABLED", True):
-        return EvidenceSufficiencyDecision(
-            sufficient=True,
-            reason="证据充分性校验已关闭",
-            missing_requirements=[],
-            supporting_chunk_indices=[],
-            source="disabled",
-            evaluated_chunk_count=len(evidence),
-            evaluated_chunk_ids=chunk_ids,
-        )
-
+        return _accept_without_semantic_check(evidence, facts, reason="证据充分性校验已关闭", source="disabled")
     if len(normalized_question) > MAX_EVIDENCE_QUESTION_CHARS:
         logger.warning("Skipping evidence check because the question is too long")
-        return _fallback_decision(evidence, failure_kind="input_limit")
+        return replace(_fallback_assessment(evidence, failure_kind="input_limit"), facts=facts)
 
-    derived = build_derived_evidence(normalized_question, evidence)
+    derived_facts = _prepare_derived_facts(normalized_question, sources, facts)
+    model_derived = _project_derived_evidence(derived_facts.derived_evidence, sources, evidence)
+    _record_calculations(derived_facts.derived_evidence)
+    return _assess_with_model(normalized_question, evidence, goals=goals, derived=model_derived,
+                              facts=derived_facts, client=client)
+
+
+def _accept_without_semantic_check(
+    evidence: tuple[VerificationItem, ...], facts: FactEvidenceBundle, *,
+    reason: str, source: EvidenceAssessmentSource = "rule",
+) -> EvidenceAssessment:
+    """构造跳过语义评估的放行报告。"""
+    return EvidenceAssessment(
+        sufficient=True, reason=reason, source=source, facts=facts,
+        evaluated_chunk_count=len(evidence), evaluated_chunk_ids=[item.evidence.id for item in evidence],
+    )
+
+
+def _check_required_inputs(
+    question: str, evidence: tuple[VerificationItem, ...], facts: FactEvidenceBundle, *,
+    require_semantic: bool,
+) -> EvidenceAssessment | None:
+    """检查问题和候选是否满足当前核验路径的输入要求。"""
+    if not question:
+        return EvidenceAssessment(
+            sufficient=False, reason="查询为空，无法校验证据充分性", source="rule",
+            missing_requirements=["有效用户问题"], facts=facts,
+            evaluated_chunk_count=len(evidence), evaluated_chunk_ids=[item.evidence.id for item in evidence],
+        )
+    if evidence:
+        return None
+    if not require_semantic:
+        # Agent 的直接回答允许没有检索来源；财务事实门控已经先执行。
+        return _accept_without_semantic_check(evidence, facts, reason="当前路径无需额外语义充分性检查")
+    return EvidenceAssessment(
+        sufficient=False, reason="没有可用的候选证据", source="rule",
+        missing_requirements=["可直接支持答案的知识库证据"],
+    )
+
+
+def _check_visual_support(question: str, evidence: tuple[VerificationItem, ...]) -> EvidenceAssessment | None:
+    """拒绝以尚未提取视觉事实的图表定位文字回答视觉问题。"""
+    visual_question = re.search(
+        r"柱|曲线|折线|饼图|图例|颜色|零轴|正负|为负|负值|趋势|增速|最高|最低|"
+        r"展示.*季度|哪.*(?:年|季度)|bar|curve|legend|trend|negative",
+        question, re.I,
+    )
+    only_unread_figures = all(
+        item.evidence.structure.kind == "figure"
+        and item.evidence.structure.figure.status != "extracted"
+        for item in evidence
+    )
+    if not visual_question or not only_unread_figures:
+        return None
+    return EvidenceAssessment(
+        sufficient=False, reason="只找到图表文字定位信息，尚未提取回答所需的视觉事实", source="rule",
+        missing_requirements=["图表视觉事实或明确描述该事实的正文证据"],
+        evaluated_chunk_count=len(evidence), evaluated_chunk_ids=[item.evidence.id for item in evidence],
+    )
+
+
+def _prepare_derived_facts(question: str, sources: EvidenceCollection, facts: FactEvidenceBundle) -> FactEvidenceBundle:
+    """沿用已核验的财务计算，或为非财务证据生成确定性计算。"""
+    derived = facts.derived_evidence if facts.applicable else build_derived_evidence(question, sources)
+    return replace(facts, derived_evidence=derived)
+
+
+def _calculation_source_ids(calculation: dict[str, Any], source_ids: list[str]) -> list[str]:
+    """取得计算出处的稳定 ID，兼容仅保存原始来源序号的计算记录。"""
+    return calculation.get("supporting_chunk_ids") or [
+        identifier for index, identifier in enumerate(source_ids, 1)
+        if index in calculation.get("supporting_chunk_indices", [])
+    ]
+
+
+def _project_calculation(
+    calculation: dict[str, Any], *, source_ids: list[str], model_indices: dict[str, int],
+) -> dict[str, Any]:
+    """将一项计算的来源引用投影到实际模型输入序号，不修改原始计算。"""
+    identifiers = _calculation_source_ids(calculation, source_ids)
+    projected = {
+        **calculation,
+        "supporting_chunk_indices": [model_indices[key] for key in identifiers if key in model_indices],
+        "inputs": [{**operand, "chunk_index": model_indices.get(operand["chunk_id"])}
+                   for operand in calculation.get("inputs", [])],
+    }
+    if calculation["status"] == "supported" and any(key not in model_indices for key in identifiers):
+        projected.update(status="unresolved", reason="input_not_in_model_context")
+    return projected
+
+
+def _project_derived_evidence(
+    derived: list[dict[str, Any]], sources: EvidenceCollection, evidence: tuple[VerificationItem, ...],
+) -> list[dict[str, Any]]:
+    """为本次模型输入建立计算引用映射。"""
+    source_ids = [item.id for item in sources]
+    model_indices = {item.evidence.id: index for index, item in enumerate(evidence, 1)}
+    return [_project_calculation(item, source_ids=source_ids, model_indices=model_indices) for item in derived]
+
+
+def _record_calculations(derived: list[dict[str, Any]]) -> None:
+    """记录服务端计算结果，使用原始出处而不是模型输入序号。"""
     if derived:
         record_observation("derived_evidence", "calculation", "completed",
                            supported_count=sum(item["status"] == "supported" for item in derived),
                            calculations=derived)
-    attempts = 0
-    operation_id = uuid4().hex
+
+
+def _build_model_messages(
+    question: str, evidence: tuple[VerificationItem, ...], goals: tuple[QueryGoal, ...],
+    derived: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    """在模型边界序列化有界证据、目标和计算上下文。"""
+    system_prompt = EVIDENCE_SUFFICIENCY_SYSTEM_PROMPT
+    if goals:
+        system_prompt += (
+            '\n必须逐个评估goals，并返回goal_coverage数组，每项为'
+            '{"goal_id":"目标id","status":"supported|missing|conflict","supporting_chunk_indices":[1]}。'
+            '只有全部目标均supported且各有证据才能sufficient=true。'
+        )
+    payload = {
+        "question": question,
+        "candidate_evidence": [item.model_record(index) for index, item in enumerate(evidence, 1)],
+        "goals": [goal.to_dict() for goal in goals],
+        "derived_evidence": derived,
+    }
+    return [{"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
+
+
+def _build_model_request(
+    question: str, evidence: tuple[VerificationItem, ...], goals: tuple[QueryGoal, ...],
+    derived: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """配置充分性模型的请求参数。"""
+    return {
+        "model": os.getenv("RAG_EVIDENCE_SUFFICIENCY_MODEL", DEFAULT_EVIDENCE_SUFFICIENCY_MODEL),
+        "messages": _build_model_messages(question, evidence, goals, derived),
+        "response_format": {"type": "json_object"},
+        "temperature": 0,
+        "max_tokens": 1600 if goals or derived else 500,
+        "stream": False,
+        "timeout": _timeout_seconds(),
+        "extra_body": {"enable_thinking": False},
+    }
+
+
+def _parse_model_completion(
+    completion: Any, *, evidence: tuple[VerificationItem, ...], goals: tuple[QueryGoal, ...],
+    derived: list[dict[str, Any]],
+) -> EvidenceAssessment:
+    """观测模型响应的解码及契约校验，返回尚未关联财务事实的判定。"""
+    choices = getattr(completion, "choices", None) or []
+    raw_content = getattr(getattr(choices[0], "message", None), "content", None) if choices else None
+    content = raw_content if isinstance(raw_content, str) else ""
+    return observe_contract(
+        "evidence_sufficiency", content, parse=lambda _: json.loads(_response_content(completion)),
+        validate=lambda payload: _parse_assessment(
+            payload, chunk_count=len(evidence),
+            chunk_ids=[item.evidence.id for item in evidence], goals=goals, derived_evidence=derived,
+        ),
+        finish_reason=getattr(choices[0], "finish_reason", None) if choices else None,
+    )
+
+
+def _can_retry_request(error: Exception, attempt: int) -> bool:
+    """传输故障只允许重试一次，并受开关、期限和模型调用额度约束。"""
+    if attempt != 1 or not _retryable_transport(error):
+        return False
+    if not _environment_flag("RAG_EVIDENCE_SUFFICIENCY_TRANSIENT_RETRY", True):
+        return False
+    runtime = current_runtime()
+    return runtime is None or (
+        runtime.remaining() >= min(2.0, _timeout_seconds())
+        and runtime.counts.get("model", 0) < runtime.max_model_calls
+    )
+
+
+def _record_skipped_response_validation() -> None:
+    """请求失败时记录未执行的响应解码和契约校验。"""
+    for suffix, phase in (("_parse", "parse"), ("_validation", "semantic_validation")):
+        record_observation("evidence_sufficiency" + suffix, phase, "skipped", end_reason="request_failed")
+
+
+def _record_recovery_decision(error: Exception, *, retry: bool) -> None:
+    """记录本次请求失败后的重试决策。"""
+    record_observation("evidence_sufficiency_recovery", "recovery", "retry" if retry else "failed",
+                       end_reason="transient_request_retry" if retry else "verification_unavailable",
+                       **failure_details(error))
+
+
+@dataclass
+class _ModelRun:
+    """仅保存一次模型核验的观测标识和当前尝试次数。"""
+
+    operation_id: str = field(default_factory=lambda: uuid4().hex)
+    attempts: int = 0
+
+
+def _run_model_attempts(
+    client: Any, request: dict[str, Any], *, evidence: tuple[VerificationItem, ...],
+    goals: tuple[QueryGoal, ...], derived: list[dict[str, Any]], facts: FactEvidenceBundle, run: _ModelRun,
+) -> EvidenceAssessment:
+    """组织模型尝试；请求重试与响应校验各由独立步骤完成。"""
+    for attempt in (1, 2):
+        run.attempts = attempt
+        with observation_context(operation_id=run.operation_id, attempt=attempt, source="model", verifier="evidence_sufficiency"):
+            try:
+                completion = model_completion(client, "evidence_sufficiency", **request)
+            except Exception as error:
+                _record_skipped_response_validation()
+                retry = _can_retry_request(error, attempt)
+                _record_recovery_decision(error, retry=retry)
+                if retry:
+                    continue
+                raise
+            assessment = _parse_model_completion(completion, evidence=evidence, goals=goals, derived=derived)
+            assessment = _bind_fact_support(replace(assessment, diagnostics={"attempts": attempt}), facts)
+            record_observation("evidence_sufficiency_completion", "completion", "accepted",
+                               end_reason="verified_after_retry" if attempt > 1 else "verified")
+            return assessment
+    raise RuntimeError("evidence sufficiency attempts exhausted without a result")
+
+
+def _model_failure_kind(error: Exception) -> str:
+    """将失败归类为预算、传输、契约或配置问题。"""
+    if isinstance(error, QueryBudgetExceeded):
+        return "budget_exhausted"
+    if _retryable_transport(error):
+        return "service_unavailable"
+    if isinstance(error, ValueError):
+        return "contract_rejected"
+    return "configuration_or_request_error"
+
+
+def _record_model_failure(error: Exception, *, run: _ModelRun, kind: str) -> None:
+    """记录整个模型核验的最终失败。"""
+    logger.warning("RAG evidence sufficiency check failed: %s", type(error).__name__)
+    record_observation("evidence_sufficiency_completion", "completion", "failed",
+                       operation_id=run.operation_id, attempts=run.attempts, end_reason=kind, **failure_details(error))
+
+
+def _assess_with_model(
+    question: str, evidence: tuple[VerificationItem, ...], *, goals: tuple[QueryGoal, ...],
+    derived: list[dict[str, Any]], facts: FactEvidenceBundle, client: Any | None,
+) -> EvidenceAssessment:
+    """组织模型核验，并将模型路径的失败转换为现有降级报告。"""
+    run = _ModelRun()
     try:
         resolved_client = client or get_evidence_sufficiency_client()
-        # 调用LLM做JSON判定，返回是否充分、缺失的要求和支持的证据索引。
-        # 这里输入是结构化JSON输入，输出也是结构化JSON，避免模型生成不规范文本。
-        request = dict(
-            model=os.getenv(
-                "RAG_EVIDENCE_SUFFICIENCY_MODEL",
-                DEFAULT_EVIDENCE_SUFFICIENCY_MODEL,
-            ),
-            messages=[
-                {
-                    "role": "system",
-                    "content": EVIDENCE_SUFFICIENCY_SYSTEM_PROMPT + (
-                        '\n必须逐个评估goals，并返回goal_coverage数组，每项为'
-                        '{"goal_id":"目标id","status":"supported|missing|conflict","supporting_chunk_indices":[1]}。'
-                        '只有全部目标均supported且各有证据才能sufficient=true。' if goals else ""
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "question": normalized_question,
-                            "candidate_evidence": evidence,
-                            "goals": [goal.to_dict() for goal in goals],
-                            "derived_evidence": derived,
-                        },
-                        ensure_ascii=False,
-                    ),
-                },
-            ],
-            response_format={"type": "json_object"},
-            temperature=0,
-            max_tokens=1600 if goals or derived else 500,
-            stream=False,
-            timeout=_timeout_seconds(),
-            extra_body={"enable_thinking": False},
-        )
-        for attempts in (1, 2):
-            with observation_context(operation_id=operation_id, attempt=attempts, source="model", verifier="evidence_sufficiency"):
-                try:
-                    completion = model_completion(resolved_client, "evidence_sufficiency", **request)
-                except Exception as error:
-                    for suffix, phase in (("_parse", "parse"), ("_validation", "semantic_validation")):
-                        record_observation("evidence_sufficiency" + suffix, phase, "skipped", end_reason="request_failed")
-                    runtime = current_runtime()
-                    budget_available = runtime is None or (
-                        runtime.remaining() >= min(2.0, _timeout_seconds())
-                        and runtime.counts.get("model", 0) < runtime.max_model_calls
-                    )
-                    retry = attempts == 1 and _retryable_transport(error) and budget_available and _environment_flag(
-                        "RAG_EVIDENCE_SUFFICIENCY_TRANSIENT_RETRY", True,
-                    )
-                    record_observation("evidence_sufficiency_recovery", "recovery", "retry" if retry else "failed",
-                                       end_reason="transient_request_retry" if retry else "verification_unavailable",
-                                       **failure_details(error))
-                    if retry:
-                        continue
-                    raise
-                choices = getattr(completion, "choices", None) or []
-                raw_content = getattr(getattr(choices[0], "message", None), "content", None) if choices else None
-                content = raw_content if isinstance(raw_content, str) else ""
-                decision = observe_contract(
-                    "evidence_sufficiency", content, parse=lambda _: json.loads(_response_content(completion)),
-                    validate=lambda payload: _parse_decision(
-                        json.dumps(payload, ensure_ascii=False), chunk_count=len(evidence),
-                        chunk_ids=chunk_ids, goals=goals, derived_evidence=derived,
-                    ),
-                    finish_reason=getattr(choices[0], "finish_reason", None) if choices else None,
-                )
-                decision = replace(decision, attempts=attempts)
-                record_observation("evidence_sufficiency_completion", "completion", "accepted",
-                                   end_reason="verified_after_retry" if attempts > 1 else "verified")
-                break
-        logger.info(
-            "RAG evidence sufficiency checked: sufficient=%s chunks=%s missing=%s",
-            decision.sufficient,
-            decision.evaluated_chunk_count,
-            len(decision.missing_requirements),
-        )
-        return decision
+        request = _build_model_request(question, evidence, goals, derived)
+        assessment = _run_model_attempts(resolved_client, request, evidence=evidence, goals=goals,
+                                         derived=derived, facts=facts, run=run)
     except Exception as error:
-        logger.warning(
-            "RAG evidence sufficiency check failed: %s",
-            type(error).__name__,
-        )
-        kind = ("budget_exhausted" if isinstance(error, QueryBudgetExceeded) else
-                "service_unavailable" if _retryable_transport(error) else
-                "contract_rejected" if isinstance(error, ValueError) else "configuration_or_request_error")
-        record_observation("evidence_sufficiency_completion", "completion", "failed",
-                           operation_id=operation_id, attempts=attempts, end_reason=kind, **failure_details(error))
-        return _fallback_decision(evidence, error=error, failure_kind=kind, attempts=attempts, derived_evidence=derived)
+        kind = _model_failure_kind(error)
+        _record_model_failure(error, run=run, kind=kind)
+        return replace(_fallback_assessment(evidence, error=error, failure_kind=kind, attempts=run.attempts), facts=facts)
+    logger.info("RAG evidence sufficiency checked: sufficient=%s chunks=%s missing=%s",
+                assessment.sufficient, assessment.evaluated_chunk_count, len(assessment.missing_requirements))
+    return assessment

@@ -1,4 +1,4 @@
-"""Optional image-to-text extraction at ingestion; ordinary chat stays text-only."""
+"""入库时可选将图像转换为事实文本；普通聊天仍使用文本输入。"""
 
 import base64
 from io import BytesIO

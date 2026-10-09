@@ -1,3 +1,6 @@
+from tests.evidence_helpers import make_query
+from service.core.evidence_verification import verify_evidence
+from service.core.evidence_adapter import collection_from_records
 import json
 from types import SimpleNamespace
 
@@ -12,7 +15,7 @@ pytestmark = pytest.mark.unit
 
 
 def verdict(*, sufficient=False, source="model"):
-    return evidence_sufficiency.EvidenceSufficiencyDecision(
+    return evidence_sufficiency.EvidenceAssessment(
         sufficient, "按目标校验", [] if sufficient else ["归母净利润"], [1], source, 1, ["revenue"],
         [{"goal_id": "revenue", "status": "supported", "supporting_chunk_ids": ["revenue"]},
          {"goal_id": "profit", "status": "supported" if sufficient else "missing", "supporting_chunk_ids": []}],
@@ -37,9 +40,9 @@ def test_goal_verifier_rejects_incomplete_or_inconsistent_proof(monkeypatch, fai
         payload["supporting_chunk_indices"] = []
     response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))])
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: response)))
-    decision = evidence_sufficiency.check_evidence_sufficiency("营业收入和归母净利润？",
-        [{"chunk_id": "revenue", "content_with_weight": "营业收入10亿元。"}], client=client,
-        goals=(QueryGoal("revenue", "营业收入"), QueryGoal("profit", "归母净利润")))
+    decision = verify_evidence(make_query("营业收入和归母净利润？", (QueryGoal("revenue", "营业收入"), QueryGoal("profit", "归母净利润"))),
+        collection_from_records([{"chunk_id": "revenue", "content_with_weight": "营业收入10亿元。"}]),
+        client=client)
     assert not decision.sufficient
     assert decision.source == "fallback"
 
@@ -58,15 +61,16 @@ def test_repair_only_queries_missing_goal_and_retains_supported_evidence(monkeyp
     })
     monkeypatch.setattr(retrieval, "expand_table_contexts", lambda chunks, question: chunks)
     checked = []
-    def verify(question, chunks, *, goals):
-        checked.extend(chunk["chunk_id"] for chunk in chunks)
+    def verify(context, chunks):
+        assert context.goals == analysis.goals
+        checked.extend(chunk.id for chunk in chunks)
         return verdict(sufficient=True)
-    monkeypatch.setattr(retrieval, "check_evidence_sufficiency", verify)
+    monkeypatch.setattr(retrieval, "verify_evidence", verify)
     analysis = QueryAnalysis("multi_question", False, 2, True, False, False, "两个目标", "model",
         goals=(QueryGoal("revenue", "营业收入", ("2025年",)), QueryGoal("profit", "归母净利润", ("2025年",))))
-    result, decision = retrieval._repair_missing_goals({"total": 1, "chunks": [first]}, verdict(),
-        question="2025年营业收入和归母净利润？", analysis=analysis,
-        dealer=SimpleNamespace(retrieval=retrieve), index_names="1", options=retrieval.Dealer.RetrievalOptions())
+    result, evidence, decision = retrieval._repair_missing_goals({"total": 1, "chunks": [first]}, collection_from_records([first]), verdict(),
+        dealer=SimpleNamespace(retrieval=retrieve), index_names="1", options=retrieval.Dealer.RetrievalOptions(),
+        context=make_query("2025年营业收入和归母净利润？", analysis.goals))
     assert calls == ["归母净利润 2025年"]
     assert result["chunks"][0]["chunk_id"] == "revenue"
     assert decision.sufficient is new_evidence

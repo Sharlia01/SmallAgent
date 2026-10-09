@@ -1,9 +1,10 @@
-"""Acceptance regressions from baselineV2_v4; model outputs here are fixtures.
+"""基于 baselineV2_v4 的验收回归，模型输出使用测试夹具。
 
-The saved run did not retain rejected model responses. These tests exercise
-valid equivalents and invalid counterexamples through parsing AND execution,
-not claim a replay of the missing provider outputs.
+历史运行未保存被拒绝的模型响应；这些测试通过解析和执行
+覆盖有效等价表达及无效反例，不声称重放缺失的提供方输出。
 """
+
+from service.core.evidence_adapter import reference_records
 
 import json
 from pathlib import Path
@@ -184,7 +185,7 @@ def test_bridge_reference_becomes_slot_and_executes_with_grounded_value():
 
 @pytest.mark.parametrize("wrong", [
     "查找图2中显示2021年归母净利润为负的信息",
-    "查找图3中显示2021年归母净利润为负的信息",  # even a lucky answer cannot be assumed
+    "查找图3中显示2021年归母净利润为负的信息",  # 不能假设模型会碰巧回答正确。
 ])
 def test_unknown_figure_binding_is_rejected_before_retrieval(wrong):
     goals = [dict(FIGURE_GOALS[0], text=wrong), FIGURE_GOALS[1]]
@@ -219,7 +220,7 @@ def test_plan_correction_preserves_mode_and_executes_valid_nodes():
 
 def test_real_retrieval_entry_runs_parallel_plan_without_mocking_preparation(monkeypatch):
     from service.core import query_intent, query_planning, retrieval
-    from service.core.evidence_sufficiency import EvidenceSufficiencyDecision
+    from domain.assessment import EvidenceAssessment
 
     client = ScriptedClient([analysis(DIVIDEND_GOALS), {"subqueries": [
         dict(id=g["id"], query=g["text"], goal_ids=[g["id"]]) for g in DIVIDEND_GOALS
@@ -236,15 +237,15 @@ def test_real_retrieval_entry_runs_parallel_plan_without_mocking_preparation(mon
                  "content_with_weight": query, "rerank_score": 0.9}], "doc_aggs": []}
     monkeypatch.setattr(retrieval, "get_retrieval_dealer", lambda: SimpleNamespace(retrieval=retrieve))
     monkeypatch.setattr(retrieval, "rerank_similarity", lambda q, docs: ([0.9] * len(docs), None))
-    monkeypatch.setattr(retrieval, "check_evidence_sufficiency", lambda q, chunks, **kw:
-        EvidenceSufficiencyDecision(True, "目标证据齐全", [], [1, 2], "model", len(chunks),
-                                     [chunk["chunk_id"] for chunk in chunks]))
-    result = retrieval.retrieve_raw_results("test-index", DIVIDENDS)
-    assert result["retrieval_plan"]["source"] == "model"
-    assert result["parallel_retrieval"]["applied"] is True
+    monkeypatch.setattr(retrieval, "verify_evidence", lambda q, chunks, **kw:
+        EvidenceAssessment(True, "目标证据齐全", [], [1, 2], "model", len(chunks),
+                                     [chunk.id for chunk in chunks]))
+    result = retrieval.retrieve_evidence("test-index", DIVIDENDS)
+    assert result.diagnostics["retrieval_plan"]["source"] == "model"
+    assert result.diagnostics["parallel_retrieval"]["applied"] is True
     assert set(calls) == {g["text"] for g in DIVIDEND_GOALS}
-    assert {c["chunk_id"] for c in result["chunks"]} == set(calls)
-    assert result["query_runtime"]["counts"] == {"model": 2, "retrieval": 2}
+    assert {c["chunk_id"] for c in reference_records(result.evidence)} == set(calls)
+    assert result.diagnostics["query_runtime"]["counts"] == {"model": 2, "retrieval": 2}
 
 
 def test_valid_independent_goals_survive_repeated_plan_format_errors():

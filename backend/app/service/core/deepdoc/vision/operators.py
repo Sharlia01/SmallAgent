@@ -1,4 +1,5 @@
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2024 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,7 +25,7 @@ from PIL import Image
 
 
 class DecodeImage(object):
-    """ decode image """
+    """解码图像。"""
 
     def __init__(self,
                  img_mode='RGB',
@@ -66,12 +67,13 @@ class DecodeImage(object):
 
 
 class StandardizeImage(object):
-    """normalize image
-    Args:
-        mean (list): im - mean
-        std (list): im / std
-        is_scale (bool): whether need im / 255
-        norm_type (str): type in ['mean_std', 'none']
+    """对图像进行归一化。
+
+    参数：
+        mean（list）：各通道需要减去的均值。
+        std（list）：各通道需要除以的标准差。
+        is_scale（bool）：是否先将像素值除以 255。
+        norm_type（str）：归一化类型，可为 mean_std 或 none。
     """
 
     def __init__(self, mean, std, is_scale=True, norm_type='mean_std'):
@@ -81,13 +83,14 @@ class StandardizeImage(object):
         self.norm_type = norm_type
 
     def __call__(self, im, im_info):
-        """
-        Args:
-            im (np.ndarray): image (np.ndarray)
-            im_info (dict): info of image
-        Returns:
-            im (np.ndarray):  processed image (np.ndarray)
-            im_info (dict): info of processed image
+        """处理图像并更新相关信息。
+
+        参数：
+            im（np.ndarray）：图像数组。
+            im_info（dict）：图像信息。
+        返回：
+            im（np.ndarray）：处理后的图像。
+            im_info（dict）：处理后的图像信息。
         """
         im = im.astype(np.float32, copy=False)
         if self.is_scale:
@@ -103,8 +106,7 @@ class StandardizeImage(object):
 
 
 class NormalizeImage(object):
-    """ normalize image such as subtract mean, divide std
-    """
+    """通过减去均值、除以标准差等操作对图像进行归一化。"""
 
     def __init__(self, scale=None, mean=None, std=None, order='chw', **kwargs):
         if isinstance(scale, str):
@@ -130,8 +132,7 @@ class NormalizeImage(object):
 
 
 class ToCHWImage(object):
-    """ convert hwc image to chw image
-    """
+    """将图像维度顺序从 HWC 转换为 CHW。"""
 
     def __init__(self, **kwargs):
         pass
@@ -207,11 +208,12 @@ class Pad(object):
 
 
 class LinearResize(object):
-    """resize image by target_size and max_size
-    Args:
-        target_size (int): the target size of image
-        keep_ratio (bool): whether keep_ratio or not, default true
-        interp (int): method of resize
+    """根据目标尺寸和最长边限制缩放图像。
+
+    参数：
+        target_size（int）：目标图像尺寸。
+        keep_ratio（bool）：是否保留宽高比，默认保留。
+        interp（int）：缩放时使用的插值方法。
     """
 
     def __init__(self, target_size, keep_ratio=True, interp=cv2.INTER_LINEAR):
@@ -222,13 +224,14 @@ class LinearResize(object):
         self.interp = interp
 
     def __call__(self, im, im_info):
-        """
-        Args:
-            im (np.ndarray): image (np.ndarray)
-            im_info (dict): info of image
-        Returns:
-            im (np.ndarray):  processed image (np.ndarray)
-            im_info (dict): info of processed image
+        """处理图像并更新相关信息。
+
+        参数：
+            im（np.ndarray）：图像数组。
+            im_info（dict）：图像信息。
+        返回：
+            im（np.ndarray）：处理后的图像。
+            im_info（dict）：处理后的图像信息。
         """
         assert len(self.target_size) == 2
         assert self.target_size[0] > 0 and self.target_size[1] > 0
@@ -247,12 +250,13 @@ class LinearResize(object):
         return im, im_info
 
     def generate_scale(self, im):
-        """
-        Args:
-            im (np.ndarray): image (np.ndarray)
-        Returns:
-            im_scale_x: the resize ratio of X
-            im_scale_y: the resize ratio of Y
+        """根据目标尺寸计算图像缩放比例。
+
+        参数：
+            im（np.ndarray）：图像数组。
+        返回：
+            im_scale_x：横向缩放比例。
+            im_scale_y：纵向缩放比例。
         """
         origin_shape = im.shape[:2]
         _im_c = im.shape[2]
@@ -361,17 +365,17 @@ class DetResizeForTest(object):
         return img, [ratio_h, ratio_w]
 
     def resize_image_type0(self, img):
-        """
-        resize image to a size multiple of 32 which is required by the network
-        args:
-            img(array): array with shape [h, w, c]
-        return(tuple):
-            img, (ratio_h, ratio_w)
+        """按网络要求，将图像尺寸调整为 32 的整数倍。
+
+        参数：
+            img（array）：形状为 [h, w, c] 的图像数组。
+        返回：
+            调整后的图像，以及高度和宽度的缩放比例。
         """
         limit_side_len = self.limit_side_len
         h, w, c = img.shape
 
-        # limit the max side
+        # 限制图像最长边。
         if self.limit_type == 'max':
             if max(h, w) > limit_side_len:
                 if h > w:
@@ -471,18 +475,20 @@ class E2EResizeForTest(object):
         return im, (ratio_h, ratio_w)
 
     def resize_image(self, im, max_side_len=512):
-        """
-        resize image to a size multiple of max_stride which is required by the network
-        :param im: the resized image
-        :param max_side_len: limit of max image size to avoid out of memory in gpu
-        :return: the resized image and the resize ratio
+        """按网络要求，将图像尺寸调整为最大步长的整数倍。
+
+        参数：
+            im：待调整的图像。
+            max_side_len：图像最长边限制，用于避免 GPU 内存不足。
+        返回：
+            调整后的图像及其缩放比例。
         """
         h, w, _ = im.shape
 
         resize_w = w
         resize_h = h
 
-        # Fix the longer side
+        # 固定图像较长边的长度。
         if resize_h > resize_w:
             ratio = float(max_side_len) / resize_h
         else:
@@ -601,10 +607,10 @@ class ResizeNormalize(object):
 
 
 class GrayImageChannelFormat(object):
-    """
-    format gray scale image's channel: (3,h,w) -> (1,h,w)
-    Args:
-        inverse: inverse gray image
+    """调整灰度图像通道，将 (3, h, w) 转换为 (1, h, w)。
+
+    参数：
+        inverse：是否对灰度图像进行反色。
     """
 
     def __init__(self, inverse=False, **kwargs):
@@ -625,45 +631,49 @@ class GrayImageChannelFormat(object):
 
 
 class Permute(object):
-    """permute image
-    Args:
-        to_bgr (bool): whether convert RGB to BGR
-        channel_first (bool): whether convert HWC to CHW
+    """调整图像的通道和维度顺序。
+
+    参数：
+        to_bgr（bool）：是否将 RGB 转换为 BGR。
+        channel_first（bool）：是否将 HWC 转换为 CHW。
     """
 
     def __init__(self, ):
         super(Permute, self).__init__()
 
     def __call__(self, im, im_info):
-        """
-        Args:
-            im (np.ndarray): image (np.ndarray)
-            im_info (dict): info of image
-        Returns:
-            im (np.ndarray):  processed image (np.ndarray)
-            im_info (dict): info of processed image
+        """处理图像并更新相关信息。
+
+        参数：
+            im（np.ndarray）：图像数组。
+            im_info（dict）：图像信息。
+        返回：
+            im（np.ndarray）：处理后的图像。
+            im_info（dict）：处理后的图像信息。
         """
         im = im.transpose((2, 0, 1)).copy()
         return im, im_info
 
 
 class PadStride(object):
-    """ padding image for model with FPN, instead PadBatch(pad_to_stride) in original config
-    Args:
-        stride (bool): model with FPN need image shape % stride == 0
+    """为特征金字塔网络填充图像，替代原配置中的 PadBatch。
+
+    参数：
+        stride：填充后图像尺寸必须是该步长的整数倍。
     """
 
     def __init__(self, stride=0):
         self.coarsest_stride = stride
 
     def __call__(self, im, im_info):
-        """
-        Args:
-            im (np.ndarray): image (np.ndarray)
-            im_info (dict): info of image
-        Returns:
-            im (np.ndarray):  processed image (np.ndarray)
-            im_info (dict): info of processed image
+        """处理图像并更新相关信息。
+
+        参数：
+            im（np.ndarray）：图像数组。
+            im_info（dict）：图像信息。
+        返回：
+            im（np.ndarray）：处理后的图像。
+            im_info（dict）：处理后的图像信息。
         """
         coarsest_stride = self.coarsest_stride
         if coarsest_stride <= 0:
@@ -677,19 +687,20 @@ class PadStride(object):
 
 
 def decode_image(im_file, im_info):
-    """read rgb image
-    Args:
-        im_file (str|np.ndarray): input can be image path or np.ndarray
-        im_info (dict): info of image
-    Returns:
-        im (np.ndarray):  processed image (np.ndarray)
-        im_info (dict): info of processed image
+    """读取 RGB 图像。
+
+    参数：
+        im_file（str 或 np.ndarray）：图像路径或图像数组。
+        im_info（dict）：图像信息。
+    返回：
+        im（np.ndarray）：处理后的图像。
+        im_info（dict）：处理后的图像信息。
     """
     if isinstance(im_file, str):
         with open(im_file, 'rb') as f:
             im_read = f.read()
         data = np.frombuffer(im_read, dtype='uint8')
-        im = cv2.imdecode(data, 1)  # BGR mode, but need RGB mode
+        im = cv2.imdecode(data, 1)  # 原图使用 BGR 通道顺序，模型需要 RGB 通道顺序。
         im = cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
     else:
         im = im_file
@@ -699,7 +710,7 @@ def decode_image(im_file, im_info):
 
 
 def preprocess(im, preprocess_ops):
-    # process image by preprocess_ops
+    # 依次使用 preprocess_ops 处理图像。
     im_info = {
         'scale_factor': np.array(
             [1., 1.], dtype=np.float32),

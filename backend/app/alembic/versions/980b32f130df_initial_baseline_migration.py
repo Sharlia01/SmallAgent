@@ -1,9 +1,8 @@
-"""Create the initial application schema.
+"""创建应用的初始数据库结构。
 
-Revision ID: 980b32f130df
-Revises: 
-Create Date: 2025-06-19 22:32:28.433643
-
+版本编号：980b32f130df
+前序版本：无
+创建时间：2025-06-19 22:32:28.433643
 """
 from typing import Sequence, Union
 
@@ -12,7 +11,7 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
 
-# revision identifiers, used by Alembic.
+# Alembic 使用的迁移版本标识。
 revision: str = '980b32f130df'
 down_revision: Union[str, None] = None
 branch_labels: Union[str, Sequence[str], None] = None
@@ -20,7 +19,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    """Create every table that predates Alembic management."""
+    """创建纳入 Alembic 管理之前的所有应用表。"""
     op.execute("CREATE EXTENSION IF NOT EXISTS pgcrypto")
 
     op.create_table(
@@ -129,7 +128,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    """Remove the application tables created by this baseline."""
+    """删除此基线迁移创建的应用表。"""
     op.drop_index("idx_knowledgebases_created_at", table_name="knowledgebases")
     op.drop_index("idx_knowledgebases_user_id", table_name="knowledgebases")
     op.drop_table("knowledgebases")

@@ -3,7 +3,7 @@ import { proxy, snapshot, subscribe } from 'valtio'
 import { subscribeKey } from 'valtio/utils'
 
 export type ProxyPersistStorageEngine = {
-  // returns null if file not exists
+  // 存储文件不存在时返回 null。
   getItem: (name: string) => string | null | Promise<string | null>
 
   setItem: (name: string, value: string) => void | Promise<void>
@@ -11,7 +11,7 @@ export type ProxyPersistStorageEngine = {
   getAllKeys: () => string[] | Promise<string[]>
 }
 
-// "multi" only works for object type.
+// multi 存储模式仅适用于对象类型。
 export enum PersistStrategy {
   SingleFile = 'SingleFile',
   MultiFile = 'MultiFile',
@@ -86,20 +86,21 @@ export default function proxyWithPersist<S extends object>(
   ;(async () => {
     const storage = await inputs.getStorage()
 
-    // key is path, value is un-stringified value. stringify happens at time of write
+    // 键为存储路径，值为尚未序列化的对象；实际写入时再进行序列化。
     const pendingWrites: Record<string, any> = {}
 
+    // 按路径合并尚未执行的修改，避免同一属性快速变化时反复写入旧值。
     const bulkWrite = () =>
       Promise.all(
         Object.entries(pendingWrites).map(([filePath, value]) => {
-          // TODO: if removeItem/setItem fails, and pendingWrites doesn't include
-          // filePath, then restore this. if it includes it on error, it means
-          // another write/delete got queued up, and that takes precedence.
+          // 待完善：删除或写入失败时，若 pendingWrites 中已无此路径，
+          // 应恢复该任务；若仍有此路径，则说明错误处理期间已经排入
+          // 更新的写入或删除任务，应优先执行更新的任务。
           delete pendingWrites[filePath]
 
           let write: Write
           if (value === null) {
-            // delete it
+            // 删除对应存储项。
             write = () => {
               return storage.removeItem(filePath)
             }
@@ -145,7 +146,7 @@ export default function proxyWithPersist<S extends object>(
           const persistedString = await storage.getItem(filePath)
 
           if (persistedString === null) {
-            // file does not exist
+            // 存储文件尚不存在。
           } else {
             const persistedValue = JSON.parse(persistedString)
             if (isPersistingMainObject) {
@@ -209,8 +210,8 @@ export default function proxyWithPersist<S extends object>(
 
                 const persistedValue = JSON.parse(persistedString)
 
-                // persistedFilePath has the inputs.name prefix and "-" so get
-                // the dot path that starts after this.
+                // persistedFilePath 包含 inputs.name 和连字符前缀，
+                // 去掉前缀后得到以点分隔的对象属性路径。
                 const targetPath = persistedFilePath.substring(
                   inputs.name.length + '-'.length,
                 )
@@ -232,7 +233,7 @@ export default function proxyWithPersist<S extends object>(
             if (isPersistingMainObject) {
               value = omit(value, '_persist')
             }
-            // figured out which subkeys were added, removed, changed
+            // 确定哪些子属性被新增、删除或修改。
             const keys = new Set(Object.keys(value))
             const prevKeys = new Set(Object.keys(prevValue))
 
@@ -304,7 +305,7 @@ export default function proxyWithPersist<S extends object>(
       }),
     )
 
-    // migration
+    // 迁移已有持久化数据。
     type PersistData = {
       version: number
     }

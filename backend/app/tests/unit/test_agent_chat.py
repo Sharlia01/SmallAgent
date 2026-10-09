@@ -1,3 +1,7 @@
+from service.core.evidence_adapter import reference_records
+from tests.evidence_helpers import make_evidence_record, make_tool_result, make_query
+from service.core.evidence_verification import verify_evidence
+from service.core.evidence_pipeline import build_answer_context
 from types import SimpleNamespace
 
 import pytest
@@ -5,9 +9,9 @@ import pytest
 from agent.orchestrator import (
     AgentExecution,
     AgentRun,
-    tool_results_to_retrieved_content,
+    collect_tool_evidence,
 )
-from agent.schemas import ToolResult, ToolSource
+from agent.schemas import ToolResult
 from service.core import chat
 
 
@@ -47,7 +51,7 @@ def test_chat_builds_two_model_orchestrator_with_rag_and_web_tools(monkeypatch):
 def test_load_conversation_history_is_user_scoped_and_chronological(monkeypatch):
     class FakeResult:
         def fetchall(self):
-            # Database query returns newest turns first.
+            # 数据库按时间倒序返回，最新会话轮次在前。
             return [
                 SimpleNamespace(user_question="后一个问题", model_answer="后一个回答"),
                 SimpleNamespace(user_question="前一个问题", model_answer="前一个回答"),
@@ -116,7 +120,7 @@ def test_load_conversation_history_truncates_oversized_latest_turn(monkeypatch):
 
 @pytest.mark.unit
 def test_tool_results_are_deduplicated_and_adapted_for_existing_chat():
-    source = ToolSource(
+    source = make_evidence_record(
         source_type="knowledge_base",
         source_id="chunk-1",
         title="制度.pdf",
@@ -130,13 +134,13 @@ def test_tool_results_are_deduplicated_and_adapted_for_existing_chat():
         },
     )
     results = [
-        ToolResult(
+        make_tool_result(
             tool_name="search_knowledge_base",
             query="差旅",
             content="证据",
             sources=[source],
         ),
-        ToolResult(
+        make_tool_result(
             tool_name="search_knowledge_base",
             query="差旅审批",
             content="重复证据",
@@ -144,7 +148,7 @@ def test_tool_results_are_deduplicated_and_adapted_for_existing_chat():
         ),
     ]
 
-    references = tool_results_to_retrieved_content(results)
+    references = reference_records(collect_tool_evidence(results))
 
     assert references == [
         {
@@ -173,7 +177,7 @@ def test_tool_results_are_deduplicated_and_adapted_for_existing_chat():
 @pytest.mark.unit
 def test_web_tool_result_becomes_one_cited_web_document():
     web_sources = [
-        ToolSource(
+        make_evidence_record(
             source_type="web",
             source_id="web-1",
             title="最新政策",
@@ -181,7 +185,7 @@ def test_web_tool_result_becomes_one_cited_web_document():
             url="https://example.com/policy",
             metadata={"site_name": "政府网站", "index": 1},
         ),
-        ToolSource(
+        make_evidence_record(
             source_type="web",
             source_id="web-2",
             title="政策解读",
@@ -190,7 +194,7 @@ def test_web_tool_result_becomes_one_cited_web_document():
             metadata={"site_name": "权威媒体", "index": 2},
         ),
     ]
-    result = ToolResult(
+    result = make_tool_result(
         tool_name="search_web",
         query="最新政策",
         content="实时摘要与来源链接",
@@ -198,7 +202,7 @@ def test_web_tool_result_becomes_one_cited_web_document():
         metadata={"document_id": "web-search-1"},
     )
 
-    references = tool_results_to_retrieved_content([result, result])
+    references = reference_records(collect_tool_evidence([result, result]))
 
     assert len(references) == 1
     assert references[0]["document_id"] == "web-search-1"
@@ -213,7 +217,7 @@ def test_web_tool_result_becomes_one_cited_web_document():
 
 @pytest.mark.unit
 def test_chat_uses_agent_evidence_in_stream_and_persistence(monkeypatch):
-    source = ToolSource(
+    source = make_evidence_record(
         source_type="knowledge_base",
         source_id="chunk-1",
         title="制度.pdf",
@@ -222,7 +226,7 @@ def test_chat_uses_agent_evidence_in_stream_and_persistence(monkeypatch):
     )
     agent_run = AgentRun(
         tool_results=[
-            ToolResult(
+            make_tool_result(
                 tool_name="search_knowledge_base",
                 query="差旅",
                 content="证据",
@@ -268,18 +272,23 @@ def test_chat_uses_agent_evidence_in_stream_and_persistence(monkeypatch):
             ]
         ),
     ]
-    references = tool_results_to_retrieved_content(agent_run.tool_results)
+    references = reference_records(collect_tool_evidence(agent_run.tool_results))
+    evidence = collect_tool_evidence(agent_run.tool_results)
+    query = make_query("差旅如何审批？")
+    assessment = verify_evidence(query, evidence, require_semantic=False)
     execution = AgentExecution(
-        planning=agent_run,
-        retrieved_content=references,
-        response_documents=references,
+        agent_run=agent_run, evidence=evidence, assessment=assessment,
+        context=build_answer_context(query, evidence, assessment),
         answer_messages=[{"role": "user", "content": "answer prompt"}],
         answer_stream=answer_stream,
     )
 
     class FakeOrchestrator:
-        def run(self, **kwargs):
-            saved["orchestrator_args"] = kwargs
+        def run(self, *, session_id, question, session_context, conversation_history):
+            saved["orchestrator_args"] = {
+                "session_id": session_id, "question": question,
+                "session_context": session_context, "conversation_history": conversation_history,
+            }
             return execution
 
     monkeypatch.setattr(
@@ -327,14 +336,11 @@ def test_chat_uses_agent_evidence_in_stream_and_persistence(monkeypatch):
 def test_chat_streams_and_persists_direct_refusal(monkeypatch):
     saved = {}
     execution = AgentExecution(
-        planning=AgentRun(steps=1, stop_reason="completed"),
-        retrieved_content=[],
-        response_documents=[],
+        agent_run=AgentRun(steps=1, stop_reason="completed"),
         answer_messages=[],
         answer_stream=None,
         direct_answer="当前资料不足以可靠回答这个问题。",
         response_mode="refuse",
-        evidence_sufficiency={"sufficient": False, "source": "model"},
     )
 
     class FakeOrchestrator:

@@ -1,7 +1,7 @@
-"""Domain models for auditable tables and their searchable child chunks.
+"""可审计表格及其可搜索子片段的领域模型。
 
-The complete table is the source of truth.  Searchable chunks deliberately keep
-only a row (or a small row range) so large tables do not dilute retrieval.
+完整表格是事实来源；检索片段只保留单行或少量行，
+避免大表中的无关信息稀释检索效果。
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ TABLE_PARSER_VERSION = "table-object-v5"
 
 @dataclass(frozen=True)
 class TableObject:
-    """A complete, reconstructable table produced by a parser."""
+    """解析器生成的完整、可重建表格。"""
 
     table_id: str
     parser_html: str
@@ -35,7 +35,7 @@ class TableObject:
 
 @dataclass(frozen=True)
 class TableChunk:
-    """A searchable child of a :class:`TableObject`."""
+    """TableObject 的可搜索子片段。"""
 
     table_id: str
     row_start: int
@@ -46,7 +46,7 @@ class TableChunk:
     chunk_kind: str = "row"
 
     def to_record(self) -> dict[str, Any]:
-        """Map the domain names to fields that follow the ES suffix mapping."""
+        """将领域字段名映射为符合 Elasticsearch 后缀规范的字段。"""
         return {
             "table_id_kwd": self.table_id,
             "table_chunk_kind_kwd": self.chunk_kind,
@@ -66,7 +66,7 @@ def make_table_id(
     parser_html: str,
     cells_json: dict[str, Any] | None = None,
 ) -> str:
-    """Return a content-addressed ID stable for an unchanged parsed table."""
+    """返回按内容寻址的编号；表格内容不变时编号保持稳定。"""
     identity = {
         "schema_version": TABLE_OBJECT_SCHEMA_VERSION,
         "document_name": document_name,
@@ -103,7 +103,7 @@ def _row_markdown(caption: str, context: str, headers: list[str], cells: list[st
 
 
 def build_table_markdown(cells_json: dict[str, Any]) -> str:
-    """Deterministically render Markdown from normalized cells, never from HTML."""
+    """根据规范化单元格确定性生成 Markdown，不从 HTML 反推。"""
     caption = str(cells_json.get("caption") or "")
     data_rows = cells_json.get("data_rows") or []
     parts = [f"### {caption}"] if caption else []
@@ -131,8 +131,8 @@ def build_table_markdown(cells_json: dict[str, Any]) -> str:
             parts.append("| " + " | ".join(_markdown_cell(value) for value in cells) + " |")
         return "\n".join(parts)
 
-    # An unbound table remains readable without promoting its first row to a
-    # semantic header.  Row labels are structural only.
+    # 未绑定的表格仍可展示，但不能将首行提升为语义表头；
+    # 此时行标签只表示结构位置。
     parts.append("> 表格结构未可靠绑定；以下内容保留原始行列顺序。")
     raw_grid = cells_json.get("raw_grid") or []
     for index, row in enumerate(raw_grid, start=1):
@@ -145,7 +145,7 @@ def build_table_markdown(cells_json: dict[str, Any]) -> str:
 
 
 def build_semantic_summary(cells_json: dict[str, Any]) -> str:
-    """Build a factual table-level summary without an LLM."""
+    """不调用语言模型，生成基于事实的表级摘要。"""
     caption = str(cells_json.get("caption") or "未命名表格")
     data_rows = cells_json.get("data_rows") or []
     headers: list[str] = []
@@ -168,7 +168,7 @@ def build_semantic_summary(cells_json: dict[str, Any]) -> str:
 
 
 def build_table_chunks(table: TableObject) -> list[TableChunk]:
-    """Create self-contained row chunks from one complete table object."""
+    """从完整表格对象生成上下文独立的行片段。"""
     cells_json = table.cells_json
     caption = str(cells_json.get("caption") or "")
     chunks: list[TableChunk] = []

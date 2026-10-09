@@ -1,7 +1,7 @@
-"""Request-local budgets, observations and bounded execution for query work.
+"""查询处理使用的请求级预算、观测记录和有界执行。
 
-No user data is cached across requests. Context is explicitly copied to workers;
-deadlines prevent new work and bound network calls, not arbitrary local CPU work.
+用户数据不跨请求缓存，线程任务显式继承当前上下文。
+期限限制新任务和网络调用，不能强制中断任意本地计算。
 """
 
 from __future__ import annotations
@@ -60,6 +60,7 @@ class QueryRuntime:
         return max(0.0, self.timeout_seconds - (time.monotonic() - self.started))
 
     def reserve(self, kind: str) -> None:
+        # 并发分支共用请求预算，检查剩余额度与扣减计数必须在同一临界区完成。
         with self._lock:
             limit = self.max_model_calls if kind == "model" else self.max_retrievals
             if self.remaining() <= 0 or self.counts.get(kind, 0) >= limit:
@@ -99,7 +100,7 @@ def current_runtime() -> QueryRuntime | None:
 
 @contextmanager
 def observation_context(**fields: Any):
-    """Correlate attempts/nodes without passing diagnostic kwargs to providers."""
+    """关联执行尝试与节点，不向提供方传入诊断专用参数。"""
     token = _observation.set({**_observation.get(), **fields})
     try:
         yield
@@ -115,7 +116,7 @@ def record_observation(stage: str, phase: str, status: str, **fields: Any) -> No
 
 def failure_details(error: Exception, *, default_rule: str = "unexpected_error",
                     default_field: str | None = None) -> dict[str, Any]:
-    """Bound exception text; never serialize provider request/response objects."""
+    """限制异常文本长度，不序列化提供方的请求或响应对象。"""
     field_name = getattr(error, "field", None) or default_field
     detail = str(error)
     fields = {
@@ -129,7 +130,7 @@ def failure_details(error: Exception, *, default_rule: str = "unexpected_error",
             fields[name] = getattr(error, name)
     context = getattr(error, "context", None)
     if context:
-        # Keep provider objects and unbounded payloads out of diagnostics.
+        # 诊断信息不包含提供方对象或大小不受限的数据。
         fields["validation_context"] = {
             str(key): value if isinstance(value, (bool, int, float)) else str(value)[:1000]
             for key, value in context.items()
@@ -175,7 +176,7 @@ def record_execution_node(node_id: str, status: str, *, error: Exception | None 
 
 @contextmanager
 def observe_plan_execution(mode: str, node_ids: list[str], *, source: str):
-    """One execution attempt; an empty successful retrieval is not a failure."""
+    """记录一次执行尝试；检索成功但没有结果不属于运行失败。"""
     observation = PlanObservation(mode, node_ids)
     token = _plan_observation.set(observation)
     started = time.monotonic()
@@ -233,8 +234,8 @@ def bounded_query(function):
                                    end_reason="budget_exhausted" if isinstance(error, QueryBudgetExceeded) else "unhandled_error",
                                    duration_ms=round((time.monotonic() - started) * 1000, 3),
                                    **failure_details(error))
-                # The caller/evaluator still receives the original exception type.
-                # Preserve the trace before the request-local context is reset.
+                # 调用方或评测器仍接收原始异常类型；
+                # 重置请求上下文之前，先保存执行轨迹。
                 error.query_runtime = runtime.snapshot()
                 raise
             if isinstance(result, dict):
@@ -244,14 +245,17 @@ def bounded_query(function):
                 evidence = result.get("chunks")
             else:
                 response_mode = getattr(result, "response_mode", None)
-                if getattr(result, "stop_reason", None) == "clarification_required":
+                if getattr(result, "clarification", None) or getattr(result, "stop_reason", None) == "clarification_required":
                     response_mode = "clarify"
                 budget_exhausted = getattr(result, "budget_exhausted", False)
-                sufficiency = getattr(result, "evidence_sufficiency", None) or {}
-                evidence = getattr(result, "retrieved_content", None)
+                assessment = getattr(result, "assessment", None)
+                raw = getattr(result, "raw_retrieval", None) or {}
+                sufficiency = assessment.to_dict() if assessment else raw.get("evidence_sufficiency") or {}
+                # 诊断读取业务对象，不触发前端序列化，也不依赖已经移除的工具来源结构。
+                evidence = getattr(result, "evidence", None)
                 if evidence is None:
-                    evidence = any(
-                        getattr(tool_result, "sources", None)
+                    evidence = raw.get("chunks") or any(
+                        getattr(tool_result, "evidence", None)
                         for tool_result in getattr(result, "tool_results", ())
                     )
             reason = ("clarification_required" if response_mode == "clarify" else
@@ -265,12 +269,16 @@ def bounded_query(function):
                 result["query_runtime"] = runtime.snapshot()
             elif hasattr(result, "query_runtime"):
                 result.query_runtime = runtime.snapshot()
+            elif hasattr(result, "diagnostics"):
+                result.diagnostics["query_runtime"] = runtime.snapshot()
+            elif hasattr(result, "raw_retrieval"):
+                result.raw_retrieval["query_runtime"] = runtime.snapshot()
             return result
     return wrapped
 
 
 def serialized_local_inference(function):
-    """Avoid concurrent model cold starts and GPU memory multiplication."""
+    """避免模型并发冷启动和重复占用 GPU 内存。"""
     @wraps(function)
     def wrapped(*args, **kwargs):
         runtime = current_runtime()
@@ -299,8 +307,8 @@ def model_completion(client: Any, stage: str, **kwargs: Any) -> Any:
         if runtime is not None:
             runtime.reserve("model")
             kwargs["timeout"] = min(float(kwargs.get("timeout", 20)), runtime.remaining())
-        # with_options is supported by the configured SDK. Fake clients only
-        # need chat.completions.create; no network retry may outrun the budget.
+        # 已配置的 SDK 支持 with_options；测试客户端只需实现
+        # chat.completions.create。网络重试也必须受请求预算约束。
         if runtime is not None and callable(getattr(client, "with_options", None)):
             client = client.with_options(max_retries=0)
         sent = True
@@ -329,7 +337,7 @@ def model_completion(client: Any, stage: str, **kwargs: Any) -> Any:
 
 def observe_contract(stage: str, content: str, *, parse: Callable[[str], Any],
                      validate: Callable[[Any], Any], finish_reason: str | None = None) -> Any:
-    """Separate decoding/schema construction from semantic acceptance."""
+    """将解码及结构构建与语义接受判断分开。"""
     from service.core.query_validation import QueryValidationError
     started = time.monotonic()
     try:
@@ -362,10 +370,10 @@ def observe_contract(stage: str, content: str, *, parse: Callable[[str], Any],
 
 def validated_completion(client: Any, stage: str, *, parse: Callable[[str], Any],
                          validate: Callable[[Any], Any], **kwargs: Any) -> Any:
-    """One semantic repair attempt, charged to the same request budget.
+    """最多进行一次语义修复，并计入同一请求预算。
 
-    Transport errors are not retried. Provider success and contract acceptance
-    are separate observations; a failed second validation propagates normally.
+    传输错误不在此重试。提供方调用成功与契约校验通过分别记录；
+    第二次校验仍失败时，按正常异常路径传播。
     """
     from service.core.query_validation import QueryValidationError
     messages = list(kwargs.pop("messages"))
@@ -430,7 +438,7 @@ def _executor_slots() -> BoundedSemaphore:
 
 
 def run_independent(tasks: dict[str, Callable[[], Any]]) -> dict[str, Any | Exception]:
-    """Execute bounded waves, retaining completed siblings after an error."""
+    """分轮执行有界并发任务，发生错误时保留已完成的同级任务结果。"""
     concurrency = int(positive_setting("RAG_QUERY_CONCURRENCY", 3, maximum=8))
     results: dict[str, Any | Exception] = {}
     items = list(tasks.items())

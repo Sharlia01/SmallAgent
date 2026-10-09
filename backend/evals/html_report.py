@@ -1,4 +1,4 @@
-"""Readable, self-contained E2E reports; also render saved runs without model calls."""
+"""生成可独立阅读的端到端报告，也可直接渲染历史运行结果而无需调用模型。"""
 
 from __future__ import annotations
 
@@ -66,7 +66,7 @@ def _issues(result: dict[str, Any]) -> list[str]:
 
 
 def render_html_report(results: list[dict[str, Any]], summary: dict[str, Any]) -> str:
-    """Escape all model/dataset text and omit raw retrieval records and thinking."""
+    """转义模型和数据集文本，省略原始检索记录和推理内容。"""
     cards = []
     attention_count = 0
     for position, result in enumerate(results, 1):

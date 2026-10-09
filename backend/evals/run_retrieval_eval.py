@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the production retriever against a versioned JSONL evaluation set."""
+"""使用生产检索器运行带版本的 JSONL 评测集。"""
 
 from __future__ import annotations
 
@@ -13,14 +13,14 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 BACKEND_DIRECTORY = SCRIPT_DIRECTORY.parent
 APP_DIRECTORY = BACKEND_DIRECTORY / "app"
 if not (APP_DIRECTORY / "service").is_dir():
-    # Support both repository backend/app and container /app layouts.
+    # 同时兼容仓库 backend/app 和容器 /app 两种目录结构。
     APP_DIRECTORY = BACKEND_DIRECTORY
 DEFAULT_DATASET = SCRIPT_DIRECTORY / "data" / "power_reports_eval_v2_dev.jsonl"
 DEFAULT_OUTPUT_DIRECTORY = SCRIPT_DIRECTORY / "results"
@@ -39,6 +39,7 @@ from service.core.evidence_sufficiency import (  # noqa: E402
     DEFAULT_EVIDENCE_SUFFICIENCY_MODEL,
 )
 from service.core.rag.nlp.model import RERANKER_MODEL  # noqa: E402
+from service.core.retrieval_result import RetrievalResult, retrieval_record  # noqa: E402
 from service.core.sequential_retrieval import (  # noqa: E402
     DEFAULT_BRIDGE_EXTRACTION_MODEL,
 )
@@ -227,7 +228,7 @@ def expand_index_names(values: list[str]) -> list[str]:
 
 
 def validate_v2_annotations(sample: dict[str, Any], line_number: int) -> None:
-    """Validate the richer annotations used by the v2 evaluation set."""
+    """校验第二版评测集的扩展标注。"""
     if not str(sample.get("schema_version") or "").startswith("2."):
         return
 
@@ -526,14 +527,14 @@ def write_results(
     )
 
 
-def load_retrieval_function():
-    """Load service dependencies only for an actual retrieval run."""
+def load_retrieval_function() -> Callable[..., RetrievalResult]:
+    """实际执行检索时才加载服务依赖。"""
     from dotenv import load_dotenv
 
     load_dotenv(BACKEND_DIRECTORY / ".env")
-    from service.core.retrieval import retrieve_raw_results
+    from service.core.retrieval import retrieve_evidence
 
-    return retrieve_raw_results
+    return retrieve_evidence
 
 
 def main() -> int:
@@ -588,7 +589,7 @@ def main() -> int:
         return 0
 
     index_names = expand_index_names(args.index_name or [])
-    retrieve_raw_results = load_retrieval_function()
+    retrieve_evidence = load_retrieval_function()
 
     output_directory = args.output_dir.resolve()
     result_path = output_directory / f"{args.run_name}.jsonl"
@@ -613,7 +614,7 @@ def main() -> int:
     for position, sample in enumerate(samples, start=1):
         query_started = time.perf_counter()
         try:
-            raw_result = retrieve_raw_results(
+            retrieved = retrieve_evidence(
                 retrieval_index_argument,
                 str(sample["question"]),
                 page_size=args.top_k,
@@ -626,6 +627,7 @@ def main() -> int:
                 final_rrf_k=args.final_rrf_k,
             )
             latency_ms = (time.perf_counter() - query_started) * 1000
+            raw_result = retrieval_record(retrieved)
             result = evaluate_retrieval_case(
                 sample,
                 raw_result,

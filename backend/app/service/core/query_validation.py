@@ -1,8 +1,8 @@
-"""Source-scoped validation shared by analysis, planning and execution.
+"""分析、规划和执行共用的来源范围校验。
 
-Source spans prove provenance; they are not mandatory literal query strings.
-These guards handle explicit bindings only. They never infer an answer to an
-unresolved relation from the order of entities in a user's question.
+原文范围用于证明来源，不要求检索词逐字照抄。
+这些规则只校验明确绑定，不能根据用户提及实体的顺序
+推断尚未确认的关系答案。
 """
 
 from __future__ import annotations
@@ -54,8 +54,8 @@ def required_constraint_terms(values: Iterable[str], *, dependent: bool = False)
         if re.search(r"(?:19|20)\d{2}E(?![A-Za-z0-9])", value, re.I):
             terms.append("预测")
         terms.extend(concepts)
-        # Unrecognized names/labels remain hard constraints. Do not silently
-        # erase a company merely because the domain recognizer lacks its name.
+        # 未识别的名称和标签仍属于硬约束，
+        # 不能因为领域识别器不认识某公司就静默删除它。
         if value and not anchors and not concepts and not re.search(
             r"谁|哪|什么|多少|如何|是否|是不是|能否|怎么|贵不贵|掉了|上涨|下降", value,
         ):
@@ -69,8 +69,8 @@ def missing_constraints(terms: Iterable[str], query: str) -> list[str]:
 
 
 def source_clauses(question: str) -> list[str]:
-    # A conjunction introducing its own dated subject starts a local scope.
-    # Do not split “收入和利润” or a candidate set such as “图2和图3”.
+    # 连接词引入自己的带日期主体时，开始新的局部范围。
+    # “收入和利润”或“图2和图3”等候选集合不在此拆分。
     clauses = []
     for sentence in re.split(r"[，,；;。！？?：:]", question):
         start = 0
@@ -95,12 +95,12 @@ def shared_scope_terms(question: str) -> list[str]:
     dates = list(dict.fromkeys(m.group().strip() for m in YEAR_OR_DATE_PATTERN.finditer(question)))
     if len(dates) == 1:
         shared.extend(dates)
-    # A relative period embedded in one of several dates is local, not global.
+    # 多个日期中的相对期间属于局部分句，不能扩展为全局约束。
     relatives = list(dict.fromkeys(m.group() for m in RELATIVE_TIME_PATTERN.finditer(question)))
     if len(dates) <= 1 and len(relatives) == 1:
         shared.extend(relatives)
-    # Only leading exclusions are unambiguously global. Other exclusions are
-    # checked against their source clause and the goal that owns it.
+    # 仅问题开头的排除条件能明确视为全局约束；
+    # 其他排除条件按原始分句及其所属目标校验。
     leading = source_clauses(question)[0] if question else ""
     if re.match(r"^(?:请)?(?:不含|不包括|不考虑)", leading):
         shared.extend(m.group() for m in NEGATION_PATTERN.finditer(leading))
@@ -120,11 +120,11 @@ def _subject_years(text: str) -> list[tuple[str, str]]:
     from service.core.query_expansion import _extract_organizations, ENTITY_LEADING_CONTEXT_PATTERN
     pairs = []
     for clause in source_clauses(text):
-        # Table labels and narrative verbs are not entity identifiers.
+        # 表格标签和叙述动词不是实体标识。
         subjects = _extract_organizations(clause)
         if not subjects:
-            # A source-local leading name also covers companies without a
-            # registered organization suffix. Exclude document/field labels.
+            # 来源分句开头的名称也可用于识别没有常见组织后缀的公司，
+            # 但应排除文档标签和字段标签。
             prefix = ENTITY_LEADING_CONTEXT_PATTERN.sub("", clause)
             match = re.match(r"([\u4e00-\u9fff·]{2,12}?)(?:的|在)?\s*((?:19|20)\d{2})", prefix)
             if match and not _topics(match[1]) and not re.search(r"表|图|财务|预测|报告|截至|季度|半年|年度|同比|环比", match[1]):
@@ -143,13 +143,13 @@ def validate_relation_bindings(question: str, candidates: Iterable[str]) -> None
     for subject, year in _subject_years(question):
         subjects.setdefault(subject, set()).add(year)
     if len(subjects) == 1:
-        # A shared subject may be omitted in the second dated clause. The
-        # metric-local check below still prevents exchanging the two dates.
+        # 第二个带日期分句可省略共享主体；
+        # 下方按指标进行的局部检查仍会防止两个日期被交换。
         next(iter(subjects.values())).update(_years(question))
     clauses = source_clauses(question)
     for candidate in candidates:
-        # Include single-sentence plans containing several bindings: preserving
-        # all locator tokens elsewhere must not disguise a fabricated pairing.
+        # 包含多个绑定的单句计划也需要校验；
+        # 在其他位置保留全部定位词，不能掩盖虚构的对应关系。
         for clause in source_clauses(candidate):
             selected = {canonical_text(m.group()) for m in LOCATOR_PATTERN.finditer(clause)}
             if unknown_locator and selected and selected < locators and _topics(clause):
@@ -161,10 +161,10 @@ def validate_relation_bindings(question: str, candidates: Iterable[str]) -> None
         for topic in candidate_topics:
             sources = [clause for clause in clauses if topic in _topics(clause)]
             if len(sources) != 1:
-                continue  # repeated metrics need explicit goal source spans
+                continue  # 重复指标必须有明确的目标原文范围。
             source = sources[0]
-            # A goal can own several clauses; only compare its clause for this
-            # topic, never unrelated dates or entities from another goal.
+            # 一个目标可能覆盖多个分句；只比较当前主题所属的分句，
+            # 不能拿其他目标的无关日期或实体参与匹配。
             parts = [c for c in source_clauses(candidate) if topic in _topics(c)]
             for part in parts:
                 if _years(source) and _years(part) and not _years(part) <= _years(source):

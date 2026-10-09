@@ -1,4 +1,4 @@
-"""Pure helpers for evaluating ranked RAG retrieval results."""
+"""评估检索增强排名结果的纯辅助函数。"""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def resolve_metric_ks(
     top_k: int,
     metric_ks: Iterable[int] | None = None,
 ) -> tuple[int, ...]:
-    """Return requested cutoffs, defaulting to the actual retrieval Top K."""
+    """返回指定评测截断位置，默认使用实际检索结果数量。"""
     if not isinstance(top_k, int) or isinstance(top_k, bool) or top_k <= 0:
         raise ValueError("top_k must be a positive integer")
 
@@ -48,19 +48,19 @@ def resolve_metric_ks(
 
 
 def normalize_text(text: Any) -> str:
-    """Normalize OCR and layout differences before comparing evidence text."""
+    """比较证据文本前，先消除 OCR 和排版差异。"""
     normalized = unicodedata.normalize("NFKC", str(text or "")).casefold()
     return "".join(character for character in normalized if character.isalnum())
 
 
 def normalize_document_name(name: Any) -> str:
-    """Normalize a document path to the filename stored in the gold set."""
+    """将文档路径规范化为标准答案集合中保存的文件名。"""
     normalized = unicodedata.normalize("NFKC", str(name or ""))
     return os.path.basename(normalized.replace("\\", "/")).casefold()
 
 
-# Keep this map deliberately narrow: only equivalent financial labels belong
-# here. Broad synonyms could incorrectly merge distinct metrics such as PE/PB.
+# 此映射仅包含等价财务标签；过宽的同义词会
+# 错误合并市盈率与市净率等不同指标。
 _TABLE_FIELD_ALIASES = {
     "pe": {"pe", "市盈率", "市盈率pe"},
     "pb": {"pb", "市净率", "市净率pb"},
@@ -107,7 +107,7 @@ _CURRENCY_MULTIPLIERS = {
 
 
 def _normalize_decimal(value: Decimal) -> str:
-    """Render equal decimal values identically without scientific notation."""
+    """将等值十进制数统一表示，避免使用科学计数法。"""
     if value == 0:
         return "0"
     rendered = format(value.normalize(), "f")
@@ -115,14 +115,14 @@ def _normalize_decimal(value: Decimal) -> str:
 
 
 def _table_field_alias(value: str) -> str | None:
-    """Return the canonical id of an equivalent financial field label."""
+    """返回等价财务字段标签的规范编号。"""
     key = normalize_text(value)
     canonical = _TABLE_ALIAS_LOOKUP.get(key)
     if canonical:
         return canonical
 
-    # Preserve forecast/actual period suffixes in compound headers, e.g.
-    # ``P/E 25E`` and ``市盈率（PE）25E``.
+    # 复合表头中保留实际与预测期间后缀，
+    # 例如 P/E 25E 和“市盈率（PE）25E”。
     period_match = re.fullmatch(r"(.+?)((?:19|20)?\d{2}[ae])", key)
     if period_match:
         canonical = _TABLE_ALIAS_LOOKUP.get(period_match.group(1))
@@ -132,7 +132,7 @@ def _table_field_alias(value: str) -> str | None:
 
 
 def _match_table_number(value: Any) -> tuple[Decimal, str | None] | None:
-    """Parse a standalone number and its optional display unit."""
+    """解析独立数值及可选的显示单位。"""
     normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
     normalized = re.sub(r"\s+", "", normalized).replace(",", "")
     if (
@@ -153,7 +153,7 @@ def _match_table_number(value: Any) -> tuple[Decimal, str | None] | None:
 
 
 def _parse_table_number(value: Any) -> tuple[Decimal, str | None] | None:
-    """Parse a table quantity and convert explicit currency scales."""
+    """解析表格数值，并转换已明确声明的货币数量级。"""
     matched = _match_table_number(value)
     if not matched:
         return None
@@ -168,7 +168,7 @@ def _parse_table_number(value: Any) -> tuple[Decimal, str | None] | None:
 
 
 def normalize_table_cell(value: Any) -> str:
-    """Normalize table cells, including equivalent financial field labels."""
+    """规范化表格单元格，包含等价财务字段标签。"""
     normalized = unicodedata.normalize(
         "NFKC",
         str(value or ""),
@@ -203,7 +203,7 @@ def normalize_table_cell(value: Any) -> str:
 
 
 def _table_cells_equivalent(expected: Any, actual: Any) -> bool:
-    """Compare cells with controlled alias and unit-aware numeric handling."""
+    """通过受控别名和考虑单位的数值规则比较单元格。"""
     if normalize_table_cell(expected) == normalize_table_cell(actual):
         return True
 
@@ -217,9 +217,9 @@ def _table_cells_equivalent(expected: Any, actual: Any) -> bool:
     if expected_dimension == actual_dimension:
         return expected_value == actual_value
 
-    # Gold rows often omit a unit declared by the table header while parsed
-    # cells repeat it (for example 0.40 versus 0.40元). Only one implicit-unit
-    # side is relaxed; two explicit incompatible dimensions never match.
+    # 标准答案可能省略表头已声明的单位，解析单元格却重复单位，
+    # 如 0.40 与 0.40元。只允许一侧使用隐含单位；
+    # 两侧明确但不兼容的计量维度不能匹配。
     if expected_dimension is None or actual_dimension is None:
         expected_raw = _match_table_number(expected)
         actual_raw = _match_table_number(actual)
@@ -242,7 +242,7 @@ def _table_cell_sequences_equal(
 
 
 class _TableHTMLParser(HTMLParser):
-    """Extract captions and rows from the simple HTML tables stored in chunks."""
+    """从片段中的简单 HTML 表格提取题注和行。"""
 
     def __init__(self):
         super().__init__(convert_charrefs=True)
@@ -307,12 +307,11 @@ def parse_html_tables(content: Any) -> list[dict[str, Any]]:
     return parser.tables
 
 def evidence_text_match_score(reference: Any, candidate: Any) -> float:
-    """Return how much of a gold evidence string is present in a chunk.
+    """计算片段对标准证据文本的覆盖程度。
 
-    Exact normalized containment receives 1.0. The character trigram fallback
-    tolerates small OCR differences while remaining asymmetric: a candidate
-    must cover most of the gold evidence, rather than merely sharing a short
-    phrase with it.
+    规范化后完全包含时记为 1.0；字符三元组回退允许少量 OCR 差异。
+    覆盖判断具有方向性：候选须包含大部分标准证据，
+    仅共享一小段词语不能视为覆盖。
     """
     reference_text = normalize_text(reference)
     candidate_text = normalize_text(candidate)
@@ -349,7 +348,7 @@ def evidence_chunk_match_score(
     evidence: dict[str, Any],
     chunk: dict[str, Any],
 ) -> float:
-    """Score a chunk against evidence after enforcing document identity."""
+    """确认文档身份一致后，计算片段对标准证据的得分。"""
     evidence_document = normalize_document_name(evidence.get("document_name"))
     chunk_document = normalize_document_name(_chunk_document_name(chunk))
     if not evidence_document or evidence_document != chunk_document:
@@ -391,8 +390,8 @@ def table_row_chunk_match_score(evidence, chunk):
         if cells_match(structured_cells):
             return 1.0
 
-        # Query-time parent expansion can expose reliable neighboring rows to
-        # the answering LLM even when the atomic hit is a different row.
+        # 查询时扩展父表可为回答模型提供可靠邻近行，
+        # 即使最初命中的单行片段不是目标行。
         context = chunk.get("table_context_obj") or {}
         if context.get("reliable") is True and any(
             cells_match(row.get("cells"))
@@ -401,8 +400,8 @@ def table_row_chunk_match_score(evidence, chunk):
         ):
             return 1.0
 
-        # Structured cells are the source of truth for newly parsed rows.  Do
-        # not let duplicated prose or HTML override an explicit cell mismatch.
+        # 新解析表格以结构化单元格为准；
+        # 重复正文或 HTML 不能覆盖明确的单元格不匹配。
         return 0.0
 
     expected_text = evidence.get("text")
@@ -410,9 +409,8 @@ def table_row_chunk_match_score(evidence, chunk):
     content = _chunk_content(chunk)
     tables = parse_html_tables(content)
 
-    # Some PDF tables are stored as flattened plain text instead of HTML.
-    # Without row tags, use normalized evidence coverage as a fallback while
-    # retaining the document identity check above.
+    # 部分 PDF 表格只保存为展开后的纯文本，缺少 HTML 行标签。
+    # 此时用规范化证据覆盖作为回退，同时继续检查文档身份。
     if not tables:
         if not expected_text:
             return 0.0
@@ -455,16 +453,15 @@ def figure_chunk_match_score(
     evidence: dict[str, Any],
     chunk: dict[str, Any],
 ) -> float:
-    """Match a retrieved figure by its caption/locator in the same document."""
+    """按同一文档中的题注或定位信息匹配检索图表。"""
     evidence_document = normalize_document_name(evidence.get("document_name"))
     chunk_document = normalize_document_name(_chunk_document_name(chunk))
     if not evidence_document or evidence_document != chunk_document:
         return 0.0
 
-    # Figure gold text often describes a visual fact that OCR cannot recover.
-    # The locator identifies the figure that must be retrieved, so use it as
-    # the primary retrieval-relevance reference and retain text as a fallback
-    # for older datasets without a locator.
+    # 图表标准答案常描述 OCR 无法恢复的视觉事实。
+    # 优先用定位信息判断应召回哪张图；
+    # 旧数据集缺少定位信息时，再用文本作为回退。
     reference = evidence.get("locator") or evidence.get("text")
     return evidence_text_match_score(reference, _chunk_content(chunk))
 
@@ -495,7 +492,7 @@ def evaluate_evidence_requirement(
     chunks: list[dict[str, Any]],
     match_threshold: float,
 ) -> dict[str, Any]:
-    """Evaluate OR alternatives whose evidence atoms may match different chunks."""
+    """评估可选证据组合，允许各证据单元分别匹配不同片段。"""
     successful_alternatives = []
     best_coverage = 0.0
 
@@ -635,7 +632,7 @@ def _stage_latency_snapshot(raw_result: dict[str, Any]) -> dict[str, float | Non
 
 
 def _json_safe(value: Any) -> Any:
-    """Recursively convert NumPy-like values without importing NumPy."""
+    """递归转换类似 NumPy 的数值，不需要直接导入 NumPy。"""
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, dict):
@@ -655,7 +652,7 @@ def serialize_retrieved_chunk(
     chunk: dict[str, Any],
     rank: int,
 ) -> dict[str, Any]:
-    """Keep ranking diagnostics while omitting the large embedding vector."""
+    """保留排名诊断信息，省略体积较大的向量字段。"""
     return {
         "rank": rank,
         **evidence_metadata(chunk),
@@ -758,7 +755,7 @@ def _chunk_fingerprint(chunk: dict[str, Any], rank: int) -> tuple[str, ...]:
 
 
 def _exact_duplicate_rate(chunks: list[dict[str, Any]]) -> float | None:
-    """Return exact normalized duplicate share; empty result sets are unknown."""
+    """计算规范化后的精确重复比例；结果集为空时视为未知。"""
     if not chunks:
         return None
     fingerprints = {
@@ -775,7 +772,7 @@ def _evaluate_chunks(
     top_k: int,
     match_threshold: float,
 ) -> dict[str, Any]:
-    """Score either retrieval stage using exactly the same evidence rules."""
+    """使用完全相同的证据规则评估不同检索阶段。"""
     evidence_requirements = sample.get("evidence_requirements") or []
 
     # 先确定“标准答案”长什么样子，然后再去看检索结果里有没有匹配的。
@@ -958,7 +955,7 @@ def _with_gate_attribution(
     answerable: bool | None = None,
     pre_gate_evidence_sufficient: bool | None = None,
 ) -> dict[str, Any]:
-    """Attribute a rejection to upstream retrieval or the gate itself."""
+    """将拒绝原因归于上游检索或门控本身。"""
     attributed = dict(gate)
     evidence_sufficient = (
         pre_gate_evidence_sufficient
@@ -990,7 +987,7 @@ def _gate_metrics(
     answerable: bool | None = None,
     pre_gate_evidence_sufficient: bool | None = None,
 ) -> dict[str, Any]:
-    """Use the recorded decision, never empty chunks, to identify rejection."""
+    """根据已记录的判定识别拒绝原因，不能仅依据片段列表为空推断。"""
     source = decision.get("source")
     sufficient = decision.get("sufficient")
     disabled = decision.get("enabled") is False or source == "disabled"
@@ -1020,7 +1017,7 @@ def evaluate_retrieval_case(
     match_threshold: float,
     metric_ks: Iterable[int] | None = None,
 ) -> dict[str, Any]:
-    """Evaluate retrieval, gate decisions and delivered evidence separately."""
+    """分别评估检索结果、门控决策和最终交付证据。"""
     resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
     raw_chunks = list(raw_result.get("chunks") or [])[:top_k]
     serialized_chunks = [
@@ -1034,7 +1031,7 @@ def evaluate_retrieval_case(
         metric_ks=resolved_metric_ks,
         match_threshold=match_threshold,
     )
-    # Missing historical snapshots are unknown, not an empty retrieval.
+    # 缺少历史快照时视为未知，不能当成检索结果为空。
     before_chunks = raw_result.get("chunks_before_sufficiency")
     before = None
     serialized_before = None
@@ -1156,7 +1153,7 @@ def build_error_case(
     top_k: int,
     metric_ks: Iterable[int] | None = None,
 ) -> dict[str, Any]:
-    """Record one failed query without losing the rest of the evaluation run."""
+    """记录单条查询失败，同时保留本轮评测的其他结果。"""
     resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
     return {
         "result_schema_version": RESULT_SCHEMA_VERSION,
@@ -1216,7 +1213,7 @@ def _sample_ids(
     results: Iterable[dict[str, Any]],
     predicate,
 ) -> list[str]:
-    """Return stable, unique IDs for samples matching ``predicate``."""
+    """返回满足 predicate 条件的稳定、去重样本编号。"""
     sample_ids = []
     seen = set()
     for result in results:
@@ -1233,7 +1230,7 @@ def _result_gate_metrics(
     *,
     top_k: int,
 ) -> dict[str, Any]:
-    """Read a gate decision and derive evidence-based attribution if possible."""
+    """读取门控判定，并在证据允许时推导拒绝原因归属。"""
     stored = result.get("gate_metrics")
     if isinstance(stored, dict) and (
         isinstance(stored.get("rejected"), bool)
@@ -1269,7 +1266,7 @@ def _stage_non_perfect_sample_ids(
     before_sufficiency: bool,
     metric_ks: Iterable[int] | None = None,
 ) -> dict[str, list[str]]:
-    """Map directional stage metrics to samples that miss their ideal value."""
+    """将未达到理想值的阶段指标映射到对应样本。"""
     resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
     empty_key = "empty_before_sufficiency" if before_sufficiency else "empty"
 
@@ -1277,7 +1274,7 @@ def _stage_non_perfect_sample_ids(
         if before_sufficiency:
             metrics = result.get("retrieval_metrics")
         else:
-            # Keep historical 2.1 rows readable without emitting the alias in 2.2.
+            # 继续兼容历史 2.1 版本记录，但 2.2 输出不再生成旧别名。
             metrics = result.get("post_gate_metrics") or result.get("metrics")
         return metrics if isinstance(metrics, dict) else None
 
@@ -1325,7 +1322,7 @@ def _gate_non_perfect_sample_ids(
     *,
     top_k: int,
 ) -> dict[str, list[str]]:
-    """Return samples behind gate metrics whose ideal direction is defined."""
+    """返回具有明确理想方向的门控指标所对应的样本。"""
     successful = [result for result in results if not result.get("error")]
     decisions = [
         (result, _result_gate_metrics(result, top_k=top_k))
@@ -1402,7 +1399,7 @@ def _percentile(values: Iterable[float], quantile: float) -> float | None:
 def _aggregate_stage_latencies(
     results: list[dict[str, Any]],
 ) -> dict[str, dict[str, float | int | None]]:
-    """Aggregate independently available, non-overlapping stage timings."""
+    """聚合各自可用且不重叠的阶段耗时。"""
     successful = [result for result in results if not result.get("error")]
     aggregated = {}
     for stage in RETRIEVAL_LATENCY_STAGES:
@@ -1599,10 +1596,10 @@ def _aggregate_gate_metrics(
 
 
 def aggregate_query_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
-    """Operational measurements with explicit denominators; no inferred costs.
+    """使用明确分母计算运行指标，不推测调用费用。
 
-    Route agreement is a diagnostic against annotations, not answer quality.
-    Unknown token usage is not interpreted as zero tokens.
+    路由一致性仅用于与标注结果对照，不代表回答质量。
+    未知词元使用量不能视为零。
     """
     retrievals = [item.get("retrieval") or {} for item in results]
     runtimes = [r["query_runtime"] for r in retrievals if r.get("query_runtime")]
@@ -1665,10 +1662,10 @@ def aggregate_retrieval_stages(
     top_k: int,
     metric_ks: Iterable[int] | None = None,
 ) -> dict[str, Any]:
-    """Share retrieval/gate summaries across retrieval and E2E result rows.
+    """在检索评测与端到端记录之间共享检索和门控汇总。
 
-    This reads stored per-query scores, without depending on the runner's
-    latency format or recomputing retrieval. Missing stage data stays unavailable.
+    读取已经保存的单查询得分，不依赖执行器的延迟格式，也不重新检索。
+    缺失的阶段数据仍标记为不可用。
     """
     resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
     aggregated = {
@@ -1715,7 +1712,7 @@ def aggregate_results(
     top_k: int,
     metric_ks: Iterable[int] | None = None,
 ) -> dict[str, Any]:
-    """Aggregate run statistics and the three explicit metric stages."""
+    """聚合运行统计及三个独立指标阶段的结果。"""
     successful = [result for result in results if not result.get("error")]
     answerable = [result for result in successful if result.get("answerable")]
     unanswerable = [
@@ -1751,7 +1748,7 @@ def build_summary(
     top_k: int,
     metric_ks: Iterable[int] | None = None,
 ) -> dict[str, Any]:
-    """Build overall and per-slice summaries for a completed run."""
+    """为已完成评测生成整体汇总和分组汇总。"""
     resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
     by_question_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_source_modality: dict[str, list[dict[str, Any]]] = defaultdict(list)

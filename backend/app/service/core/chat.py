@@ -26,7 +26,7 @@ SESSION_NAME_MAX_LENGTH = 30
 
 
 def _positive_int_env(name: str, default: int, maximum: int) -> int:
-    """Read a bounded positive integer without breaking startup on bad config."""
+    """读取有上下界的正整数配置，配置错误时避免影响服务启动。"""
     try:
         value = int(os.getenv(name, str(default)))
     except (TypeError, ValueError):
@@ -63,7 +63,7 @@ def get_quick_parse_content(session_id: str) -> str:
 
 
 def _truncate_history_text(content: str, limit: int) -> str:
-    """Keep both ends of an oversized message within an exact char limit."""
+    """在精确字符上限内保留超长消息的头部和尾部。"""
     if len(content) <= limit:
         return content
     marker = "\n...(历史消息已截断)...\n"
@@ -81,7 +81,7 @@ def _fit_history_turn(
     answer: str,
     budget: int,
 ) -> tuple[str, str]:
-    """Fit one user/assistant pair while preserving space for both sides."""
+    """按预算裁剪一轮问答，并为用户和助手双方保留空间。"""
     if not question:
         return "", _truncate_history_text(answer, budget)
     if not answer:
@@ -108,7 +108,7 @@ def load_conversation_history(
     session_id: str,
     user_id: int,
 ) -> list[dict[str, str]]:
-    """Load recent turns owned by the user and apply a total char budget."""
+    """读取当前用户的最近会话轮次，并限制总字符数。"""
     db = None
     try:
         db = next(get_db())
@@ -144,8 +144,8 @@ def load_conversation_history(
                 remaining_chars -= turn_length
                 continue
 
-            # The newest turn is still useful even when it alone exceeds the
-            # budget. Older turns are dropped once the budget is exhausted.
+            # 即使最新一轮本身超出预算，也优先保留其上下文；
+            # 预算耗尽后丢弃更早的会话轮次。
             if not selected_turns and remaining_chars > 0:
                 selected_turns.append(
                     _fit_history_turn(
@@ -164,7 +164,7 @@ def load_conversation_history(
                 history.append({"role": "assistant", "content": model_answer})
         return history
     except Exception as error:
-        # History improves continuity but must not make a fresh question fail.
+        # 历史消息用于保持连贯性，其读取失败不能导致本轮新问题失败。
         logger.exception("读取多轮对话历史失败，继续按单轮处理: %s", error)
         return []
     finally:
@@ -271,7 +271,7 @@ def generate_recommended_questions(user_question, retrieved_content=None, sessio
         return []
 
 def generate_session_name(user_question: str) -> str:
-    """Build a session title locally from the first question."""
+    """根据首个问题在本地生成会话标题。"""
     normalized_question = " ".join(str(user_question or "").split())
     if not normalized_question:
         return DEFAULT_SESSION_NAME
@@ -368,7 +368,7 @@ def update_session_name(session_id: str, question: str, user_id: int):
         db.close()
 
 def _create_agent_orchestrator(user_id: int) -> AgentOrchestrator:
-    """Create one request-scoped two-model Agent orchestration pipeline."""
+    """为当前请求创建由规划和回答两个模型组成的 Agent 管线。"""
     client = OpenAI(
         api_key=os.getenv("DASHSCOPE_API_KEY"),
         base_url=os.getenv("DASHSCOPE_BASE_URL"),
@@ -409,7 +409,6 @@ def _generate_recommended_questions_safely(question, retrieved_content, session_
 def get_chat_completion(
     session_id,
     question,
-    retrieved_content=None,
     user_id: int | None = None,
     include_recommended_questions: bool = True,
 ):
@@ -422,7 +421,6 @@ def get_chat_completion(
 
     :param session_id: 当前会话 ID
     :param question: 用户提出的问题
-    :param retrieved_content: 兼容旧调用的预检索文档；None 时由 Agent 决定是否检索
     :param user_id: 当前用户 ID
     :param include_recommended_questions: 是否在正文后同步生成推荐问题
     :return: 逐个产生 SSE 格式字符串的生成器
@@ -444,7 +442,6 @@ def get_chat_completion(
             question=question,
             session_context=quick_parse_content,
             conversation_history=conversation_history,
-            retrieved_content=retrieved_content,
         )
         retrieved_content = execution.retrieved_content
         all_documents = execution.response_documents

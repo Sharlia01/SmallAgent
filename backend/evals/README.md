@@ -98,7 +98,7 @@ python evals/run_retrieval_eval.py \
 v2 校验还会检查证据 ID 唯一性、claim 到 evidence 的引用关系、期望行为、检索模式，
 并要求不可回答题显式标注 `expected_evidence_sufficient=false`。
 
-检索层现已通过 `retrieve_raw_results()` 保留完整结果，包括 `chunk_id`、各召回分支的原始排名与分数、RRF 分数和最终语义重排分数。当前评测集尚未把标准证据映射到 ES 中的稳定 `chunk_id`，因此评测脚本先校验文档名，再对返回片段和 `relevant_evidence[].text` 做规范化文本匹配。完成第一轮基线并确认切块稳定后，可以把标准 chunk ID 补入证据对象，进一步减少模糊匹配。
+评测脚本通过统一入口 `retrieve_evidence()` 获取 `RetrievalResult`，在评测输出处使用 `retrieval_record()` 生成 JSON。结果保留 `chunk_id`、各召回分支的原始排名与分数、RRF 分数、最终语义重排分数、候选总数及查询诊断。当前评测集尚未把标准证据映射到 ES 中的稳定 `chunk_id`，因此评测脚本先校验文档名，再对返回片段和 `relevant_evidence[].text` 做规范化文本匹配。完成第一轮基线并确认切块稳定后，可以把标准 chunk ID 补入证据对象，进一步减少模糊匹配。
 
 检索入口使用不可变用户需求、语义目标、确定性路由、计划校验和有界执行。支持 `single`、`parallel`、`sequential`、`graph`、`clarify`；独立节点可并发，混合图最多 8 个节点。结果保留上下文绑定、局部约束、每步证据来源、预算与缺口补查诊断。改写与扩展开关相互独立，完整无变换基线应同时关闭 `QUERY_REWRITE_ENABLED` 和 `QUERY_EXPANSION_ENABLED`。完整流程、降级行为和当前边界见 [查询管线设计](../docs/query_pipeline.md)。
 

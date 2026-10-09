@@ -1,4 +1,5 @@
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2025 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -49,7 +50,7 @@ class TableStructureRecognizer(Recognizer):
     def __call__(self, images, thr=0.2):
         tbls = super().__call__(images, thr)
         res = []
-        # align left&right for rows, align top&bottom for columns
+        # 行区域统一左右边界，列区域统一上下边界。
         for tbl in tbls:
             lts = [{"label": b["type"],
                     "score": b["score"],
@@ -165,7 +166,7 @@ class TableStructureRecognizer(Recognizer):
             lst_r = rows[-1]
             if lst_r[-1].get("R", "") != b.get("R", "") \
                     or (b["top"] >= btm - 3 and lst_r[-1].get("R", "-1") != b.get("R", "-2")
-                        ):  # new row
+                        ):  # 创建新行。
                 btm = b["bottom"]
                 b["rn"] += 1
                 rows.append([b])
@@ -188,7 +189,7 @@ class TableStructureRecognizer(Recognizer):
             lst_c = cols[-1]
             if (int(b.get("C", "1")) - int(lst_c[-1].get("C", "1")) == 1 and b["page_number"] == lst_c[-1][
                 "page_number"]) \
-                    or (b["x0"] >= right and lst_c[-1].get("C", "-1") != b.get("C", "-2")):  # new col
+                    or (b["x0"] >= right and lst_c[-1].get("C", "-1") != b.get("C", "-2")):  # 创建新列。
                 right = b["x1"]
                 b["cn"] += 1
                 cols.append([b])
@@ -201,7 +202,7 @@ class TableStructureRecognizer(Recognizer):
             tbl[b["rn"]][b["cn"]].append(b)
 
         if len(rows) >= 4:
-            # remove single in column
+            # 移除列中孤立的单元格。
             j = 0
             while j < len(tbl[0]):
                 e, ii = 0, 0
@@ -223,7 +224,7 @@ class TableStructureRecognizer(Recognizer):
                     continue
                 bx = tbl[ii][j][0]
                 logging.debug("Relocate column single: " + bx["text"])
-                # j column only has one value
+                # 第 j 列只有一个有效值。
                 left, right = 100000, 100000
                 if j > 0 and not f:
                     for i in range(len(tbl)):
@@ -264,7 +265,7 @@ class TableStructureRecognizer(Recognizer):
             len(cols), len(tbl[0]))
 
         if len(cols) >= 4:
-            # remove single in row
+            # 移除行中孤立的单元格。
             i = 0
             while i < len(tbl):
                 e, jj = 0, 0
@@ -287,7 +288,7 @@ class TableStructureRecognizer(Recognizer):
 
                 bx = tbl[i][jj][0]
                 logging.debug("Relocate row single: " + bx["text"])
-                # i row only has one value
+                # 第 i 行只有一个有效值。
                 up, down = 100000, 100000
                 if i > 0 and not f:
                     for j in range(len(tbl[i - 1])):
@@ -323,7 +324,7 @@ class TableStructureRecognizer(Recognizer):
                     tbl.pop(i)
                 rows.pop(i)
 
-        # which rows are headers
+        # 确定哪些行属于表头。
         hdset = set([])
         for i in range(len(tbl)):
             cnt, h = 0, 0
@@ -352,7 +353,7 @@ class TableStructureRecognizer(Recognizer):
 
     @staticmethod
     def __html_table(cap, hdset, tbl):
-        # constrcut HTML
+        # 构建表格的 HTML 表示。
         html = "<table>"
         if cap:
             html += f"<caption>{cap}</caption>"
@@ -398,7 +399,7 @@ class TableStructureRecognizer(Recognizer):
 
     @staticmethod
     def __desc_table(cap, hdr_rowno, tbl, is_english):
-        # get text of every colomn in header row to become header text
+        # 收集表头行中各列的文本，生成表头内容。
         clmno = len(tbl[0])
         rowno = len(tbl)
         headers = {}
@@ -502,7 +503,7 @@ class TableStructureRecognizer(Recognizer):
 
     @staticmethod
     def __cal_spans(boxes, rows, cols, tbl, html=True):
-        # caculate span
+        # 计算单元格跨行、跨列范围。
         clft = [np.mean([c.get("C_left", c["x0"]) for c in cln])
                 for cln in cols]
         crgt = [np.mean([c.get("C_right", c["x1"]) for c in cln])
@@ -516,7 +517,7 @@ class TableStructureRecognizer(Recognizer):
                 continue
             b["colspan"] = [b["cn"]]
             b["rowspan"] = [b["rn"]]
-            # col span
+            # 计算跨列数量。
             for j in range(0, len(clft)):
                 if j == b["cn"]:
                     continue
@@ -525,7 +526,7 @@ class TableStructureRecognizer(Recognizer):
                 if crgt[j] - (crgt[j] - clft[j]) / 2 > b["H_right"]:
                     continue
                 b["colspan"].append(j)
-            # row span
+            # 计算跨行数量。
             for j in range(0, len(rtop)):
                 if j == b["rn"]:
                     continue
@@ -540,7 +541,7 @@ class TableStructureRecognizer(Recognizer):
                 return ""
             return "".join([t["text"] for t in arr])
 
-        # rm the spaning cells
+        # 移除已被跨行或跨列单元格覆盖的位置。
         for i in range(len(tbl)):
             for j, arr in enumerate(tbl[i]):
                 if not arr:

@@ -1,4 +1,5 @@
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2024 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -79,7 +80,7 @@ encoder = tiktoken.get_encoding("cl100k_base")
 
 
 def num_tokens_from_string(string: str) -> int:
-    """Returns the number of tokens in a text string."""
+    """计算文本字符串的词元数量。"""
     try:
         return len(encoder.encode(string))
     except Exception:
@@ -87,5 +88,5 @@ def num_tokens_from_string(string: str) -> int:
 
 
 def truncate(string: str, max_len: int) -> str:
-    """Returns truncated text if the length of text exceed max_len."""
+    """文本长度超过 max_len 时，返回截断后的文本。"""
     return encoder.decode(encoder.encode(string)[:max_len])

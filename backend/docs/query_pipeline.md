@@ -41,8 +41,16 @@ Agent 的 `query` 只作为工具调用的检索提议和诊断信息；KB 管�
 | `query_planning.py` | 路由与执行计划分离；校验节点、目标、模板、槽位、依赖和约束 |
 | `query_execution.py` | 拓扑分层执行混合依赖图，保留成功分支和桥接失败前证据 |
 | `query_runtime.py` | 请求级预算、进程级线程池与队列、模型调用记录、上下文传递 |
+| `query_context.py` | 本轮显式共享的请求、指代消解和完整查询目标，不从工具诊断恢复业务状态 |
 | `retrieval.py` | 集成执行、统一排序、目标补查与最终门控；保留门控前快照 |
-| `derived_evidence.py` | 从已绑定表格生成带单元格出处的确定性计算证据 |
+| `domain/evidence.py` | 只读原始证据、来源与定位、检索轨迹、证据集合和回答引用映射 |
+| `domain/facts.py` / `domain/assessment.py` | 财务事实契约、目标要求和绑定来源快照的核验报告 |
+| `evidence_adapter.py` | 索引和解析器记录进入领域对象，以及领域对象输出为前端 JSON 的边界 |
+| `retrieval_result.py` | 明确分开检索证据、候选证据、核验报告、澄清和运行诊断 |
+| `evidence_pipeline.py` | 聊天与评测共用的最终核验、回答上下文、提示词格式化和引用输出 |
+| `financial_facts.py` | 事实抽取、归属核验、逐目标匹配和事实正文投影 |
+| `financial_fact_models.py` | 有界的复杂正文候选提取与独立关系核验 |
+| `derived_evidence.py` | 从已核验财务事实或旧表格生成带输入出处的确定性计算证据 |
 | `sequential_retrieval.py` | 从原文提取桥接值及来源；评级要绑定具体公司，冲突时放弃绑定 |
 | `agent_evaluation.py` | 无数据库写入的真实 Agent → KB 工具 → 回答评测适配器 |
 
@@ -68,11 +76,54 @@ Agent 的 `query` 只作为工具调用的检索提议和诊断信息；KB 管�
 - 需要继承文档范围时，必须取得明确的同一文档 ID；缺失或冲突时阻断，不扩大范围。
 - 模型必须逐目标报告 `supported`、`missing` 或 `conflict`，并给出有效来源索引。目标缺失、重复 ID、越界索引、总判定和目标判定矛盾均视为校验失败。
 - 缺少独立目标时最多补查一轮。保留已支持证据，合并新候选后重新检查完整问题；没有新证据立即停止。依赖子图的自动重规划尚未实现，不能把未取得的桥接值当作已知事实补查。
-- 校验器故障默认拒答，不把故障误判为缺少某项事实并无限重试。`RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN=true` 或关闭门控会改变这一保证。
+- 校验器故障默认拒答，不把故障误判为缺少某项事实并无限重试。`RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN=true` 或关闭语义门控会改变这一保证；公司财务数值仍须通过事实门控。
 - 超时、连接错误、HTTP 408/5xx 最多重试一次，仍受原请求期限与模型调用预算约束；格式或语义错误不按网络故障重试。失败保留 `verification_status=unavailable`、`failure_kind`、`failure`、`attempts`，回答文案区分“未完成核验”和“资料不足”。
-- 计算结果无需在文档中原样出现。白名单计算当前覆盖同一期间的每股派息率，以及显式两期同一指标的差值、增幅/降幅；使用 `Decimal`，不执行模型表达式。输入必须来自可靠绑定的表头和单元格，检查文档范围、时间、单位、冲突及分母。派息率可以使用同一表内、未标出不同单位的两项每股指标作为共同计量基础，并记录 `unit_basis`；不跨文档猜币种或做未经支持的换算。
-- `derived_evidence` 保存输入单元格、公式操作、结果和来源 chunk；门控使用时返回 `derived_evidence_ids`。不支持或输入不足的自动计算记录 `unresolved`，不自动拒答；计算成功也不替代其他事实、关系及目标的充分性检查。
+- 计算结果无需在文档中原样出现。白名单计算当前覆盖同一期间的每股派息率、显式两期同一指标的差值和增幅/降幅，以及绑定各公司操作数的同期间跨公司差值；使用 `Decimal`，不执行模型表达式。输入检查实体、时间、单位、冲突及分母。派息率可以使用同一表内、未标出不同单位的两项每股指标作为共同计量基础，并记录 `unit_basis`；不跨文档猜币种或做未经支持的换算。
+- `derived_evidence` 保存输入、公式操作、结果和来源 chunk；门控使用时返回 `derived_evidence_ids`，财务计算另外记录 `input_fact_ids`。不支持或输入不足的自动计算记录 `unresolved`；公司财务计算不能放行缺少可比核验输入的目标。其他目标仍由语义门控判断。计算成功也不替代其他事实、关系及目标的充分性检查。
 - Agent 合并多次 KB 调用或其他工具结果时，再检查整个证据集合；会话临时文档也参与这一检查。充分性失败时不调用回答模型。最终判定会传给评测结果。
+
+## 证据结构与应用边界
+
+业务流程使用明确的领域类型。证据核验始终传递 `EvidenceCollection`；来源 JSON 只在索引及外部检索入口适配，模型请求和 API 输出在各自出口序列化。目标覆盖、事实出处和计算结果中的字典是报告数据，不是原始证据的中间表示。
+
+```mermaid
+flowchart LR
+    I[索引记录 / 网页提供方] --> E[Evidence 原始证据]
+    E --> C[EvidenceCollection 合并与轨迹]
+    Q[QueryContext 请求与目标] --> V[verify_evidence 完整核验]
+    C --> V
+    V --> A[EvidenceAssessment 独立报告]
+    A --> S[按目标选择事实]
+    C --> S
+    S --> X[AnswerContext 正文与引用映射]
+    X --> M[回答模型提示]
+    X --> D[前端引用 JSON]
+```
+
+- `Evidence` 保存稳定标识、原文、`EvidenceSource`、`EvidenceLocation` 和 `EvidenceStructure`。原文和嵌套来源结构只读，来源适配时复制，后续修改原始字典不会改变证据。来源适配器一次性解析为 `EvidenceTable`、`EvidenceTableRow`、`EvidenceFigure` 和 `EvidenceAttribution`，财务规则及派生计算直接读取这些类型；原始行和列映射用于证明切片来自原表。解析器附加字段只为模型及 API 输出保留。`financial_facts`、`answer_context` 等本次查询的判定不写回原始证据。
+- `EvidenceCollection` 内部按 ID 索引并维持顺序；排序分数和不同查询的命中记录放在 `RetrievalTrace`，不改变证据身份。相同 ID、相同来源只保留一份原文并合并轨迹；相同 ID 对应不同原文、来源或定位时保留首份来源并记录身份冲突，最终核验拒绝使用该集合。
+- `EvidenceAssessment` 是检索、工具和回答阶段共用的唯一核验报告，直接保存 `sufficient`、`reason`、`missing_requirements`、目标覆盖和结构化 `facts`，不再嵌套另一个判定对象。支持事实 ID 和计算结果从 `facts` 取得，只保留一份权威数据；重试次数、故障详情放入报告的 `diagnostics`。报告绑定完整查询、证据集合、规则版本和实际核验模式，只有范围及模式一致且报告自身未变化时才复用。新增会话文档、合并新证据、目标或规则变化都会重新核验；跳过语义检查的报告不能用于要求语义检查的路径。候选来源的核验顺序在结果组装和工具合并时保留，重复命中只新增轨迹时可以复用。已绑定报告不能直接改绑到新范围。报告保存独立快照，抽取阶段的状态变更不会修改已完成报告。
+- `evidence_verification.py` 的 `verify_evidence` 是完整核验入口，只接收当前 `QueryContext` 和 `EvidenceCollection`，目标统一从上下文读取。它组织身份冲突检查、报告复用、一次财务事实核验和充分性评估，最后绑定报告范围。`evidence_sufficiency.py` 的 `assess_evidence_sufficiency` 只消费现成事实报告，返回尚未绑定范围的结果，不再次抽取、不创建查询上下文，也不依赖完整核验模块。`evidence_assessment.py` 的 `finalize_assessment` 只绑定范围及模式，不隐式执行业务核验。
+- 模型输入通过 `VerificationItem` 引用原始 `Evidence`，筛选和裁剪正文不会重建来源。只有发送请求时生成 JSON；输入序号按实际发送顺序生成，计算操作数通过稳定来源 ID 映射到模型序号。财务模型上下文只包含已选择事实，原始混合公司表格留在引用审计数据中。
+- `AnswerContext` 只保存筛选后的正文、使用的事实 ID 和一份连续引用映射。格式化提示词和生成前端引用都消费这份结果，不再分别筛选或重新抽取事实。不适用来源不会占用最终引用编号，原文仍可通过引用查看；核验不通过或报告失效时禁止构建回答上下文。
+
+`ToolResult` 表达一次工具执行，显式包含 `evidence`、`candidates`、`assessment`、`clarification` 和 `diagnostics`。`content` 是供检索决策器观察的工具摘要，最终回答从 `AnswerContext` 取得支持正文。`AgentRun` 记录工具执行循环；`AgentExecution` 持有最终证据集合、核验报告、回答上下文和流。这三个类型的职责不同，保留各自边界。旧 `ToolSource`、`_PreparedEvidence` 和工具结果转字典列表的中间转换已经移除。
+
+`QueryContext` 由当前请求创建，通过服务端工具调用显式共享，保留 `QueryGoal` 的 `source_spans`、`constraint_provenance` 和 `candidate_locators`。工具中的搜索词不替换用户问题，`diagnostics` 不能重建或覆盖当前请求。`retrieve_evidence` 是统一检索入口，返回 `RetrievalResult`；聊天、知识库单轮评测、Agent 评测和纯检索评测都直接消费该类型。结果显式保存候选总数及检索时的类型化请求、查询分析，`retrieval_record` 只在评测及 API 输出边界生成 JSON，并保留排名分数和运行诊断。结果中的查询信息用于输出快照，不能替换当前调用方持有的 `QueryContext`。结果组装只验证已有报告范围，不补核验或补绑定。显式注入的外部检索器和历史记录通过 `adapt_retrieval_records` 进入相同类型；JSON 中的判定没有可信核验范围，适配器将完整来源交给 `verify_evidence` 重新核验，不自行执行财务判断。补查保留检索排序所需的原始记录，新候选在入口适配后以完整集合重新核验。各回答入口共用 `evidence_pipeline.py` 构建回答上下文及引用，该模块不执行核验；会话临时文档在合并阶段加入一次。
+
+## 财务事实归属与回答上下文
+
+`financial_facts.py` 为公司财务数值目标编译 `FactRequirement`，并从可信表格和明确正文关系生成独立的 `FinancialFact`。归属核验、事实有效性与目标适用性分开记录。事实保存原始数值、十进制规范值、单位、币种、实际/预测、合并/母公司、业务范围及原文位置；缺失口径保持 `unknown`。模型或工具传入的 `verified` 标记不能充当核验结果。
+
+表格扩展保留每行自己的归属、完整来源行和原始列映射。公司行、公司列根据这一行的结构重新核验；无公司名称的指标表须有正文中的明确报告主体和财务报表章节依据。主体证明可来自明确标签，或报告开头公司名称与已登记证券代码一致的标题。文件名不能单独确认数值归属。新增标题证明使用 `entity-attribution-v2`，旧资料需要重新解析才能获得该证明；已有明确标签和公司行仍可核验。视觉模型重建但没有独立结构证明的表格保持未知。明确的简单正文和严格有序的“分别”关系使用规则核验；复杂关系默认保持未知。
+
+`RAG_FINANCIAL_FACT_MODEL_ENABLED=true` 时，复杂正文缺少事实支持才使用模型提取候选，再以独立调用核验关系。候选须通过原文位置、公司登记、指标、期间、数值和单位校验；明确规则关系优先于模型的相反配对。核验结果只保存在当前请求的服务端缓存中，并绑定原文摘要及实体表版本，不能通过工具元数据重放。两次调用使用现有期限和调用预算，失败后保持未知。该路径默认关闭，启用后仍需用真实语料校准模型核验准确率。
+
+核验报告通过 `facts` 保存财务事实和计算结果，通过目标覆盖记录逐目标事实引用。`financial_fact_bundle`、`supporting_fact_ids` 等兼容字段只在 JSON 输出时生成，正常业务流程不再序列化后重新解析。历史报告内容可以由 `evidence_adapter.py` 解码，但解码结果不能直接充当当前请求的有效报告。未匹配事实标为 `not_applicable`，不会单独导致其他目标拒答；归属不足保留未知，口径明确且可比时才确认值冲突，未知口径或近似披露造成的不同值记录为信息不足。计算消费核验事实，使用 `Decimal` 并记录 `input_fact_ids`；未知口径只允许在同一可靠表格有共同计量依据时使用，不跨独立来源猜测可比性。
+
+回答保留完整原文用于前端引用，服务端通过 `AnswerContext` 单独生成支持正文；前端协议仍输出 `answer_context` 字段。其中只含匹配事实、核验后的计算及不含数值的必要解释；审计用的完整表格和混合公司引文不会重新交给回答模型。最终回答入口对 KB、工具合并、会话文档统一执行事实门控，并保留目标契约。财务目标使用消解后的问题，不把历史回答中的数值当作本轮证据。关闭充分性模型或设置 fail-open 不能绕过财务归属门控。
+
+第一版覆盖已登记或明确命名公司的财务数值目标，以及有可靠报告主体的财务表。未登记公司不自动创建实体；没有公司目标但候选中存在公司范围时需要确认主体。未消解的相对期间和未逐年展开的年份范围保持未知，规划模型不能只用端点年份代替完整要求。完全不含实体或主体元数据的旧证据仍由现有充分性策略处理。原因、评级和非财务目标沿用现有语义门控；含明确数值的原因问题仍执行事实核验。生成后的公司—事实—引用一致性检查尚未实现。
 
 ## 预算、并发和回滚
 
@@ -95,7 +146,7 @@ Agent 的 `query` 只作为工具调用的检索提议和诊断信息；KB 管�
 
 ## 诊断和验收
 
-原始检索及工具诊断包含 `query_contract`、`query_intent`、`retrieval_route`、`retrieval_plan`、`plan_execution`、`query_transform`、`retrieval_graph`、`query_repair`、`query_runtime`。原文、证据引用和上下文引文可能包含业务数据，持久化这些诊断时应遵循项目的数据保留与访问控制策略。
+原始检索 JSON 为评测保留 `query_contract`、`query_intent` 和 `evidence_sufficiency` 快照；进入工具后，这些业务信息分别由 `QueryContext` 和 `EvidenceAssessment` 承载。工具运行诊断保留 `retrieval_route`、`retrieval_plan`、`plan_execution`、`query_transform`、`retrieval_graph`、`query_repair`、`query_runtime` 等排查信息。原文、证据引用和上下文引文可能包含业务数据，持久化这些诊断时应遵循项目的数据保留与访问控制策略。
 
 `query_runtime` 提供策略版本、预算、调用次数、剩余时间、阶段状态、耗时及服务商返回的 token 用量。token 缺失保持未知；不将缺失视为零成本。`total` 是实际经过时间，并发节点召回/重排字段是各节点耗时之和，不能相加推算总延迟。`repair` 包含补查和再次门控。`stage_latency_semantics` 显式记录这种区别。
 

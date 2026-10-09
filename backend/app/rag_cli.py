@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Interactive terminal client for the AgentRAG FastAPI backend.
+"""AgentRAG FastAPI 后端的交互式终端客户端。
 
-This module deliberately talks to the public HTTP API instead of importing the
-RAG implementation.  The web UI and this CLI therefore share authentication,
-session history, retrieval, citation, and refusal behaviour.
+通过公开 HTTP 接口调用服务，避免直接导入检索实现。
+因此命令行与网页界面共用认证、会话历史、检索、引用和拒答行为。
 """
 
 from __future__ import annotations
@@ -28,19 +27,19 @@ DEFAULT_TIMEOUT_SECONDS = 300.0
 
 
 class CliError(RuntimeError):
-    """A user-facing API or command error."""
+    """可向用户展示的接口或命令错误。"""
 
 
 @dataclass(frozen=True)
 class SseEvent:
-    """One decoded server-sent event."""
+    """一条已解码的服务端推送事件。"""
 
     event: str
     data: str
 
 
 def iter_sse_events(lines: Iterable[str | bytes]) -> Iterator[SseEvent]:
-    """Decode an SSE line stream, including multiline ``data`` fields."""
+    """解析 SSE 行流，支持由多行组成的 data 字段。"""
     event_name = "message"
     data_lines: list[str] = []
 
@@ -79,7 +78,7 @@ def iter_sse_events(lines: Iterable[str | bytes]) -> Iterator[SseEvent]:
 
 
 def normalize_terminal_text(value: str) -> str:
-    """Recover UTF-8 bytes represented as surrogates by a terminal decoder."""
+    """恢复终端解码器表示为代理字符的 UTF-8 字节。"""
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
@@ -99,7 +98,7 @@ def normalize_terminal_text(value: str) -> str:
 
 
 class RagApiClient:
-    """Small typed wrapper around the FastAPI endpoints used by the CLI."""
+    """对命令行使用的 FastAPI 接口进行轻量类型封装。"""
 
     def __init__(
         self,
@@ -296,9 +295,8 @@ class RagApiClient:
                 done_received = False
                 for event in iter_sse_events(response.iter_lines()):
                     if event.data == "[DONE]":
-                        # Keep draining the HTTP response.  The server persists
-                        # the completed turn after emitting [DONE], so closing
-                        # the socket here could interrupt that final work.
+                        # 继续读取完整 HTTP 响应。服务端在发出 [DONE] 后还会保存本轮会话，
+                        # 若此时关闭连接，可能中断最后的持久化操作。
                         done_received = True
                         continue
                     if done_received:
@@ -349,7 +347,7 @@ def _page_label(document: dict[str, Any]) -> str:
 
 
 def format_source(document: dict[str, Any], number: int) -> str:
-    """Format one response document without dumping its full chunk text."""
+    """格式化单条响应文档，避免输出完整片段文本。"""
     source_type = str(document.get("source_type") or "knowledge_base")
     name = str(
         document.get("document_name")
@@ -370,7 +368,7 @@ def format_source(document: dict[str, Any], number: int) -> str:
 
 
 class InteractiveCli:
-    """Terminal command loop and streaming renderer."""
+    """终端命令循环与流式输出渲染。"""
 
     def __init__(
         self,
@@ -487,7 +485,7 @@ class InteractiveCli:
             )
 
     def handle_command(self, line: str) -> bool:
-        """Handle one slash command. Return ``False`` to leave the loop."""
+        """处理一条斜杠命令；返回 False 时退出循环。"""
         try:
             parts = shlex.split(line)
         except ValueError as error:

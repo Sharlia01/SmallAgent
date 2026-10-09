@@ -1,4 +1,4 @@
-"""Tools available to the Agent orchestrator."""
+"""Agent 编排器可使用的工具。"""
 
 from agent.tools.base import AgentTool
 from agent.tools.rag_search import RagSearchTool, search_knowledge_base

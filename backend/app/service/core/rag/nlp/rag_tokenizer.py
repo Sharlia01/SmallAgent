@@ -1,4 +1,5 @@
 #
+# 第三方源码声明：以下保留原始版权与 Apache 2.0 许可条款。
 #  Copyright 2024 The InfiniFlow Authors. All Rights Reserved.
 #
 #  Licensed under the Apache License, Version 2.0 (the "License");
@@ -69,22 +70,22 @@ class RagTokenizer:
         self.SPLIT_CHAR = r"([ ,\.<>/?;:'\[\]\\`!@#$%^&*\(\)\{\}\|_+=《》，。？、；‘’：“”【】~！￥%……（）——-]+|[a-z\.-]+|[0-9,\.-]+)"
 
         trie_file_name = self.DIR_ + ".txt.trie"
-        # check if trie file existence
+        # 检查前缀树缓存文件是否存在。
         if os.path.exists(trie_file_name):
             try:
-                # load trie from file
+                # 从缓存文件加载前缀树。
                 self.trie_ = datrie.Trie.load(trie_file_name)
                 return
             except Exception:
-                # fail to load trie from file, build default trie
+                # 缓存加载失败时，构建默认前缀树。
                 logging.exception(f"[HUQIE]:Fail to load trie file {trie_file_name}, build the default trie file")
                 self.trie_ = datrie.Trie(string.printable)
         else:
-            # file not exist, build default trie
+            # 缓存文件不存在时，构建默认前缀树。
             logging.info(f"[HUQIE]:Trie file {trie_file_name} not found, build the default trie file")
             self.trie_ = datrie.Trie(string.printable)
 
-        # load data from dict file and save to trie file
+        # 从词典文件读取数据，并保存为前缀树缓存。
         self.loadDict_(self.DIR_ + ".txt")
 
     def loadUserDict(self, fnm):
@@ -99,7 +100,7 @@ class RagTokenizer:
         self.loadDict_(fnm)
 
     def _strQ2B(self, ustring):
-        """Convert full-width characters to half-width characters"""
+        """将全角字符转换为半角字符。"""
         rstring = ""
         for uchar in ustring:
             inside_code = ord(uchar)
@@ -107,7 +108,7 @@ class RagTokenizer:
                 inside_code = 0x0020
             else:
                 inside_code -= 0xfee0
-            if inside_code < 0x0020 or inside_code > 0x7e:  # After the conversion, if it's not a half-width character, return the original character.
+            if inside_code < 0x0020 or inside_code > 0x7e:  # 转换后的字符不属于半角范围时，返回原始字符。
                 rstring += uchar
             else:
                 rstring += chr(inside_code)
@@ -123,7 +124,7 @@ class RagTokenizer:
             tkslist.append(preTks)
             return res
 
-        # pruning
+        # 剪枝，减少无效搜索分支。
         S = s + 1
         if s + 2 <= len(chars):
             t1, t2 = "".join(chars[s:s + 1]), "".join(chars[s:s + 2])
@@ -196,7 +197,7 @@ class RagTokenizer:
         return sorted(res, key=lambda x: x[1], reverse=True)
 
     def merge_(self, tks):
-        # if split chars is part of token
+        # 检查拆分出的字符是否属于现有词元。
         res = []
         tks = re.sub(r"[ ]+", " ", tks).split()
         s = 0
@@ -280,7 +281,7 @@ class RagTokenizer:
                 continue
             # print(L)
 
-            # use maxforward for the first time
+            # 首次分词使用正向最大匹配。
             tks, s = self.maxForward_(L)
             tks1, s1 = self.maxBackward_(L)
             if self.DEBUG:
@@ -311,7 +312,7 @@ class RagTokenizer:
                     i += 1
                     j += 1
                     continue
-                # backward tokens from_i to i are different from forward tokens from _j to j.
+                # 比较 from_i 到 i 的逆向词元，与 _j 到 j 的正向词元是否不同。
                 tkslist = []
                 self.dfs_("".join(tks[_j:j]), 0, [], tkslist)
                 res.append(" ".join(self.sortTks_(tkslist)[0][0]))
