@@ -130,16 +130,8 @@ def test_e2e_aggregation_reports_unsafe_answers_and_over_refusals():
     results[0]["split"] = "test"
     results[1]["split"] = "challenge"
     sliced = build_e2e_summary(results)
-    assert sliced["split_counts"] == {"challenge": 1, "test": 1}
-    assert sliced["by_split"]["test"]["refusal_metrics"][
-        "unsafe_answer_count"
-    ] == 1
-    assert sliced["by_split"]["challenge"]["refusal_metrics"][
-        "over_refusal_count"
-    ] == 1
-    assert sliced["by_split"]["challenge"]["non_perfect_sample_ids"][
-        "refusal_metrics"
-    ]["refusal_precision"] == ["over-refusal"]
+    assert "split_counts" not in sliced
+    assert "by_split" not in sliced
 
 
 @pytest.mark.unit
@@ -278,13 +270,13 @@ def test_e2e_summary_aggregates_retrieval_scores_and_slices(top_k):
     assert after[f"precision_at_{top_k}"] == pytest.approx(1 / (2 * top_k))
     assert overall["gate_metrics"]["false_rejection_with_sufficient_evidence_count"] == 1
     assert overall["refusal_metrics"]["over_refusal_count"] == 1
-    assert summary["by_split"]["dev"]["retrieval_metrics"][f"recall_at_{top_k}"] == 0.5
-    assert summary["by_split"]["test"]["retrieval_metrics"][f"recall_at_{top_k}"] == 1.0
+    assert "split_counts" not in summary
+    assert "by_split" not in summary
     assert summary["by_question_type"]["paraphrase"]["retrieval_metrics"][f"mrr_at_{top_k}"] == 0.5
     assert summary["by_question_type"]["unanswerable"]["retrieval_metrics"][f"recall_at_{top_k}"] is None
     if top_k == 10:
         assert "recall_at_5" not in before
-        assert "mrr_at_5" not in summary["by_split"]["dev"]["retrieval_metrics"]
+        assert "mrr_at_5" not in summary["by_question_type"]["paraphrase"]["retrieval_metrics"]
 
     failures = overall["non_perfect_sample_ids"]
     assert failures["error_rate"] == ["failed"]
@@ -296,8 +288,10 @@ def test_e2e_summary_aggregates_retrieval_scores_and_slices(top_k):
     # Both runners must keep identical denominators, scores and diagnostics.
     retrieval_summary = build_summary(cases, top_k=top_k)
     pairs = [(overall, retrieval_summary["overall"])]
-    for axis in ("by_question_type", "by_split"):
-        pairs.extend((values, retrieval_summary[axis][name]) for name, values in summary[axis].items())
+    pairs.extend(
+        (values, retrieval_summary["by_question_type"][name])
+        for name, values in summary["by_question_type"].items()
+    )
     for e2e, retrieval in pairs:
         for group in ("retrieval_metrics", "post_gate_metrics", "gate_metrics"):
             assert e2e[group] == retrieval[group]

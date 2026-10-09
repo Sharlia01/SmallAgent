@@ -139,7 +139,7 @@ Agent 的 `query` 只作为工具调用的检索提议和诊断信息；KB 管�
 
 `retrieval_fusion.candidate_diagnostics` 保存候选 chunk ID、各召回分支名次、RRF 名次、重排名次、冲突数、是否入选及淘汰原因，最多 200 项并附截断标记。并行合并另保留覆盖预留和最终选择诊断。它解释本次实际召回候选的流向，不等于对未进入任何召回分支的文档做全库扫描。
 
-评测结果无需额外开关：逐题的 `retrieval.query_runtime.events` 保留事件，`retrieval.plan_execution` 保留执行摘要。汇总的 `query_metrics.phase_metrics` 分开统计上述四阶段；`stage_metrics` 进一步按阶段名和 `source` 拆分，避免规则兜底混入模型计划接受率。成功率按实际阶段尝试计算，纠正重试是另一次尝试；`skipped/blocked` 单列且不进入成功率分母，无观测时成功率为 `null`。每组提供成功/失败数、失败规则/字段分布和结束原因；`pipeline_end_reasons` 汇总管线终止情况。预算阻止的模型调用不会计入已发出请求或 token 用量；解析/校验事件也不重复计费。
+评测结果无需额外开关：逐题的 `retrieval.query_runtime.events` 保留请求、解析、语义校验和执行事件，`retrieval.plan_execution` 保留执行摘要。汇总的 `query_metrics.pipeline_end_reasons` 统计管线终止原因。预算阻止的模型调用不会计入已发出请求或 token 用量；解析/校验事件也不重复计费。
 
 检索和端到端汇总的 `query_metrics` 提供计划回退率、标注路由一致率、目标支持率、补查成功率、模型/检索调用与 token 覆盖统计，所有指标保留分母。路由一致不等于答案正确，应结合原有证据覆盖、拒答、引用和忠实度指标判断。总延迟增加 P99；成功查询的延迟分布需与错误率一起查看。
 

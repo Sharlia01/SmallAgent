@@ -152,6 +152,49 @@ def test_faithfulness_is_null_for_refusal_and_disabled_judge():
 
 
 @pytest.mark.unit
+def test_non_factual_supported_intro_does_not_fail_or_count_in_score():
+    client, _completions = _client_with_response(json.dumps({
+        "assessments": [
+            {"claim_index": 1, "requires_evidence": False, "supported": True,
+             "supporting_document_indices": [], "reason": "过渡语，无需证据"},
+            {"claim_index": 2, "requires_evidence": True, "supported": True,
+             "supporting_document_indices": [1], "reason": "收入被支持"},
+            {"claim_index": 3, "requires_evidence": True, "supported": False,
+             "supporting_document_indices": [], "reason": "利润没有证据"},
+        ],
+    }))
+    result = evaluate_faithfulness(
+        question="收入和利润是多少？",
+        answer="财务数据如下：\n收入为10亿元。利润为2亿元。",
+        documents=[{"content_with_weight": "收入为10亿元。"}],
+        response_mode="answer", judge_client=client, judge_model="judge",
+    )
+    assert result["judge_source"] == "model"
+    assert result["judge_error"] is None
+    assert result["claims"][0]["supported"] is True
+    assert result["factual_claim_count"] == 2
+    assert result["faithfulness_score"] == 0.5
+
+
+@pytest.mark.unit
+def test_factual_supported_claim_still_requires_evidence_indices():
+    client, _completions = _client_with_response(json.dumps({
+        "assessments": [
+            {"claim_index": 1, "requires_evidence": True, "supported": True,
+             "supporting_document_indices": [], "reason": "漏填证据"},
+        ],
+    }))
+    result = evaluate_faithfulness(
+        question="收入是多少？", answer="收入为10亿元。",
+        documents=[{"content_with_weight": "收入为10亿元。"}],
+        response_mode="answer", judge_client=client, judge_model="judge",
+    )
+    assert result["faithfulness_score"] is None
+    assert result["judge_source"] == "fallback"
+    assert "lacks valid evidence" in result["judge_error"]
+
+
+@pytest.mark.unit
 def test_faithfulness_returns_null_when_judge_response_is_invalid():
     client, _completions = _client_with_response(
         '{"assessments":['

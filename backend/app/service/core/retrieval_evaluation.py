@@ -1598,24 +1598,6 @@ def _aggregate_gate_metrics(
     }
 
 
-def _stage_outcome_metrics(events: list[dict[str, Any]]) -> dict[str, Any]:
-    """Attempt denominators exclude downstream stages that never ran."""
-    success_statuses = {"ok", "accepted", "succeeded"}
-    failure_statuses = {"error", "rejected", "failed", "partial", "budget_exhausted"}
-    succeeded = sum(e.get("status") in success_statuses for e in events)
-    failed = sum(e.get("status") in failure_statuses for e in events)
-    return {
-        "event_count": len(events), "attempt_count": succeeded + failed,
-        "success_count": succeeded, "failure_count": failed,
-        "success_rate": _rate(succeeded, succeeded + failed),
-        "skipped_count": sum(e.get("status") == "skipped" for e in events),
-        "blocked_count": sum(e.get("status") == "blocked" for e in events),
-        "failure_rules": dict(Counter(e["rule"] for e in events if e.get("rule") and e.get("status") in failure_statuses | {"blocked"})),
-        "failure_fields": dict(Counter(field for e in events for field in e.get("failure_fields", []))),
-        "end_reasons": dict(Counter(e["end_reason"] for e in events if e.get("end_reason"))),
-    }
-
-
 def aggregate_query_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     """Operational measurements with explicit denominators; no inferred costs.
 
@@ -1645,12 +1627,6 @@ def aggregate_query_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     all_events = [event for runtime in runtimes for event in runtime.get("events", [])]
     events = [event for event in all_events if "model" in event and event.get("request_sent") is not False]
     token_events = [event for event in events if isinstance(event.get("total_tokens"), (int, float))]
-    observable_phases = ("request", "parse", "semantic_validation", "execution")
-    stage_events = defaultdict(list)
-    for event in all_events:
-        if event.get("phase") in observable_phases:
-            # Rule-compiled plans must not inflate model-plan acceptance rates.
-            stage_events[(event["stage"], event["phase"], event.get("source", "unspecified"))].append(event)
     return {
         "runtime_sample_count": len(runtimes),
         "runtime_unavailable_count": len(results) - len(runtimes),
@@ -1678,10 +1654,6 @@ def aggregate_query_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         "repair_success_rate": _rate(sum(r.get("stop_reason") == "goals_satisfied" for r in repairs), len(repairs)),
         "repair_cohorts": repair_cohorts,
         "verification_unavailable_count": sum((r.get("evidence_sufficiency") or {}).get("verification_status") == "unavailable" for r in retrievals),
-        "phase_metrics": {phase: _stage_outcome_metrics([e for e in all_events if e.get("phase") == phase])
-                          for phase in observable_phases},
-        "stage_metrics": [{"stage": stage, "phase": phase, "source": source, **_stage_outcome_metrics(items)}
-                          for (stage, phase, source), items in sorted(stage_events.items())],
         "pipeline_end_reasons": dict(Counter(e["end_reason"] for e in all_events
                                             if e.get("phase") == "pipeline" and e.get("end_reason"))),
     }
@@ -1783,7 +1755,6 @@ def build_summary(
     resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
     by_question_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_source_modality: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    by_split: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for result in results:
         by_question_type[str(result.get("question_type") or "unknown")].append(
             result
@@ -1791,7 +1762,6 @@ def build_summary(
         by_source_modality[str(result.get("source_modality") or "unknown")].append(
             result
         )
-        by_split[str(result.get("split") or "unknown")].append(result)
 
     return {
         "result_schema_version": RESULT_SCHEMA_VERSION,
@@ -1800,14 +1770,6 @@ def build_summary(
         ),
         "source_modality_counts": dict(
             sorted(Counter(result["source_modality"] for result in results).items())
-        ),
-        "split_counts": dict(
-            sorted(
-                Counter(
-                    str(result.get("split") or "unknown")
-                    for result in results
-                ).items()
-            )
         ),
         "metric_ks": list(resolved_metric_ks),
         "overall": aggregate_results(
@@ -1830,13 +1792,5 @@ def build_summary(
                 metric_ks=resolved_metric_ks,
             )
             for name, items in sorted(by_source_modality.items())
-        },
-        "by_split": {
-            name: aggregate_results(
-                items,
-                top_k=top_k,
-                metric_ks=resolved_metric_ks,
-            )
-            for name, items in sorted(by_split.items())
         },
     }

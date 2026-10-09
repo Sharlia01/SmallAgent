@@ -524,12 +524,10 @@ def build_e2e_summary(
     top_k: int = 5,
 ) -> dict[str, Any]:
     by_question_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    by_split: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for result in results:
         by_question_type[str(result.get("question_type") or "unknown")].append(
             result
         )
-        by_split[str(result.get("split") or "unknown")].append(result)
     return {
         "result_schema_version": E2E_RESULT_SCHEMA_VERSION,
         "metric_ks": list(resolve_metric_ks(top_k)),
@@ -541,21 +539,9 @@ def build_e2e_summary(
                 ).items()
             )
         ),
-        "split_counts": dict(
-            sorted(
-                Counter(
-                    str(result.get("split") or "unknown")
-                    for result in results
-                ).items()
-            )
-        ),
         "overall": aggregate_e2e_results(results, top_k=top_k),
         "by_question_type": {
             name: aggregate_e2e_results(items, top_k=top_k)
             for name, items in sorted(by_question_type.items())
-        },
-        "by_split": {
-            name: aggregate_e2e_results(items, top_k=top_k)
-            for name, items in sorted(by_split.items())
         },
     }

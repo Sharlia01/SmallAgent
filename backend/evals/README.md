@@ -224,8 +224,8 @@ docker compose exec LS_api \
 逐题 JSONL 中，这三组位于根节点。汇总文件中的整体指标路径分别为
 `metrics.overall.retrieval_metrics`、`metrics.overall.gate_metrics`、
 `metrics.overall.post_gate_metrics`；`by_question_type` 和 `by_source_modality`
-中的每个切片也包含同样三组。v2 结果还提供 `by_split`，避免把调参集、常规测试集
-和挑战集混成一个总分。
+中的每个切片也包含同样三组。需要分别比较调参集、常规测试集和挑战集时，
+请分别运行评测。
 
 检查前后的检索评分使用相同的证据匹配规则：
 
@@ -247,7 +247,7 @@ docker compose exec LS_api \
 
 汇总结果还包含 `error_rate`、`average_latency_ms`、`latency_p50_ms` 和
 `latency_p95_ms`、`latency_p99_ms`。延迟统计只使用成功完成的查询；失败查询通过 `error_count/error_rate`
-单独体现。建议始终结合 `by_question_type`、`by_source_modality` 和 `by_split` 查看切片，
+单独体现。建议结合 `by_question_type` 和 `by_source_modality` 查看切片，
 不要只比较整体均值。
 
 逐题 `retrieval.stage_latency_ms` 记录阶段耗时；并发节点的工作时间会重叠，不能将各字段相加作为总延迟。`stage_latency_semantics` 标明统计口径：
@@ -312,7 +312,7 @@ AllRequirementsHit、拒答召回率等指标以 `1` 为理想值；`error_rate`
 2.2 不再写出与 `post_gate_metrics` 完全重复的逐题 `metrics`，也移除了汇总中重复平铺的
 Hit、Recall、MRR、空结果率、旧拒答率和旧 fallback 率。新结果统一读取上述三组指标；
 `evidence_matches`、`retrieval.chunks` 等诊断字段不变。汇总最外层的 `metrics` 仍作为
-`overall`、`by_question_type`、`by_source_modality` 和 `by_split` 的容器保留。
+`overall`、`by_question_type` 和 `by_source_modality` 的容器保留。
 聚合器仍可读取带旧 `metrics` 字段的 2.1 历史逐题结果。
 2.3 在保持上述字段兼容的基础上增加门控拒绝归因指标。
 2.4 增加逐题阶段耗时及其整体和切片聚合。
@@ -349,6 +349,8 @@ Faithfulness，以及逐条 claim 与引用证据的蕴含关系。可通过 `--
 `--judge-model` 临时覆盖；使用 `--no-judge` 时只运行确定性的引用编号、充分性和
 拒答评估，不产生答案正确性、Faithfulness 或引用支持度分数。Faithfulness 是一次
 独立 judge 调用，因此每个实际回答的样本会比旧版多一次模型请求。
+
+端到端流程先运行忠实度评判，引用评判沿用其逐条 `requires_evidence` 分类：非事实陈述跳过引用评判，事实陈述只检查其引用片段是否支持内容。分类不可用时引用语义评分也记为不可用，不重新独立分类；引用编号有效性仍可计算。原始结果中的 `citation_metrics.classification_source=faithfulness` 标记这一口径，历史分数需注意分类口径差异。
 
 每条结果包含：
 
@@ -393,7 +395,7 @@ faithfulness_score = 被全部最终证据支持的事实主张数 / 事实主�
 - `metrics.overall.post_gate_metrics`：充分性检查后交给回答模型的证据指标。
 - `metrics.overall.gate_metrics`：放行、拒绝、检查失败及拒绝原因归因统计。
 
-`metrics.by_question_type` 和 `metrics.by_split` 中也包含这三组统计。
+`metrics.by_question_type` 中也包含这三组统计。
 `non_perfect_sample_ids` 同步提供检索指标对应的未达标样本 ID，原有答案、引用和
 拒答指标及其样本列表继续保留。运行结束后终端也会打印整体统计。
 
@@ -413,6 +415,16 @@ K 跟随实际 `--top-k`，例如 `--top-k 10` 只输出 `@10`。这些检索统
 
 - `results/<run-name>.jsonl`：逐题回答、引用解析、检索 trace 和各项指标。
 - `results/<run-name>_summary.json`：整体与题型切片汇总。
+- `results/<run-name>.html`：可离线打开的阅读报告，包含问题、参考答案、实际答案、主要评分和失败原因，支持搜索和筛选需关注题目。评分失败显示为未评分，不计作零分；详细检索记录仍保存在 JSONL 中。
+
+已有端到端结果无需重新调用模型，可直接补生成 HTML：
+
+```bash
+cd backend
+python evals/html_report.py evals/results/agent_test_smoke_20261008.jsonl
+```
+
+默认读取同名 `_summary.json`，输出同名 `.html`。已有 HTML 需显式添加 `--overwrite` 才会替换。
 
 
 ### 查询规划与 Agent 回归

@@ -30,6 +30,7 @@ if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 
 from openai import OpenAI  # noqa: E402
+from html_report import render_html_report  # noqa: E402
 
 from run_retrieval_eval import (  # noqa: E402
     atomic_write_text,
@@ -243,6 +244,7 @@ def write_outputs(
         summary_path,
         json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
     )
+    atomic_write_text(result_path.with_suffix(".html"), render_html_report(results, summary))
 
 
 def main() -> int:
@@ -280,7 +282,8 @@ def main() -> int:
     output_directory = args.output_dir.resolve()
     result_path = output_directory / f"{args.run_name}.jsonl"
     summary_path = output_directory / f"{args.run_name}_summary.json"
-    existing = [path for path in (result_path, summary_path) if path.exists()]
+    html_path = result_path.with_suffix(".html")
+    existing = [path for path in (result_path, summary_path, html_path) if path.exists()]
     if existing and not args.overwrite:
         raise FileExistsError(
             "Result files already exist: "
@@ -322,6 +325,15 @@ def main() -> int:
                 top_k=args.top_k,
                 match_threshold=args.match_threshold,
             )
+            faithfulness_metrics = evaluate_faithfulness(
+                question=str(sample["question"]),
+                answer=turn.answer,
+                documents=turn.documents,
+                response_mode=turn.response_mode,
+                judge_client=client if judge_model else None,
+                judge_model=judge_model,
+                judge_timeout=args.judge_timeout,
+            )
             citation_metrics = evaluate_citations(
                 turn.answer,
                 turn.documents,
@@ -332,15 +344,7 @@ def main() -> int:
                 ),
                 judge_model=judge_model,
                 judge_timeout=args.judge_timeout,
-            )
-            faithfulness_metrics = evaluate_faithfulness(
-                question=str(sample["question"]),
-                answer=turn.answer,
-                documents=turn.documents,
-                response_mode=turn.response_mode,
-                judge_client=client if judge_model else None,
-                judge_model=judge_model,
-                judge_timeout=args.judge_timeout,
+                classified_claims=faithfulness_metrics["claims"],
             )
             if sample.get("answerable") and turn.response_mode == "answer":
                 answer_metrics = evaluate_answer_quality(
@@ -494,6 +498,7 @@ def main() -> int:
     write_outputs(result_path, summary_path, results, summary)
     print(f"Results: {result_path}")
     print(f"Summary: {summary_path}")
+    print(f"HTML report: {html_path}")
     print(json.dumps(summary["metrics"]["overall"], ensure_ascii=False, indent=2))
     return 1 if summary["metrics"]["overall"]["error_count"] else 0
 

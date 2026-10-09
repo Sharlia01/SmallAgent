@@ -27,6 +27,8 @@ def test_runtime_costs_keep_unknown_usage_and_failed_samples_visible():
     assert result["reported_total_tokens"] == 120
     assert result["plan_fallback_rate"] == 1
     assert result["repair_success_rate"] == result["route_agreement"] == 1
+    assert "phase_metrics" not in result
+    assert "stage_metrics" not in result
 
 
 def test_missing_runtime_metrics_are_not_reported_as_zero_cost():

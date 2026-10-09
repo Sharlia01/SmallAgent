@@ -1002,70 +1002,152 @@ def _clarification_result(request: QueryRequest, message: str) -> dict[str, Any]
     }
 
 
-def _repair_missing_goals(result, decision, *, question, analysis, dealer, index_names, options):
-    """One bounded repair wave; keep supported goals and recheck the union."""
-    if decision.sufficient or not analysis.goals or not _environment_flag("RAG_QUERY_REPAIR_ENABLED", True):
-        return result, decision
-    if decision.source in {"fallback", "disabled"}:
-        return result, decision  # verifier outage is not evidence of retrieval failure
-    missing = {item["goal_id"] for item in decision.goal_coverage if item["status"] != "supported"}
-    if not result.get("chunks"):
-        missing = {goal.id for goal in analysis.goals}
-    goals = [goal for goal in analysis.goals if goal.id in missing and not goal.depends_on]
-    if not goals:
-        return result, decision
+def _build_goal_repair_queries(goals, chunks, question):
+    """把缺失目标转成补查词，同时记录每条查询属于哪个目标。"""
     queries = {}
     query_owners = {}
+    # 已找到的图表不重复查；未知对应关系只补齐尚未找到的候选图表。
+    present_locators = None
     for goal in goals:
         if goal.candidate_locators:
-            # Recover the missing candidate object rather than repeating the
-            # full unresolved relation and letting the same object dominate.
-            present = set().union(*(extract_locators(str(chunk.get("locator_kwd") or ""))
-                                    for chunk in result.get("chunks") or []))
+            if present_locators is None:
+                present_locators = set().union(*(
+                    extract_locators(str(chunk.get("locator_kwd") or ""))
+                    for chunk in chunks
+                ))
             for index, locator in enumerate(goal.candidate_locators):
-                if not extract_locators(locator) <= present:
-                    key = f"{goal.id}_{index + 1}"
-                    queries[key] = " ".join([locator, "完整内容 文字及视觉事实", *shared_scope_terms(question)])
-                    query_owners[key] = goal.id
+                if extract_locators(locator) <= present_locators:
+                    continue
+                query_id = f"{goal.id}_{index + 1}"
+                queries[query_id] = " ".join([
+                    locator, "完整内容 文字及视觉事实", *shared_scope_terms(question),
+                ])
+                query_owners[query_id] = goal.id
         else:
+            # 普通目标直接使用已有描述和限定条件，不再调用模型编写查询。
             queries[goal.id] = " ".join(dict.fromkeys([goal.text, *goal.constraints]))
             query_owners[goal.id] = goal.id
+    return queries, query_owners
+
+
+def _repair_missing_goals(result, decision, *, question, analysis, dealer, index_names, options):
+    """证据不足时只补查一轮，返回合并后的结果和再次核验的判定。
+
+    result 是已取回的片段，decision 是首次充分性判定，analysis.goals
+    是用户需求清单。此函数更新 result；不负责最终拒答或清空片段。
+    """
+    # 1. 确认确实需要补查。核验器故障不能解释为“资料里缺少事实”。
+    if decision.sufficient or not analysis.goals:
+        return result, decision
+    if not _environment_flag("RAG_QUERY_REPAIR_ENABLED", True):
+        return result, decision
+    if decision.source in {"fallback", "disabled"}:
+        return result, decision
+
+    # 2. 找出没有被支持的目标。零片段时，所有目标都视为缺失。
+    missing_goal_ids = {
+        item["goal_id"]
+        for item in decision.goal_coverage
+        if item["status"] != "supported"
+    }
+    existing_chunks = result.get("chunks") or []
+    if not existing_chunks:
+        missing_goal_ids = {goal.id for goal in analysis.goals}
+    # 依赖目标需要先取得桥接值，不能直接当作独立查询补查。
+    repairable_goals = [
+        goal for goal in analysis.goals
+        if goal.id in missing_goal_ids and not goal.depends_on
+    ]
+    if not repairable_goals:
+        return result, decision
+
+    # 3. 为每个缺口准备搜索词；一个图表目标可能对应多条候选查询。
+    queries, query_owners = _build_goal_repair_queries(
+        repairable_goals, existing_chunks, question,
+    )
     if not queries:
         return result, decision
-    before_ids = {_chunk_key(chunk) for chunk in result.get("chunks") or []}
-    def repair_goal(goal_id, query):
-        with observation_context(node_id="repair_" + goal_id, goal_ids=[query_owners[goal_id]], source="repair"):
+    existing_chunk_ids = {_chunk_key(chunk) for chunk in existing_chunks}
+
+    # 4. 并发补查。候选数可大于初次 top-k，但受重排候选上限约束。
+    repair_page_size = min(options.rerank_candidate_size, max(options.page_size, 10))
+
+    def retrieve_repair_query(query_id, query):
+        with observation_context(
+            node_id="repair_" + query_id,
+            goal_ids=[query_owners[query_id]],
+            source="repair",
+        ):
             return dealer.retrieval(
-                question=query, keyword_question=query, tenant_ids=index_names,
-                options=replace(options, page=1, page_size=min(options.rerank_candidate_size, max(options.page_size, 10))),
+                question=query,
+                keyword_question=query,
+                tenant_ids=index_names,
+                options=replace(options, page=1, page_size=repair_page_size),
             )
-    repairs = run_independent({goal_id: lambda goal_id=goal_id, query=query: repair_goal(goal_id, query)
-                               for goal_id, query in queries.items()})
-    successful = [(QuerySubqueryPlan(id=goal_id, query=queries[goal_id], goal_ids=[query_owners[goal_id]]), value)
-                  for goal_id, value in repairs.items() if not isinstance(value, Exception)]
-    new_ids = {_chunk_key(chunk) for _, value in successful for chunk in value.get("chunks") or []} - before_ids
-    result["query_repair"] = {
-        "attempted_goal_ids": list(dict.fromkeys(query_owners.values())), "queries": queries, "new_candidate_count": len(new_ids),
-        "failed_goal_ids": list(dict.fromkeys(query_owners[key] for key, value in repairs.items() if isinstance(value, Exception))),
-        "failed_query_ids": [key for key, value in repairs.items() if isinstance(value, Exception)],
-        "stop_reason": "no_new_evidence" if not new_ids else "repair_limit",
+
+    # 默认参数绑定当前查询，避免循环中的 lambda 全部使用最后一条查询。
+    repair_tasks = {
+        query_id: lambda query_id=query_id, query=query: retrieve_repair_query(query_id, query)
+        for query_id, query in queries.items()
     }
-    if not new_ids:
+    repair_results = run_independent(repair_tasks)
+
+    # 5. 失败分支只记录诊断，成功分支仍可合并；按片段 ID 统计新增证据。
+    successful_repairs = []
+    failed_query_ids = []
+    for query_id, repair_result in repair_results.items():
+        if isinstance(repair_result, Exception):
+            failed_query_ids.append(query_id)
+            continue
+        repair_step = QuerySubqueryPlan(
+            id=query_id, query=queries[query_id], goal_ids=[query_owners[query_id]],
+        )
+        successful_repairs.append((repair_step, repair_result))
+
+    repaired_chunk_ids = {
+        _chunk_key(chunk)
+        for _, repair_result in successful_repairs
+        for chunk in repair_result.get("chunks") or []
+    }
+    new_chunk_ids = repaired_chunk_ids - existing_chunk_ids
+    repair_diagnostics = {
+        "attempted_goal_ids": list(dict.fromkeys(query_owners.values())),
+        "queries": queries,
+        "new_candidate_count": len(new_chunk_ids),
+        "failed_goal_ids": list(dict.fromkeys(query_owners[key] for key in failed_query_ids)),
+        "failed_query_ids": failed_query_ids,
+        "stop_reason": "no_new_evidence" if not new_chunk_ids else "repair_limit",
+    }
+    result["query_repair"] = repair_diagnostics
+    if not new_chunk_ids:
         return result, decision
-    combined = _merge_parallel_subqueries(
+
+    # 6. 保留原有片段，并合并、去重、重排补查结果。合并容量最多 20 条；
+    # 后面的表格上下文展开仍可能调整片段内容或数量。
+    merged_page_size = min(20, max(
+        options.page_size, len(existing_chunk_ids) + len(new_chunk_ids),
+    ))
+    retained_step = QuerySubqueryPlan(id="retained", query=question)
+    merged_result = _merge_parallel_subqueries(
         original_question=question,
-        subquery_results=[(QuerySubqueryPlan(id="retained", query=question), result), *successful],
-        options=replace(options, page=1, page_size=min(20, max(options.page_size, len(before_ids) + len(new_ids)))),
+        subquery_results=[(retained_step, result), *successful_repairs],
+        options=replace(options, page=1, page_size=merged_page_size),
     )
-    candidates = expand_table_contexts(combined["chunks"], question)
-    decision = check_evidence_sufficiency(question, candidates, goals=analysis.goals)
-    result["chunks"] = candidates
-    result["chunks_before_sufficiency"] = list(candidates)
-    result["total"] = combined["total"]
-    result["total_before_evidence_sufficiency"] = combined["total"]
-    result["doc_aggs"] = combined["doc_aggs"]
-    result["query_repair"]["stop_reason"] = "goals_satisfied" if decision.sufficient else "repair_limit"
-    return result, decision
+    merged_chunks = expand_table_contexts(merged_result["chunks"], question)
+
+    # 7. 用完整问题重新核验全部目标，不只核验本轮补查词；不再递归补查。
+    final_decision = check_evidence_sufficiency(
+        question, merged_chunks, goals=analysis.goals,
+    )
+    result["chunks"] = merged_chunks
+    result["chunks_before_sufficiency"] = list(merged_chunks)
+    result["total"] = merged_result["total"]
+    result["total_before_evidence_sufficiency"] = merged_result["total"]
+    result["doc_aggs"] = merged_result["doc_aggs"]
+    repair_diagnostics["stop_reason"] = (
+        "goals_satisfied" if final_decision.sufficient else "repair_limit"
+    )
+    return result, final_decision
 
 
 @dataclass(slots=True)
@@ -1275,34 +1357,56 @@ def _execute_retrieval_plan(
 
 
 def _verify_retrieved_evidence(result, *, question, analysis, dealer, index_names, options):
-    """Save pre-gate evidence, optionally repair gaps, and suppress unsafe output."""
-    # Table rows are ranked atomically, then expanded for verification and answering.
-    result["chunks"] = expand_table_contexts(list(result.get("chunks") or []), question)
-    result["chunks_before_sufficiency"] = list(result.get("chunks") or [])
+    """统一执行证据门控：首次核验 → 按需补查 → 根据最终判定放行或拒答。
+
+    返回 (result, gate_ms, repair_ms)。gate_ms 只记录首次核验耗时；
+    repair_ms 包含补查及再次核验。门控前快照用于评测和失败排查。
+    """
+    # 1. 补齐表格的表头等上下文，再保存快照。拒答时只清空回答用的
+    # chunks，仍保留 chunks_before_sufficiency，便于检查检索到了什么。
+    initial_chunks = list(result.get("chunks") or [])
+    verification_chunks = expand_table_contexts(initial_chunks, question)
+    result["chunks"] = verification_chunks
+    result["chunks_before_sufficiency"] = list(verification_chunks)
     result["total_before_evidence_sufficiency"] = result.get("total", 0)
 
-    # Verify only after every planned retrieval hop has been merged.
+    # 2. 所有检索分支已经合并完毕，此时才检查能否回答完整用户问题。
     gate_started = time.perf_counter()
     gate_options = {"goals": analysis.goals} if analysis.goals else {}
-    sufficiency = check_evidence_sufficiency(question, result.get("chunks", []), **gate_options)
+    initial_decision = check_evidence_sufficiency(
+        question, verification_chunks, **gate_options,
+    )
     record_observation(
-        "evidence_gate", "decision", "sufficient" if sufficiency.sufficient else "insufficient",
-        source=sufficiency.source, end_reason="initial_evidence_check", detail=sufficiency.reason[:500],
+        "evidence_gate",
+        "decision",
+        "sufficient" if initial_decision.sufficient else "insufficient",
+        source=initial_decision.source,
+        end_reason="initial_evidence_check",
+        detail=initial_decision.reason[:500],
     )
     gate_ms = (time.perf_counter() - gate_started) * 1000
 
+    # 3. 补查函数自行判断是否需要执行；已充分或无法安全补查时直接返回。
+    # 若实际补查，快照会更新为合并后的证据，并返回再次核验的判定。
     repair_started = time.perf_counter()
-    result, sufficiency = _repair_missing_goals(
-        result, sufficiency, question=question, analysis=analysis,
-        dealer=dealer, index_names=index_names, options=options,
+    result, final_decision = _repair_missing_goals(
+        result,
+        initial_decision,
+        question=question,
+        analysis=analysis,
+        dealer=dealer,
+        index_names=index_names,
+        options=options,
     )
     repair_ms = (time.perf_counter() - repair_started) * 1000
-    result["evidence_sufficiency"] = sufficiency.to_dict()
-    # The final decision is already returned in evidence_sufficiency.
+
+    # 4. 对外只保存最终判定。仍不足时不把片段交给回答阶段；
+    # 保留核验原因和门控前快照，让上层能解释拒答并进行评测。
+    result["evidence_sufficiency"] = final_decision.to_dict()
     result["evidence_sufficiency"]["enabled"] = _environment_flag(
         "RAG_EVIDENCE_SUFFICIENCY_ENABLED", True,
     )
-    if not sufficiency.sufficient:
+    if not final_decision.sufficient:
         result["total"] = 0
         result["chunks"] = []
         result["doc_aggs"] = []

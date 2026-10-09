@@ -529,8 +529,8 @@ def test_summary_keeps_correct_denominators_and_all_slices():
         assert overall[group]["error_count"] == 1
         assert group in summary["by_question_type"]["fact"]
         assert group in summary["by_source_modality"]["text"]
-        assert group in summary["by_split"]["unknown"]
-    assert summary["split_counts"] == {"unknown": 4}
+    assert "split_counts" not in summary
+    assert "by_split" not in summary
     assert summary["by_question_type"]["unanswerable"]["retrieval_metrics"]["hit_at_5"] is None
     assert failed["retrieval_metrics"]["hit_at_5"] is None
     assert failed["gate_metrics"]["rejected"] is None

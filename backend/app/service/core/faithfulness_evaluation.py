@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from service.core.citation_evaluation import parse_answer_claims
+
+
+logger = logging.getLogger(__name__)
 
 
 MAX_EVIDENCE_DOCUMENTS = 20
@@ -67,7 +71,7 @@ def _evidence_payload(documents: list[dict[str, Any]]) -> list[dict[str, Any]]:
         )
     return evidence
 
-
+# 评估回答里的每条陈述是否需要证据，检索证据是否支持它？支持它的是哪些片段？
 def _judge_claims(
     *,
     question: str,
@@ -138,12 +142,16 @@ def _judge_claims(
         ):
             raise ValueError("faithfulness supporting document indices are invalid")
         supporting_indices = list(dict.fromkeys(supporting_indices))
-        if supported and (not requires or not supporting_indices):
-            raise ValueError("supported faithfulness claim lacks valid evidence")
-        if not supported and supporting_indices:
-            raise ValueError("unsupported faithfulness claim must not cite evidence")
+        # 只有事实主张需要检查证据支持关系。开场白等不参与评分，
+        # 保留模型返回的 supported，不强制改成 False。
+        if requires:
+            if supported and not supporting_indices:
+                raise ValueError("supported faithfulness claim lacks valid evidence")
+            if not supported and supporting_indices:
+                raise ValueError("unsupported faithfulness claim must not cite evidence")
         if not isinstance(reason, str) or not reason.strip():
             raise ValueError("faithfulness assessment reason is invalid")
+
         by_index[index] = {
             "requires_evidence": requires,
             "supported": supported,
