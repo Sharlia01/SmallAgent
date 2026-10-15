@@ -18,7 +18,7 @@ sys.path.append(str(Path(__file__).parent))
 def test_simple_questions():
     """测试简化后的推荐问题生成"""
     try:
-        from service.core.chat import generate_recommended_questions
+        from service.core.answering.chat import generate_recommended_questions
         
         print("🧪 测试1: 纯问题扩展（无文档）")
         questions1 = generate_recommended_questions("什么是Python？")

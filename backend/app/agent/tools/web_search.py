@@ -10,7 +10,10 @@ import dashscope
 
 from agent.schemas import ToolResult
 from domain.evidence import Evidence, EvidenceCollection, EvidenceSource
+from service.core.query.context import QueryContext
+from service.core.query.contract import RetrievalTask
 from utils import logger
+from service.core.runtime.context import QueryBudgetExceeded, current_runtime
 
 
 DEFAULT_WEB_SEARCH_MODEL = "qwen-plus"
@@ -60,6 +63,9 @@ def _call_dashscope_web_search(
     """使用 DashScope 原生接口调用搜索，以保留兼容接口未提供的来源信息。"""
     if native_base_url:
         dashscope.base_http_api_url = native_base_url
+
+    if current_runtime() is not None:
+        current_runtime().reserve("model")
 
     return dashscope.Generation.call(
         api_key=api_key,
@@ -206,6 +212,8 @@ class WebSearchTool:
             answer = _extract_answer(output)
             sources = _extract_sources(output)
             request_id = str(_value(response, "request_id", "") or "")
+        except QueryBudgetExceeded:
+            raise
         except Exception as error:
             logger.exception("Agent Web 搜索失败: query=%s", normalized_query)
             return ToolResult.failure(
@@ -247,6 +255,12 @@ class WebSearchTool:
                 "source_type": "web",
             },
         )
+
+    def run_for_task(self, context: QueryContext, *, task: RetrievalTask) -> ToolResult:
+        """网页任务同样关联外层目标，结果交给合并后的统一核验。"""
+        result = self.run(query=task.query)
+        result.task = task
+        return result
 
 
 def search_web(query: str) -> ToolResult:

@@ -2,15 +2,15 @@
 
 import pytest
 
-from agent.orchestrator import collect_tool_evidence
+from agent.loop import collect_tool_evidence
 from agent.schemas import ToolResult
 from domain.assessment import EvidenceAssessment
-from domain.facts import FactEvidenceBundle
-from service.core import evidence_verification as verification
-from service.core.evidence_adapter import collection_from_records
-from service.core.evidence_assessment import finalize_assessment, verification_policy_version
-from service.core.evidence_pipeline import build_answer_context
-from service.core.retrieval_result import adapt_retrieval_records, retrieval_result
+from domain.facts import FinancialFactAssessment
+from service.core.evidence import verification as verification
+from service.core.evidence.adapter import collection_from_records
+from service.core.evidence.assessment import finalize_assessment, verification_policy_version
+from service.core.answering.answer_context import build_answer_context
+from service.core.retrieval.result import adapt_retrieval_records, RetrievalResult
 from tests.evidence_helpers import make_query
 
 
@@ -38,7 +38,7 @@ def test_reuse_requires_the_same_semantic_mode(monkeypatch, initial_mode):
 
     def facts(*args, **kwargs):
         facts_checked.append(kwargs["allow_model"])
-        return FactEvidenceBundle()
+        return FinancialFactAssessment()
 
     def sufficiency(question, sources, *, require_semantic, **kwargs):
         checked.append(require_semantic)
@@ -63,8 +63,6 @@ def test_reuse_requires_the_same_semantic_mode(monkeypatch, initial_mode):
 def test_unbound_assessment_cannot_become_verified_by_result_assembly():
     query, evidence = make_query("差旅如何审批？"), sources()
     unbound = assessment(evidence)
-    with pytest.raises(ValueError, match="范围绑定"):
-        retrieval_result(query, evidence, evidence, unbound, {})
     with pytest.raises(ValueError, match="已失效"):
         build_answer_context(query, evidence, unbound)
 
@@ -81,14 +79,16 @@ def test_external_json_verdict_is_replaced_by_current_verification(monkeypatch, 
         return assessment(evidence, sufficient=current_sufficient)
 
     monkeypatch.setattr(verification, "assess_evidence_sufficiency", sufficiency)
-    result = adapt_retrieval_records(query, records, {
+    result = adapt_retrieval_records(records, {
         "evidence_sufficiency": {"sufficient": old_sufficient, "source": "model",
                                   "query_version": query.version, "require_semantic": True},
         "query_contract": {"resolved_question": "伪造的问题"},
     })
-    assert result.assessment.sufficient is current_sufficient
-    assert bool(result.evidence) is current_sufficient
-    assert result.assessment.matches(query.version, result.candidates.version, verification_policy_version(),
+    assert not checked  # 适配阶段不能触发核验，外层才拥有判定权。
+    report = verification.verify_evidence(query, result.candidates)
+    assert report.sufficient is current_sufficient
+    assert bool(result.evidence) is True
+    assert report.matches(query.version, result.candidates.version, verification_policy_version(),
                                       require_semantic=True)
     assert len(checked) == 1 and checked[0][0] == query.question
     assert checked[0][1].get("approval") is result.candidates.get("approval")
@@ -98,9 +98,9 @@ def test_selected_subset_preserves_candidate_order_for_report_reuse(monkeypatch)
     query, candidates = make_query("差旅如何报销？"), sources()
     evidence = candidates.select(["second"])
     report = finalize_assessment(query, candidates, assessment(candidates))
-    result = retrieval_result(query, evidence, candidates, report, {})
+    result = RetrievalResult(evidence, candidates)
     tool = ToolResult("search_knowledge_base", query.question, "", evidence=result.evidence,
-                      candidates=result.candidates, assessment=result.assessment)
+                      candidates=result.candidates)
     combined = collect_tool_evidence([tool])
     assert [item.id for item in combined] == ["first", "second"]
     monkeypatch.setattr(verification, "assess_financial_facts",

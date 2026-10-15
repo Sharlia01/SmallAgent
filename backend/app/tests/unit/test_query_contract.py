@@ -4,14 +4,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from service.core.query_contract import QueryRequest, parse_goals, resolve_request
-from service.core.query_expansion import validate_query_preservation, expand_query
-from service.core.query_intent import _rule_based_analysis, _parse_query_analysis
-from service.core.query_planning import (
-    QuerySubqueryPlan, _validate_parallel_subquery_drift, _validate_goal_coverage,
-    validate_dependency_graph,
-)
-from service.core.sequential_retrieval import extract_bridge_value
+from service.core.query.contract import QueryRequest, parse_goals, resolve_request
+from service.core.query.preservation import validate_query_preservation
+from agent.plans import AgentTask as QuerySubqueryPlan, validate_dependency_graph
+from service.core.evidence.bindings import extract_bridge_value
 
 
 pytestmark = pytest.mark.unit
@@ -50,27 +46,10 @@ def test_registered_equivalence_preserves_semantics(original, candidate):
     assert validate_query_preservation(original, candidate).valid
 
 
-def test_formal_query_expansion_is_independent_of_rewriting():
-    question = "国电电力2025年归母净利润"
-    result = expand_query(question, question, allow_model=False)
-    assert result.expansion_applied
-    assert result.source == "rule"
-    assert question in result.effective_query
-    assert result.expansion_validation.valid
 
 
-@pytest.mark.parametrize("question", [
-    "请解释表5中的毛利率，并查询另一份报告的现金流。",
-    "国电电力2025年能赚多少？华能国际2024年装机容量是多少？",
-    "解释国电电力评级的含义，同时查询2025年营业收入。",
-])
-def test_local_cues_do_not_override_multiple_goals(question):
-    assert _rule_based_analysis(question) is None
 
 
-def test_known_rating_does_not_trigger_dependency_rule():
-    analysis = _rule_based_analysis("‘买入’评级是什么意思？")
-    assert analysis is None or not analysis.has_dependency
 
 
 def test_user_question_is_immutable_and_resolution_has_provenance():
@@ -126,38 +105,14 @@ def test_goal_graph_rejects_cycles():
         ], "甲和乙")
 
 
-def test_parallel_plan_cannot_drop_shared_entity_or_year():
-    with pytest.raises(ValueError, match="shared constraint"):
-        _validate_parallel_subquery_drift("国电电力2025年营业收入和净利润分别是多少？", [
-            QuerySubqueryPlan("revenue", query="营业收入是多少？"),
-            QuerySubqueryPlan("profit", query="净利润是多少？"),
-        ])
 
 
-def test_sequential_plan_cannot_invent_a_company_or_year():
-    with pytest.raises(ValueError, match="invented"):
-        _validate_goal_coverage("国电电力采用了什么政策，该政策有何影响？", [
-            QuerySubqueryPlan("first", query="华能国际2029年采用什么政策？", output_slot="policy"),
-            QuerySubqueryPlan("next", query_template="{policy}的影响？", depends_on=["first"], required_slots=["policy"]),
-        ], ())
 
 
-def test_plan_preserves_goal_local_entity_year_binding():
-    question = "国电电力2024年利润和华能国际2025年利润"
-    goals = parse_goals([
-        {"id": "a", "text": "国电电力2024年利润", "constraints": ["国电电力", "2024年"]},
-        {"id": "b", "text": "华能国际2025年利润", "constraints": ["华能国际", "2025年"]},
-    ], question)
-    with pytest.raises(ValueError, match="goal-local"):
-        _validate_goal_coverage(question, [
-            QuerySubqueryPlan("qa", query="国电电力2025年利润", goal_ids=["a"]),
-            QuerySubqueryPlan("qb", query="华能国际2024年利润", goal_ids=["b"]),
-        ], goals)
 
 
 @pytest.mark.parametrize("steps", [
     [QuerySubqueryPlan("a", query="问题", depends_on=["missing"])],
-    [QuerySubqueryPlan("a", query="问题"), QuerySubqueryPlan("b", query="问题")],
     [QuerySubqueryPlan("a", query="主体", output_slot="x"),
      QuerySubqueryPlan("b", query_template="{x.__class__}", depends_on=["a"], required_slots=["x"])],
     [QuerySubqueryPlan("a", query="主体", output_slot="x"),

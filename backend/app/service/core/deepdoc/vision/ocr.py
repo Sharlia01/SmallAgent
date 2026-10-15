@@ -22,7 +22,7 @@ import os
 
 from huggingface_hub import snapshot_download
 
-from service.core.api.utils.file_utils import get_project_base_directory
+from service.core.resources.paths import get_project_base_directory
 from .operators import *  # noqa: F403
 from . import operators
 import math

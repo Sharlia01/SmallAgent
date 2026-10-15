@@ -30,7 +30,7 @@ def main():
             parser.error(f"Document is not present in this index: {path.name}")
         print(json.dumps({"file": str(path), "existing_chunks": count, "apply": args.apply}, ensure_ascii=False), flush=True)
     if args.apply:
-        from service.core.file_parse import execute_insert_process
+        from service.core.ingestion.pipeline import execute_insert_process
         for path in files:
             result = execute_insert_process(str(path), path.name, args.index_name)
             print(json.dumps({"file": path.name, **result}, ensure_ascii=False), flush=True)

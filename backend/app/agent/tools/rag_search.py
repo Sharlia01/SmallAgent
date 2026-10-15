@@ -1,20 +1,20 @@
 """通过标准 Agent 工具协议提供知识库搜索。"""
 
-from service.core.query_context import QueryContext, query_context_for
-from service.core.retrieval_result import RetrievalResult, adapt_retrieval_records
-from service.core.query_contract import QueryRequest
-from service.core.query_expansion import validate_query_preservation
+from service.core.query.context import QueryContext
+from service.core.query.contract import RetrievalTask
+from service.core.retrieval.result import RetrievalResult, adapt_retrieval_records
 
 from agent.schemas import ToolResult
-from service.core.retrieval import (
+from service.core.retrieval.pipeline import (
     DEFAULT_PAGE_SIZE,
     retrieve_evidence,
 )
 from utils import logger
+from service.core.runtime.context import QueryBudgetExceeded
 
 
 MAX_RAG_RESULTS = 20
-EMPTY_RESULT_MESSAGE = "未在当前用户的知识库中找到足以完整回答问题的证据。"
+EMPTY_RESULT_MESSAGE = "当前查询未在用户知识库中找到匹配片段。"
 FAILED_RESULT_MESSAGE = "知识库检索暂时不可用。"
 
 
@@ -63,10 +63,12 @@ class RagSearchTool:
         query: str,
         top_k: int = DEFAULT_PAGE_SIZE,
         _context: QueryContext | None = None,
+        _task: RetrievalTask | None = None,
     ) -> ToolResult:
         """搜索当前绑定用户的知识库。
 
         可预期的运行故障通过 ToolResult 返回，便于 Agent 观察失败并选择回退路径。
+        工具只使用已准备的搜索任务，不创建或补全用户需求。
         """
         normalized_query = query.strip() if isinstance(query, str) else ""
         if not normalized_query or len(normalized_query) > 12000:
@@ -90,15 +92,16 @@ class RagSearchTool:
             )
 
         try:
-            context = _context or query_context_for(QueryRequest.from_user(normalized_query))
             retrieve = self._retriever or retrieve_evidence
-            arguments = {"context": context} if _context is not None or self._retriever is None else {}
+            arguments = {"task": _task} if _task is not None else {}
             output = retrieve(str(self._user_id), normalized_query, page_size=top_k, **arguments)
             if isinstance(output, RetrievalResult):
                 result = output
             else:
                 chunks, diagnostics = output
-                result = adapt_retrieval_records(context, chunks, diagnostics)
+                result = adapt_retrieval_records(chunks, diagnostics, task=_task)
+        except QueryBudgetExceeded:
+            raise
         except Exception as error:
             logger.exception(
                 "Agent RAG 工具检索失败: user_id=%s, query=%s",
@@ -112,23 +115,22 @@ class RagSearchTool:
                 diagnostics={"error_type": type(error).__name__},
             )
 
-        if _context is not None:
-            result.diagnostics["agent_query"] = {
-                "query": normalized_query,
-                "validation": validate_query_preservation(context.question, normalized_query).__dict__,
-                "used_as_user_question": False,
-            }
         return ToolResult(
             tool_name=self.name, query=normalized_query,
-            content=result.clarification or _format_evidence(result.evidence),
-            evidence=result.evidence, candidates=result.candidates, assessment=result.assessment,
-            clarification=result.clarification,
+            content=_format_evidence(result.evidence),
+            evidence=result.evidence, candidates=result.candidates,
+            task=_task or result.task,
             diagnostics={"result_count": len(result.evidence), "top_k": top_k, **result.diagnostics},
         )
 
     def run_for_context(self, context: QueryContext, *, query: str, top_k: int = DEFAULT_PAGE_SIZE) -> ToolResult:
-        """共享的业务上下文由服务端传入，不暴露给模型工具参数。"""
+        """服务端传入已准备的共享上下文，不暴露给模型工具参数。"""
         return self.run(query=query, top_k=top_k, _context=context)
+
+    def run_for_task(self, context: QueryContext, *, task: RetrievalTask,
+                     top_k: int = DEFAULT_PAGE_SIZE) -> ToolResult:
+        """显式区分原始用户需求和本次工具查询。"""
+        return self.run(query=task.query, top_k=top_k, _context=context, _task=task)
 
 
 def search_knowledge_base(

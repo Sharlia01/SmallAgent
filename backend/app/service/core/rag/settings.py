@@ -16,7 +16,7 @@
 #
 import os
 import logging
-from service.core.api.utils.file_utils import get_project_base_directory
+from service.core.resources.paths import get_project_base_directory
 
 # 服务端配置。
 RAG_CONF_PATH = os.path.join(get_project_base_directory(), "conf")

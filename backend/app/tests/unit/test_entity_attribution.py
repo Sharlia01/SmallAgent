@@ -5,17 +5,18 @@ from tests.evidence_helpers import make_evidence_record, make_tool_result
 import json
 import pytest
 
-from service.core.entity_attribution import (
+from service.core.entities.attribution import (
     EntityRegistry, annotate_chunk, annotate_document, get_entity_registry,
 )
-from service.core import file_parse
-from service.core.retrieval import format_retrieved_chunk
-from service.core.evidence_sufficiency import _prepare_evidence
+from service.core.ingestion import pipeline as file_parse
+from service.core.persistence import evidence_store
+from service.core.retrieval.pipeline import format_retrieved_chunk
+from service.core.evidence.sufficiency import _prepare_evidence
 from service.core.rag.nlp.search_v2 import Dealer
 from service.core.rag.utils.es_conn import ESConnection
-from service.core.evidence_adapter import collection_from_records, evidence_from_record, reference_records
-from agent.orchestrator import collect_tool_evidence
-from service.core.evidence_adapter import reference_records
+from service.core.evidence.adapter import collection_from_records, evidence_from_record, reference_records
+from agent.loop import collect_tool_evidence
+from service.core.evidence.adapter import reference_records
 from agent.schemas import ToolResult
 
 
@@ -166,12 +167,12 @@ def test_new_annotations_survive_ingestion_parent_storage_and_retrieval(monkeypa
     original = json.dumps(row, ensure_ascii=False, sort_keys=True)
     monkeypatch.setattr(file_parse, "get_entity_registry", lambda: registry)
     monkeypatch.setattr(file_parse, "batch_generate_embeddings", lambda texts: [[0.1] * 512 for _ in texts])
-    monkeypatch.setattr(file_parse, "get_project_base_directory", lambda: str(tmp_path))
+    monkeypatch.setattr(evidence_store, "get_project_base_directory", lambda: str(tmp_path))
     indexed = file_parse.process_items([row], "腾讯.pdf", "tenant-1")[0]
     assert indexed["subject_entity_ids"] == ["alibaba"]
     assert indexed["document_subject_entity_ids"] == ["tencent"]
     assert json.dumps(row, ensure_ascii=False, sort_keys=True) == original
-    parent = file_parse.load_table_object(indexed["table_object_ref_kwd"])
+    parent = evidence_store.load_table_object(indexed["table_object_ref_kwd"])
     assert parent["entity_attribution"]["rows"][0]["subject_entity_ids"] == ["alibaba"]
     assert parent["entity_attribution"]["document"]["document_subject_entity_ids"] == ["tencent"]
     # Elasticsearch 必须保留字典结构，否则来源证明会退化为 Python 字符串。

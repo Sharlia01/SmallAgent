@@ -1,6 +1,6 @@
-from service.core.evidence_verification import verify_evidence
-from dataclasses import asdict
-from service.core.evidence_adapter import collection_from_records
+from service.core.evidence.verification import verify_evidence
+from dataclasses import asdict, replace
+from service.core.evidence.adapter import collection_from_records
 from tests.evidence_helpers import make_evidence_record, make_tool_result, make_query
 import json
 from types import SimpleNamespace
@@ -10,14 +10,16 @@ import pytest
 from agent.orchestrator import AgentOrchestrator, AgentRun
 from tests.evidence_helpers import messages_for_records as build_answer_messages
 from agent.schemas import ToolResult
-from service.core import financial_facts, evidence_sufficiency
-from service.core.entity_attribution import EntityRegistry, annotate_document
-from service.core.financial_facts import (
-    assess_financial_facts, project_fact_context,
+from service.core.finance import facts as financial_facts
+from service.core.evidence import sufficiency as evidence_sufficiency
+from service.core.entities.attribution import EntityRegistry, annotate_document
+from service.core.finance.facts import (
+    project_fact_context,
 )
-from service.core.query_contract import QueryGoal
-from service.core.query_runtime import query_runtime
-from service.core.table_context import expand_table_chunk_context
+from tests.financial_helpers import assess_for_question as assess_financial_facts, financial_spec
+from service.core.query.contract import QueryGoal
+from service.core.runtime.context import query_runtime
+from service.core.retrieval.table_context import expand_table_chunk_context
 
 
 pytestmark = pytest.mark.unit
@@ -30,7 +32,7 @@ def registry(monkeypatch):
         {"entity_id": "B", "canonical_name": "B公司", "kind": "company", "stock_codes": ["000002.SH"]},
     ]})
     monkeypatch.setattr(financial_facts, "get_entity_registry", lambda: registry)
-    monkeypatch.setattr("service.core.entity_attribution.get_entity_registry", lambda: registry)
+    monkeypatch.setattr("service.core.entities.attribution.get_entity_registry", lambda: registry)
     return registry
 
 
@@ -135,7 +137,7 @@ def test_conflicting_values_and_unknown_scope_are_distinct(registry):
     assert bundle.goal_coverage[0]["status"] == "conflict"
     unknown = [chunk("B公司2023年营业收入为80亿元。", "one"),
                {**chunk("B公司2023年营业收入为81亿元。", "two"), "document_id": "other-report"}]
-    assert assess_financial_facts("B公司2023年营业收入是多少？", collection_from_records(unknown)).goal_coverage[0]["status"] == "missing"
+    assert assess_financial_facts("B公司2023年营业收入是多少？", collection_from_records(unknown)).goal_coverage[0]["status"] == "ambiguous"
 
 
 def test_unit_normalization_deduplicates_equivalent_values(registry):
@@ -225,18 +227,20 @@ def test_final_fact_gate_rejects_wrong_company_despite_verified_tool_result(regi
         )],
         metadata={"query_contract": {"resolved_question": question}, "evidence_sufficiency": {"sufficient": True}},
     )
-    monkeypatch.setattr(orchestrator, "_run_agent", lambda **kwargs: AgentRun(tool_results=[tool_result]))
+    monkeypatch.setattr(orchestrator, "_run_agent", lambda **kwargs: verified_agent_run(results=[tool_result], **kwargs))
     result = orchestrator.run(session_id="s", question=question)
     assert result.response_mode == "refuse" and result.answer_stream is None
     assert calls == []
 
 
 def test_session_documents_also_use_fact_selection(registry, monkeypatch):
+    # 本例只验证财务事实选择；共享需求启用的语义核验另有覆盖。
+    monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_ENABLED", "false")
     calls = []
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: calls.append(kw) or [])))
     orchestrator = AgentOrchestrator(planner_client=client, planner_model="planner", answer_client=client,
                                      answer_model="answer", tools=[])
-    monkeypatch.setattr(orchestrator, "_run_agent", lambda **kwargs: AgentRun())
+    monkeypatch.setattr(orchestrator, "_run_agent", lambda **kwargs: verified_agent_run(**kwargs))
     result = orchestrator.run(session_id="s", question="B公司2023年营业收入是多少？",
                               session_context="A公司2023年营业收入为120亿元，B公司2023年营业收入为80亿元。")
     assert result.response_mode == "answer"
@@ -340,17 +344,17 @@ def test_agent_union_keeps_goals_and_cannot_bypass_the_final_fact_gate(registry,
             metadata={"query_contract": {"resolved_question": question}, "query_intent": {"goals": [g.to_dict() for g in goals]},
                       "evidence_sufficiency": {"sufficient": True}}))
     context = make_query(question, goals)
-    monkeypatch.setattr("agent.orchestrator.query_context_for", lambda request: context)
+    monkeypatch.setattr("agent.orchestrator.prepare_query_context", lambda *args, **kwargs: context)
     received = []
     def check(question, evidence, **kwargs):
         received.append(kwargs["goals"])
         return evidence_sufficiency.EvidenceAssessment(True, "模拟语义放行", [], [1, 2], "model", 2, ["a", "b"])
-    monkeypatch.setattr("service.core.evidence_verification.assess_evidence_sufficiency", check)
+    monkeypatch.setattr("service.core.evidence.verification.assess_evidence_sufficiency", check)
     calls = []
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: calls.append(kw))))
     orchestrator = AgentOrchestrator(planner_client=client, planner_model="planner", answer_client=client,
                                      answer_model="answer", tools=[])
-    monkeypatch.setattr(orchestrator, "_run_agent", lambda **kwargs: AgentRun(tool_results=results))
+    monkeypatch.setattr(orchestrator, "_run_agent", lambda **kwargs: verified_agent_run(results=results, **kwargs))
     execution = orchestrator.run(session_id="s", question=question)
     assert execution.response_mode == "refuse" and calls == []
     assert received == []  # 事实缺口直接拒绝，不进入语义模型。
@@ -367,7 +371,7 @@ def test_successful_single_kb_result_does_not_skip_session_fact_check(registry, 
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=lambda **kw: calls.append(kw))))
     orchestrator = AgentOrchestrator(planner_client=client, planner_model="planner", answer_client=client,
                                      answer_model="answer", tools=[])
-    monkeypatch.setattr(orchestrator, "_run_agent", lambda **kwargs: AgentRun(tool_results=[result]))
+    monkeypatch.setattr(orchestrator, "_run_agent", lambda **kwargs: verified_agent_run(results=[result], **kwargs))
     execution = orchestrator.run(session_id="s", question=question, session_context="B公司2023年营业收入为81亿元。")
     assert execution.response_mode == "refuse" and calls == []
 
@@ -384,7 +388,7 @@ def test_approximate_value_is_preserved_and_not_declared_an_exact_conflict(regis
     assert bundle.sufficient and bundle.facts[0].value_qualifier == "approximate"
     assert "数值：约80亿元" in project_fact_context(collection_from_records([raw]), bundle)[0].text
     exact = chunk("B公司2023年实际合并口径营业收入为80.03亿元。", "exact")
-    assert assess_financial_facts("B公司2023年营业收入是多少？", collection_from_records([raw, exact])).goal_coverage[0]["status"] == "missing"
+    assert assess_financial_facts("B公司2023年营业收入是多少？", collection_from_records([raw, exact])).goal_coverage[0]["status"] == "ambiguous"
 
 
 def test_financial_explanation_can_keep_non_numeric_context(registry):
@@ -435,8 +439,8 @@ def test_model_candidate_claim_and_cooccurrence_cannot_override_a_rule_relations
     text = "A公司2023年营业收入为120亿元，B公司2023年营业收入为80亿元，其经营稳健。"
     client, calls = candidate_client(text, value="120")
     # 即使模型错误地同意候选，也不能覆盖明确的 B 公司对应 80 的规则绑定。
-    from service.core.financial_fact_models import extract_and_verify_candidates
-    requirements = financial_facts.build_fact_requirements("B公司2023年营业收入是多少？")
+    from service.core.finance.model_extraction import extract_and_verify_candidates
+    requirements = list(financial_spec("B公司2023年营业收入是多少？").facts)
     with query_runtime():
         facts = extract_and_verify_candidates(collection_from_records([chunk(text)]), requirements, client, registry=registry)
         assert facts[0].attribution_status == "unknown" and len(calls) == 2
@@ -465,17 +469,17 @@ def test_unnamed_target_in_mixed_company_sources_requires_confirmation(registry)
     assert bundle.applicable and not bundle.sufficient
 
 
-def test_unnamed_target_can_use_reliable_report_subject_but_not_filename(registry):
+def test_unnamed_target_does_not_inherit_report_without_declared_binding(registry):
     raw = chunk("B公司2023年营业收入为80亿元。")
     assert not assess_financial_facts("2023年营业收入是多少？", collection_from_records([raw])).sufficient
     document = annotate_document([{"content_with_weight": "报告主体：B公司"}], "B公司.pdf", registry)
-    assert assess_financial_facts("2023年营业收入是多少？", collection_from_records([{**raw, **document}])).sufficient
+    assert not assess_financial_facts("2023年营业收入是多少？", collection_from_records([{**raw, **document}])).sufficient
     assert not assess_financial_facts("它2023年营业收入是多少？", collection_from_records([{**raw, **document}])).sufficient
 
 
 def test_real_peer_company_in_another_company_report_is_bound_to_its_row():
-    from pathlib import Path
-    registry = EntityRegistry(json.loads((Path(financial_facts.__file__).parent / "conf/entity_registry.json").read_text()))
+    from service.core.resources.paths import config_file
+    registry = EntityRegistry(json.loads(config_file("entity_registry.json").read_text()))
     rows = [{"row_index": 5, "headers": ["公司", "2023年营业收入（亿元）"], "cells": ["龙源电力", "80"]}]
     hit, parent = table(rows)
     hit["document_name"] = "国电电力.pdf"
@@ -505,18 +509,13 @@ def test_numeric_why_question_still_requires_attributed_facts(registry):
     assert bundle.applicable and not bundle.sufficient
 
 
-def test_company_list_shares_explicit_scope_but_separate_clauses_do_not(registry):
-    requirements = financial_facts.build_fact_requirements("比较A公司和B公司2023年合并口径营业收入")
-    assert {requirement.statement_scope for requirement in requirements} == {"consolidated"}
-    requirements = financial_facts.build_fact_requirements("A公司2023年合并口径营业收入是多少，B公司2023年营业收入是多少？")
-    assert [(requirement.entity_id, requirement.statement_scope) for requirement in requirements] == [("A", "consolidated"), ("B", "unknown")]
-
-
 def test_revenue_growth_percentage_is_not_a_revenue_amount(registry):
     raw = expand([{"row_index": 2, "headers": ["公司", "2023年营业收入同比增速（%）"], "cells": ["B公司", "20"]}])
     bundle = assess_financial_facts("B公司2023年营业收入是多少？", collection_from_records([raw]))
     assert not bundle.sufficient
-    assert bundle.facts[0].metric == "营业收入/同比"
+    assert bundle.facts[0].metric == "营业收入"
+    assert bundle.facts[0].measure_kind == "growth_rate"
+    assert bundle.facts[0].comparison_basis == "year_over_year"
 
 
 def test_explicit_snapshot_date_is_not_collapsed_into_an_annual_period(registry):
@@ -553,3 +552,143 @@ def test_company_name_is_not_a_business_scope():
     bundle = assess_financial_facts("风电股份2023年营业收入是多少？",
                               collection_from_records([chunk("风电股份2023年营业收入为80亿元。")]), registry=registry)
     assert bundle.sufficient and bundle.facts[0].business_scope == "unknown"
+
+
+@pytest.mark.parametrize(("metric", "value"), [("存货", "119"), ("预付账款", "14"), ("固定资产", "265")])
+def test_supported_balance_metrics_use_their_own_row(registry, metric, value):
+    rows = [
+        {"row_index": 2, "headers": ["指标", "B公司 / 2025E"], "cells": ["应收票据及账款", "17"]},
+        {"row_index": 3, "headers": ["指标", "B公司 / 2025E"], "cells": [metric, value]},
+    ]
+    bundle = assess_financial_facts(f"B公司2025E{metric}是多少？", collection_from_records([expand(rows)]))
+    assert bundle.sufficient
+    assert [f.value for f in bundle.facts if f.fact_id in bundle.selected_fact_ids] == [value]
+
+
+def test_growth_rate_lookup_covers_every_year_without_calculating(registry):
+    rows = [{"row_index": 2, "headers": ["指标", "B公司 / 2025E", "B公司 / 2026E", "B公司 / 2027E"],
+             "cells": ["营业收入增长率（%）", "24.81", "20.96", "15.68"]}]
+    question = "B公司2025E-2027E营业收入增长率分别是多少？"
+    bundle = assess_financial_facts(question, collection_from_records([expand(rows)]))
+    assert bundle.sufficient and not bundle.derived_evidence
+    assert {r.period["year"] for r in bundle.requirements} == {2025, 2026, 2027}
+    assert {f.value for f in bundle.facts if f.fact_id in bundle.selected_fact_ids} == {"24.81", "20.96", "15.68"}
+    rows[0]["cells"][2] = "—"
+    missing = assess_financial_facts(question, collection_from_records([expand(rows)]))
+    assert not missing.sufficient
+    assert any("2026" in reason for reason in missing.missing_requirements)
+
+
+@pytest.mark.parametrize("text", ["B公司2025年营业收入为100亿元。", "B公司2025年营业收入环比增长率为20%。"])
+def test_yoy_rate_requires_its_own_measure_and_basis(registry, text):
+    bundle = assess_financial_facts("B公司2025年营业收入同比增长率是多少？", collection_from_records([chunk(text)]))
+    assert bundle.applicable and not bundle.sufficient
+
+
+def test_positive_decline_magnitude_is_not_a_positive_growth_rate(registry):
+    text = "B公司2025年营业收入同比下降20%。"
+    bundle = assess_financial_facts("B公司2025年营业收入同比增长率是多少？", collection_from_records([chunk(text)]))
+    assert bundle.applicable and not bundle.sufficient
+
+
+def test_operating_cashflow_label_does_not_imply_net_cashflow(registry):
+    text = "B公司2025年经营现金流增长率为20.47%。"
+    evidence = collection_from_records([chunk(text)])
+    assert assess_financial_facts("B公司2025年经营现金流增长率是多少？", evidence).sufficient
+    assert not assess_financial_facts("B公司2025年经营活动现金流量净额增长率是多少？", evidence).sufficient
+
+
+def test_text_growth_rate_and_amount_remain_distinct_in_answer_context(registry):
+    raw = chunk("B公司2025年营业收入为100亿元。B公司2025年营业收入同比增长率为20%。")
+    evidence = collection_from_records([raw])
+    bundle = assess_financial_facts("B公司2025年营业收入同比增长率是多少？", evidence)
+    assert bundle.sufficient
+    projected = project_fact_context(evidence, bundle)[0].text
+    assert "数值：20%" in projected and "growth_rate" in projected
+    assert "100亿元" not in projected
+
+
+def test_generic_rate_with_conflicting_comparison_bases_is_ambiguous(registry):
+    text = "B公司2025年营业收入同比增长率为20%。B公司2025年营业收入环比增长率为20%。"
+    assert not assess_financial_facts("B公司2025年营业收入增长率是多少？", collection_from_records([chunk(text)])).sufficient
+
+
+def test_rate_without_percent_unit_does_not_borrow_table_money_unit(registry):
+    rows = [{"row_index": 2, "headers": ["公司", "2025年营业收入增长率"], "cells": ["B公司", "20"]}]
+    assert not assess_financial_facts("B公司2025年营业收入增长率是多少？", collection_from_records([expand(rows)])).sufficient
+
+
+def test_unknown_metric_cannot_be_silently_removed_by_query_planning(registry):
+    raw = chunk("B公司2025年营业收入为100亿元。")
+    goals = (QueryGoal("revenue", "B公司2025年营业收入是多少"),)
+    bundle = assess_financial_facts("B公司2025年营业收入和净资产收益率分别是多少？", collection_from_records([raw]), goals)
+    assert bundle.applicable and not bundle.sufficient
+    assert bundle.unresolved_targets and bundle.missing_requirements
+
+
+def test_unknown_only_financial_target_requires_verification(registry):
+    bundle = assess_financial_facts("B公司2025年资本充足率是多少？", collection_from_records([]))
+    assert bundle.applicable and not bundle.sufficient and not bundle.requirements
+    assert bundle.unresolved_targets[0]["reason"] == "unsupported_metric"
+
+
+def test_qualitative_question_does_not_request_an_unknown_numeric_fact(registry):
+    bundle = assess_financial_facts("B公司资本充足率下降的原因是什么？", collection_from_records([]))
+    assert not bundle.applicable
+
+
+@pytest.mark.parametrize("question", ["计算B公司2024年和2025年营业收入增长率", "计算B公司2024-2025年营业收入增长率"])
+def test_calculated_growth_uses_amounts_not_disclosed_percentages(registry, question):
+    rows = [
+        {"row_index": 2, "headers": ["指标", "B公司 / 2024A", "B公司 / 2025A"], "cells": ["营业收入", "100", "120"]},
+        {"row_index": 3, "headers": ["指标", "B公司 / 2024A", "B公司 / 2025A"], "cells": ["营业收入增长率（%）", "10", "20"]},
+    ]
+    bundle = assess_financial_facts(question, collection_from_records([expand(rows)]))
+    assert bundle.sufficient
+    assert bundle.derived_evidence[0]["result"] == "20.0"
+    assert {i["measure_kind"] for i in bundle.derived_evidence[0]["inputs"]} == {"level"}
+
+
+def test_rate_difference_is_in_percentage_points(registry):
+    rows = [{"row_index": 2, "headers": ["指标", "B公司 / 2024A", "B公司 / 2025A"],
+             "cells": ["营业收入同比增长率（%）", "10", "20"]}]
+    bundle = assess_financial_facts("B公司2024年和2025年营业收入同比增长率相差多少？", collection_from_records([expand(rows)]))
+    assert bundle.sufficient
+    assert bundle.derived_evidence[0]["result"] == "10"
+    assert bundle.derived_evidence[0]["unit"] == "个百分点"
+
+
+def test_historical_compound_metric_is_read_without_restoring_verification_scope(registry):
+    from service.core.evidence.adapter import assessment_from_record
+    bundle = assess_financial_facts("B公司2025年营业收入是多少？", collection_from_records([chunk("B公司2025年营业收入为100亿元。")]))
+    record = bundle.to_dict()
+    fact = record["facts"][0]
+    fact.pop("measure_kind")
+    fact.pop("comparison_basis")
+    fact["metric"] = "营业收入/同比"
+    assessment = assessment_from_record({"financial_fact_bundle": record})
+    assert assessment.facts.facts[0].metric == "营业收入"
+    assert assessment.facts.facts[0].measure_kind == "growth_rate"
+    assert not assessment.query_version
+
+
+def test_unknown_financial_target_cannot_bypass_the_shared_verification_entry(registry):
+    query = make_query("B公司2025年资本充足率是多少？")
+    assessment = verify_evidence(query, collection_from_records([chunk("B公司2025年资本充足率是20%。")]), require_semantic=False)
+    assert not assessment.sufficient
+    assert assessment.facts.unresolved_targets
+
+
+def verified_agent_run(context, results=(), session_id="s", session_context=None):
+    """财务核验现由 Agent 循环持有；夹具沿用真实核验入口，不伪造通过报告。"""
+    from agent.loop import AgentLoop, collect_tool_evidence
+    from service.core.answering.answer_context import session_evidence
+    from service.core.query.contract import QueryUnderstanding, QueryGoal
+    if context.understanding is None:
+        context.understanding = QueryUnderstanding((QueryGoal("whole", context.question),))
+    context.understanding = replace(context.understanding, financial=financial_spec(context.question, context.goals))
+    evidence = collect_tool_evidence(list(results))
+    evidence.merge(session_evidence(session_id, session_context))
+    run = AgentRun(tool_results=list(results), evidence=evidence, query=context)
+    run.assessment = AgentLoop._assess(context, run)
+    return run

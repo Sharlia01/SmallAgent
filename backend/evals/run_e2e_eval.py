@@ -38,23 +38,23 @@ from run_retrieval_eval import (  # noqa: E402
     load_dataset,
     select_samples,
 )
-from service.core.citation_evaluation import evaluate_citations  # noqa: E402
-from service.core.end_to_end_evaluation import (  # noqa: E402
+from evaluation.citations import evaluate_citations  # noqa: E402
+from evaluation.end_to_end import (  # noqa: E402
     E2E_RESULT_SCHEMA_VERSION,
     build_e2e_summary,
     evaluate_answer_quality,
     evaluate_refusal,
     evaluate_sufficiency,
 )
-from service.core.faithfulness_evaluation import (  # noqa: E402
+from evaluation.faithfulness import (  # noqa: E402
     evaluate_faithfulness,
 )
-from service.core.grounded_answer import (  # noqa: E402
+from service.core.answering.grounded_answer import (  # noqa: E402
     DEFAULT_ANSWER_MODEL,
     execute_grounded_turn,
 )
-from service.core.agent_evaluation import execute_agent_turn  # noqa: E402
-from service.core.retrieval_evaluation import (  # noqa: E402
+from evaluation.agent import execute_agent_turn  # noqa: E402
+from evaluation.retrieval import (  # noqa: E402
     build_error_case,
     evaluate_retrieval_case,
     resolve_metric_ks,
@@ -94,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-rrf-k", type=int, default=10)
     parser.add_argument("--match-threshold", type=float, default=0.8)
     parser.add_argument("--answer-model", default=None)
-    parser.add_argument("--execution-mode", choices=["grounded", "agent"], default="grounded")
+    parser.add_argument("--execution-mode", choices=["grounded", "agent"], default="agent")
     parser.add_argument("--planner-model", default=None)
     parser.add_argument("--judge-model", default=None)
     parser.add_argument("--judge-timeout", type=float, default=20.0)
@@ -458,10 +458,7 @@ def main() -> int:
             "judge_model": judge_model,
             "judge_enabled": judge_model is not None,
             "faithfulness_enabled": judge_model is not None,
-            "sequential_retrieval_enabled": environment_flag(
-                "RAG_SEQUENTIAL_RETRIEVAL_ENABLED",
-                True,
-            ),
+            "execution_scope": "agent_knowledge_base",
             "bridge_extraction_model": os.getenv(
                 "RAG_BRIDGE_EXTRACTION_MODEL",
                 "qwen3.7-flash-2026-07-15",

@@ -1,36 +1,31 @@
 """用来源记录构造测试业务对象，避免测试依赖生产序列化的内部实现。"""
 
 from dataclasses import replace
+from tests.financial_helpers import financial_spec
 from domain.evidence import EvidenceCollection
 from agent.schemas import ToolResult
-from service.core.evidence_adapter import collection_from_records
-from service.core.evidence_pipeline import (
+from service.core.evidence.adapter import collection_from_records
+from service.core.answering.answer_context import (
     build_answer_context, build_answer_messages as format_messages,
 )
-from service.core.evidence_verification import verify_evidence
-from service.core.evidence_adapter import assessment_from_record
-from service.core.evidence_assessment import finalize_assessment
-from service.core.financial_facts import assess_financial_facts, financial_rejection
-from service.core.query_context import QueryContext
-from service.core.query_contract import QueryRequest, QueryGoal
-from service.core.query_intent import QueryAnalysis
-from service.core.query_planning import PreparedRetrievalRequest, RetrievalPlan, RetrievalRoute
+from service.core.evidence.verification import verify_evidence
+from service.core.evidence.adapter import assessment_from_record
+from service.core.evidence.assessment import finalize_assessment
+from service.core.finance.facts import assess_financial_facts, financial_rejection
+from service.core.query.context import QueryContext
+from service.core.query.contract import QueryRequest, QueryGoal, QueryUnderstanding
 
 
 def make_query(question, goals=()):
-    query = QueryContext(QueryRequest.from_user(question))
-    if goals:
-        analysis = QueryAnalysis("lookup_query", False, len(goals), True, False, True, "测试目标", "rule", tuple(goals))
-        query.prepared = PreparedRetrievalRequest(analysis, RetrievalRoute("single", "测试", "rule"), RetrievalPlan("single"))
-    return query
+    return QueryContext(QueryRequest.from_user(question), QueryUnderstanding(tuple(goals), requires_evidence=False, source="rule", financial=financial_spec(question, goals)))
 
 
 def bind_assessment(query, evidence, assessment, *, require_semantic=None):
     if not assessment.query_version and not assessment.facts.applicable:
-        facts = assess_financial_facts(query.question, evidence, query.goals)
-        assessment = (financial_rejection(evidence, facts, query.goals)
-                      if facts.applicable and not facts.sufficient and assessment.sufficient
-                      else replace(assessment, facts=facts))
+        fact_assessment = assess_financial_facts(query.financial_requirements, evidence)
+        assessment = (financial_rejection(evidence, fact_assessment, query.goals)
+                      if fact_assessment.applicable and not fact_assessment.sufficient and assessment.sufficient
+                      else replace(assessment, facts=fact_assessment))
     if require_semantic is None:
         require_semantic = assessment.require_semantic if assessment.require_semantic is not None else True
     return finalize_assessment(query, evidence, assessment, require_semantic=require_semantic)
@@ -54,17 +49,8 @@ def make_tool_result(*, tool_name, query, content, sources=(), metadata=None, **
                     "content_with_weight": content, "source_type": "web", "url": sources[0].get("url"), "web_sources": links}]
     evidence = collection_from_records(sources, query=query)
     candidates = collection_from_records(metadata.get("candidate_chunks") or [], query=query)
-    assessment = None
-    if metadata.get("evidence_sufficiency"):
-        question = (metadata.get("query_contract") or {}).get("resolved_question") or query
-        goals = tuple(QueryGoal(**{key: tuple(value) if key != "text" and key != "id" else value
-                                   for key, value in item.items()})
-                      for item in (metadata.get("query_intent") or {}).get("goals") or [])
-        context = make_query(question, goals)
-        assessment = bind_assessment(context, candidates or evidence, assessment_from_record(metadata["evidence_sufficiency"]))
-    return ToolResult(tool_name, query, content, evidence=evidence, candidates=candidates, assessment=assessment,
-                      clarification=metadata.get("clarification"), diagnostics={key: value for key, value in metadata.items()
-                      if key not in {"query_contract", "query_intent", "evidence_sufficiency", "candidate_chunks", "clarification", "response_mode"}}, **kwargs)
+    return ToolResult(tool_name, query, content, evidence=evidence, candidates=candidates,
+                      diagnostics={key: value for key, value in metadata.items() if key != "candidate_chunks"}, **kwargs)
 
 
 def messages_for_records(question, records, history, *, goals=()):

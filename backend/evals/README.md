@@ -1,6 +1,8 @@
 # RAG 评估
 
-本目录保存 RAG 系统的离线评估数据和后续评估脚本。JSONL 是评测集的主格式，每行是一个完整、独立的 JSON 对象。
+本目录保存 Agent RAG 系统的离线评估数据和评估脚本。JSONL 是评测集的主格式，每行是一个完整、独立的 JSON 对象。
+
+当前边界：`run_retrieval_eval.py` 只执行给定查询的召回与排序；`run_e2e_eval.py` 默认运行完整 Agent，包括理解、初始规划、工具调用、证据核验、缺口补查和回答。纯检索不执行意图识别或充分性判定。检索结果结构版本为 `3.0`，端到端结果结构版本为 `2.0`；不应与旧版内含规划的检索成绩直接比较。
 
 ## 当前数据集
 
@@ -100,24 +102,11 @@ v2 校验还会检查证据 ID 唯一性、claim 到 evidence 的引用关系、
 
 评测脚本通过统一入口 `retrieve_evidence()` 获取 `RetrievalResult`，在评测输出处使用 `retrieval_record()` 生成 JSON。结果保留 `chunk_id`、各召回分支的原始排名与分数、RRF 分数、最终语义重排分数、候选总数及查询诊断。当前评测集尚未把标准证据映射到 ES 中的稳定 `chunk_id`，因此评测脚本先校验文档名，再对返回片段和 `relevant_evidence[].text` 做规范化文本匹配。完成第一轮基线并确认切块稳定后，可以把标准 chunk ID 补入证据对象，进一步减少模糊匹配。
 
-检索入口使用不可变用户需求、语义目标、确定性路由、计划校验和有界执行。支持 `single`、`parallel`、`sequential`、`graph`、`clarify`；独立节点可并发，混合图最多 8 个节点。结果保留上下文绑定、局部约束、每步证据来源、预算与缺口补查诊断。改写与扩展开关相互独立，完整无变换基线应同时关闭 `QUERY_REWRITE_ENABLED` 和 `QUERY_EXPANSION_ENABLED`。完整流程、降级行为和当前边界见 [查询管线设计](../docs/query_pipeline.md)。
+当前检索入口只执行给定查询，包括混合召回、重排、过滤、固定别名扩展及表格上下文补全。它不理解需求、不生成子查询、不补查，也不判定答案是否充分。设置 `RETRIEVAL_ALIAS_EXPANSION_ENABLED=false` 可关闭固定别名扩展。原模型改写和扩展开关已移除。
 
-每一跳的语义重排后都会进行第二阶段加权 RRF：语义重排名次权重为 `0.4`，第一阶段检索 RRF 名次权重为 `0.6`，默认平滑常数为 `10`。这种做法只融合两边的名次，不直接混合量纲不同的原始分数。再执行确定性的限定条件兼容性检查，当前覆盖时间范围、实际值/预测值/目标、表图定位符和明确实体；候选未出现可比限定时记为 `unknown`，只有出现明确互斥限定时才记为 `conflict`。明确冲突先降级，其余候选按第二阶段融合分排序。
+端到端问答由 Agent 一次生成需求和初始计划，统一执行并行、多跳和跨工具任务，根据累计证据缺口补查。知识库限定评测只注册知识库工具。历史 `grounded` 参数作为入口名称继续接受，但调用同一 Agent 流程，默认使用 `agent`；不再保留另一套 RAG 分析路径。模块边界见 [核心架构说明](../app/service/core/README.md#agent-统一理解与规划)。
 
-递进式检索还会把两跳结果去重，以用户原始问题对合并候选统一重排一次，
-并按原问题重新检查限定条件。不同跳的原始分数不直接比较。首页容量允许时，
-保留第一跳已校验的桥接来源片段以及第二跳按本跳排名选出的独立证据，
-其余位置按统一排名补齐；最后按统一排名展示选中的证据，不按检索跳次固定置顶。
-统一重排不再施加相似度阈值，以免丢失对原问题分数较低、但回答所必需的辅助证据。
-`top_k=1` 时无法保证两跳覆盖，按原问题排名返回一条结果。
-
-`retrieval.retrieval_fusion.final_rerank` 记录原始问题、候选数、判定来源、
-保留的证据 ID 和失败原因。候选数最多为两跳返回片段数之和，去重后只请求一次模型。
-每个 chunk 的 `final_ranking` 记录统一重排名次与 `coverage_reserved`；
-本跳的语义分数、RRF 分数、融合名次和限定诊断保存在 `sequential_subqueries` 中。
-如果额外重排调用失败，保留已取得的两跳证据，按各跳名次做等权 RRF 回退
-（使用 `rrf_k`）；`final_rerank.source=fallback`，统一语义分数为 `null`，
-`final_ranking.fallback_rrf_score` 记录回退分数。
+新纯检索结果与旧版包含规划、补查、充分性过滤的结果不可直接比较。检索结果表示命中而非允许回答，端到端评测才统计最终拒答和回答质量。
 
 对于 `evidence_type=figure` 的样本，`text` 是人工核对图片后写下的视觉事实。当前检索评分优先匹配 `locator`（图标题），因此命中表示找到了目标图的文字定位信息，不代表片段已保留视觉事实或足以回答问题。图表样本应与纯文本、表格样本分开统计。
 
@@ -131,7 +120,7 @@ v2 校验还会检查证据 ID 唯一性、claim 到 evidence 的引用关系、
 
 ## 运行检索评估
 
-评测脚本直接调用生产环境使用的检索器，不调用最终回答模型，但会调用查询处理、重排和证据充分性校验所配置的模型。它会保存 Top K chunk、`chunk_id`、各分支排名和原始分数、RRF 分数、语义重排分数、充分性诊断、位置和耗时，但不会把体积较大的 embedding 向量写入结果文件。
+纯检索评测调用生产搜索入口，仅使用 Embedding 和重排模型，不调用生成式查询处理或充分性核验模型。它会保存 Top K chunk、`chunk_id`、各分支排名和原始分数、RRF 分数、语义重排分数、充分性诊断、位置和耗时，但不会把体积较大的 embedding 向量写入结果文件。
 当前 Embedding 为本地 `bge-small-zh-v1.5`（512 维）。旧的 1024 维
 `text-embedding-v3` 文档必须重新上传生成 `q_512_vec` 后才能评测。
 重排使用本地 `BAAI/bge-reranker-v2-m3`；切换重排模型不需要重新生成向量。
@@ -215,6 +204,8 @@ docker compose exec LS_api \
 
 新结果使用 `result_schema_version: "2.5"`，将指标分为三组：
 
+以下三组字段也用于端到端结果与历史记录。当前纯检索仅以 `retrieval_metrics` 衡量效果，`gate_metrics` 没有实际判定，`post_gate_metrics` 不代表回答放行。
+
 | 分组 | 数据来源 | 用途 |
 | --- | --- | --- |
 | `retrieval_metrics` | 充分性检查前的 Top K chunks | 衡量检索是否找到了标准证据 |
@@ -250,7 +241,7 @@ docker compose exec LS_api \
 单独体现。建议结合 `by_question_type` 和 `by_source_modality` 查看切片，
 不要只比较整体均值。
 
-逐题 `retrieval.stage_latency_ms` 记录阶段耗时；并发节点的工作时间会重叠，不能将各字段相加作为总延迟。`stage_latency_semantics` 标明统计口径：
+逐题 `retrieval.stage_latency_ms` 记录阶段耗时。当前纯检索主要记录召回、重排与总耗时；下列其余字段用于读取旧结果，不能把缺省值解释为执行了对应阶段。历史并发节点的工作时间会重叠，不能将各字段相加作为总延迟。
 
 - `query_transform`：意图识别、查询改写和扩展。
 - `initial_retrieval`：关键词/向量召回及 RRF 融合；多查询或多跳时为各次召回之和。
@@ -316,7 +307,7 @@ Hit、Recall、MRR、空结果率、旧拒答率和旧 fallback 率。新结果�
 聚合器仍可读取带旧 `metrics` 字段的 2.1 历史逐题结果。
 2.3 在保持上述字段兼容的基础上增加门控拒绝归因指标。
 2.4 增加逐题阶段耗时及其整体和切片聚合。
-`average_latency_ms` 是完整检索流程的平均耗时，包含充分性检查，并非某一阶段的耗时。
+`average_latency_ms` 是当前执行边界的平均耗时。3.0 的纯检索不包含规划和充分性检查，历史 2.x 结果可能包含。
 
 历史结果没有检查前快照时，检查前指标及片段标为 `null`，计入 `unavailable_query_count`，
 不补成零分，也不从最终输出推测。已记录的空列表则是实际空检索，会计入评分。
@@ -328,7 +319,7 @@ Hit、Recall、MRR、空结果率、旧拒答率和旧 fallback 率。新结果�
 
 `run_e2e_eval.py` 在不读写聊天数据库、Redis、会话标题和推荐问题的情况下，执行与
 线上相同的知识库检索、证据充分性检查、回答提示词和流式模型响应。该 runner 固定为
-`knowledge_base_only`，不会让 Web 搜索补答知识库不可回答题。默认 `--execution-mode grounded` 直接走检索；`--execution-mode agent` 通过真实 Agent 和 KB 工具执行，支持 `--planner-model`，可检测模型提炼查询时丢失用户约束的问题。Web/KB 混合工具路由仍需独立数据集评估。
+`knowledge_base_only`，不会让 Web 搜索补答知识库不可回答题。默认 `--execution-mode agent` 通过真实 Agent 和 KB 工具执行，支持 `--planner-model`。`grounded` 保留为相同 Agent 流程的兼容入口，不再维护另一套语义流程。Web/KB 混合工具路由仍需独立数据集评估。
 
 ```bash
 docker compose exec LS_api \
@@ -437,4 +428,16 @@ docker compose exec LS_api python /app/evals/run_e2e_eval.py \
   --execution-mode agent --index-name <用户ID> --split dev --run-name agent_dev_v3
 ```
 
-汇总 `query_metrics` 记录计划回退率、`expected_retrieval.mode` 与路由的一致率、目标支持率、补查成功率、模型/检索调用数和 token 报告覆盖数。路由一致率是规划诊断，不替代证据或答案质量。缺少 runtime 或 token 用量的样本标为不可用，不补成零。Agent 模式包含规划调用；最终回答、Web 搜索与 judge 成本不在查询 runtime 内。样本数、失败率和各切片应与成本、P95/P99 一起审阅。
+逐题 `agent_execution` 记录任务、工具查询、依赖绑定和停止原因。`query_metrics` 保留历史规划字段供旧记录读取；新 Agent 不再生成旧 RAG 的路由与补查报告，缺失字段不能当成成功率。请求 runtime 记录规划、证据核验、桥接及工具搜索预算；最终回答流和 judge 成本另行统计。样本数、失败率和各切片应与成本、P95/P99 一起审阅。
+
+### 结构化财务需求回归
+
+首次 Agent 理解响应包含 `financial`，其中事实、计算、未解决要求均关联目标和原文。端到端逐题检索诊断保留 `query_understanding.financial`（固定需求）、`financial_requirements`（当前绑定结果）和 `financial_bindings`（绑定来源）。纯检索不生成这些对象。
+
+重点检查公司与期间的对应、实际/预测口径、未知指标是否遗漏、计算基期与操作数方向、补查变量绑定以及缓存版本。财务证据单元测试使用固定需求夹具，理解协议由独立测试覆盖，避免在核验测试中继续调用已删除的问句解析器。
+
+### 财务关系核验回归
+
+`financial_fact_bundle` 新增 `requirement_results`、`relationship_results`、`verification_status` 和诊断信息。测试应分别统计支持、缺失、歧义、冲突、能力限制与核验失败，不能把服务故障统计为无答案。对有标注的真实样本另行衡量误放行率与误拒绝率；模拟模型响应的单元测试不代表实际模型准确率。
+
+覆盖跨句主体/期间、表头与原始坐标、脚注口径、近似值、伪造引文、数字截取、规则与模型配对分歧、不同需求缓存隔离、补查新增来源、模型超时和预算耗尽。`test_financial_relationships.py` 使用固定候选与判断响应，不联网。完整离线单元回归可设置 `RAG_FINANCIAL_FACT_MODEL_ENABLED=false`，混合核验测试会显式开启 hybrid 并注入模拟客户端。

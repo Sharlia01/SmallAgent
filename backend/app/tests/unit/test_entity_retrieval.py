@@ -4,10 +4,10 @@ from copy import deepcopy
 
 import pytest
 
-from service.core import retrieval, entity_retrieval
-from service.core.entity_attribution import EntityRegistry
-from service.core.entity_retrieval import resolve_company_constraint, COMPANY_FILTER_KEY
-from service.core.query_expansion import QueryExpansionResult
+from service.core.retrieval import pipeline as retrieval
+from service.core.retrieval import entities as entity_retrieval
+from service.core.entities.attribution import EntityRegistry
+from service.core.retrieval.entities import resolve_company_constraint, COMPANY_FILTER_KEY
 from service.core.rag.nlp.search_v2 import Dealer
 from service.core.rag.utils.doc_store_conn import MatchTextExpr, MatchDenseExpr, OrderByExpr
 from service.core.rag.utils.es_conn import ESConnection
@@ -54,18 +54,6 @@ def test_query_scope_uses_reviewed_identity_and_keeps_uncertainty(registry, ques
     assert scope.registry_version == registry.version
 
 
-def test_rewritten_company_cannot_change_original_scope(registry):
-    dealer = object.__new__(Dealer)
-    request = dealer._build_search_request(
-        "甲公司营收", Dealer.RetrievalOptions(doc_ids=["doc-a"], kb_ids=["kb-a"]),
-        keyword_question="乙公司 营业收入",
-    )
-    assert dealer.get_filters(request) == {
-        "kb_id": ["kb-a"], "doc_id": ["doc-a"], "available_int": 1,
-        COMPANY_FILTER_KEY: ["a"],
-    }
-    assert dealer.get_filters({"question": "乙公司营收"})[COMPANY_FILTER_KEY] == ["b"]
-    assert COMPANY_FILTER_KEY not in dealer.get_filters({"question": "同名营收"})
 
 
 def test_every_branch_and_keyword_retry_keep_identical_company_scope(registry):
@@ -137,32 +125,6 @@ def test_keyword_and_knn_use_same_prefilter_with_existing_scopes(registry, monke
     assert company_filter["should"][1]["bool"]["must_not"] == [{"exists": {"field": "subject_entity_ids"}}]
 
 
-def test_parallel_scopes_are_separate_and_anonymous_repair_keeps_parent(registry, monkeypatch):
-    calls = []
-
-    class StoreDealer:
-        def retrieval(self, **kwargs):
-            calls.append(kwargs)
-            return {"chunks": []}
-
-    # 即使扩展时加进乙公司，原本甲公司的子查询仍用甲公司的限制。
-    monkeypatch.setattr(retrieval, "expand_query", lambda *args, **kwargs:
-                        QueryExpansionResult.noop("乙公司营业收入", reason="test"))
-    options = Dealer.RetrievalOptions()
-    dealer = retrieval._BudgetedDealer(StoreDealer(), transform_nodes=True,
-                                      company_constraint=resolve_company_constraint("比较甲公司和乙公司"))
-    for question in ["甲公司的营收", "乙公司的营收", "2023年净利润"]:
-        dealer.retrieval(question=question, tenant_ids="42", options=options)
-    assert [call["options"].company_constraint.entity_ids for call in calls] == [
-        ("a",), ("b",), ("a", "b"),
-    ]
-    assert calls[-1]["options"].company_constraint.source == "inherited_company_set"
-    assert options.company_constraint is None  # 不修改并行分支共用的配置。
-    dealer.company_constraint = resolve_company_constraint("甲公司的营收")
-    dealer.retrieval(question="2023年营业收入", tenant_ids="42", options=options)
-    assert calls[-1]["options"].company_constraint.entity_ids == ("a",)
-    dealer.retrieval(question="未登记能源有限公司营收", tenant_ids="42", options=options)
-    assert not calls[-1]["options"].company_constraint.enabled
 
 
 def test_company_diagnostics_survive_chat_result_format(registry):

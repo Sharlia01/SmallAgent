@@ -21,7 +21,7 @@ import os
 import time
 import re
 from nltk.corpus import wordnet
-from service.core.api.utils.file_utils import get_project_base_directory
+from service.core.resources.paths import get_project_base_directory
 
 
 class Dealer:

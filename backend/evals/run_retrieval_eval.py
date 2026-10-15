@@ -28,21 +28,15 @@ DEFAULT_OUTPUT_DIRECTORY = SCRIPT_DIRECTORY / "results"
 if str(APP_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(APP_DIRECTORY))
 
-from service.core.retrieval_evaluation import (  # noqa: E402
+from evaluation.retrieval import (  # noqa: E402
     RESULT_SCHEMA_VERSION,
     build_error_case,
     build_summary,
     evaluate_retrieval_case,
     resolve_metric_ks,
 )
-from service.core.evidence_sufficiency import (  # noqa: E402
-    DEFAULT_EVIDENCE_SUFFICIENCY_MODEL,
-)
 from service.core.rag.nlp.model import RERANKER_MODEL  # noqa: E402
-from service.core.retrieval_result import RetrievalResult, retrieval_record  # noqa: E402
-from service.core.sequential_retrieval import (  # noqa: E402
-    DEFAULT_BRIDGE_EXTRACTION_MODEL,
-)
+from service.core.retrieval.result import RetrievalResult, retrieval_record  # noqa: E402
 
 
 REQUIRED_SAMPLE_FIELDS = {
@@ -532,7 +526,7 @@ def load_retrieval_function() -> Callable[..., RetrievalResult]:
     from dotenv import load_dotenv
 
     load_dotenv(BACKEND_DIRECTORY / ".env")
-    from service.core.retrieval import retrieve_evidence
+    from service.core.retrieval.pipeline import retrieve_evidence
 
     return retrieve_evidence
 
@@ -638,21 +632,11 @@ def main() -> int:
             )
             hit_key = f"hit_at_{args.top_k}"
             retrieval_hit = result["retrieval_metrics"][hit_key]
-            post_gate_hit = result["post_gate_metrics"][hit_key]
-            rejected = result["gate_metrics"]["rejected"]
-            rejection_attribution = result["gate_metrics"][
-                "rejection_attribution"
-            ]
             stage_latency = result["retrieval"]["stage_latency_ms"]
             print(
                 f"[{position}/{len(samples)}] {sample['id']} "
-                f"retrieved_before_gate="
-                f"{result['retrieval']['retrieved_count_before_sufficiency']} "
                 f"returned={result['retrieval']['retrieved_count']} "
                 f"retrieval_hit={retrieval_hit if retrieval_hit is not None else 'N/A'} "
-                f"post_gate_hit={post_gate_hit if post_gate_hit is not None else 'N/A'} "
-                f"rejected={rejected if rejected is not None else 'N/A'} "
-                f"rejection_attribution={rejection_attribution or 'N/A'} "
                 f"stages_ms={stage_latency} "
                 f"latency_ms={result['latency_ms']:.3f}",
                 flush=True,
@@ -732,35 +716,10 @@ def main() -> int:
                 1.0 - args.final_reranker_weight
             ),
             "final_rrf_k": args.final_rrf_k,
-            "bridge_extraction_model": os.getenv(
-                "RAG_BRIDGE_EXTRACTION_MODEL",
-                DEFAULT_BRIDGE_EXTRACTION_MODEL,
-            ),
-            "parallel_retrieval_enabled": environment_flag(
-                "RAG_PARALLEL_RETRIEVAL_ENABLED",
-                True,
-            ),
-            "parallel_coverage_per_subquery": environment_positive_int(
-                "RAG_PARALLEL_COVERAGE_PER_SUBQUERY",
-                2,
-            ),
-            "sequential_retrieval_enabled": environment_flag(
-                "RAG_SEQUENTIAL_RETRIEVAL_ENABLED",
-                True,
-            ),
+            "execution_scope": "search_only",
+            "alias_expansion_enabled": environment_flag("RETRIEVAL_ALIAS_EXPANSION_ENABLED", True),
             "evidence_match_threshold": args.match_threshold,
-            "evidence_sufficiency_enabled": environment_flag(
-                "RAG_EVIDENCE_SUFFICIENCY_ENABLED",
-                True,
-            ),
-            "evidence_sufficiency_model": os.getenv(
-                "RAG_EVIDENCE_SUFFICIENCY_MODEL",
-                DEFAULT_EVIDENCE_SUFFICIENCY_MODEL,
-            ),
-            "evidence_sufficiency_fail_open": environment_flag(
-                "RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN",
-                False,
-            ),
+
         },
         "result_file": str(result_path),
         "metrics": metric_summary,

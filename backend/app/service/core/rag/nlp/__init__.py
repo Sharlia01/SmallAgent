@@ -6,9 +6,9 @@ import logging
 import chardet
 from service.core.rag.utils import num_tokens_from_string
 from PIL import Image
-from service.core.table_evidence import parse_table_object
-from service.core.table_models import build_table_chunks
-from service.core.figure_evidence import figure_evidence
+from service.core.ingestion.tables import parse_table_object
+from domain.tables import build_table_chunks
+from service.core.ingestion.figures import figure_evidence
 
 def is_english(texts):
     eng = 0

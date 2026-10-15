@@ -9,7 +9,8 @@ import httpx
 import numpy as np
 from dotenv import load_dotenv
 from openai import OpenAI
-from service.core.query_runtime import current_runtime, QueryBudgetExceeded, serialized_local_inference
+from service.core.runtime.context import current_runtime, QueryBudgetExceeded
+from service.core.runtime.execution import serialized_local_inference
 
 load_dotenv()
 

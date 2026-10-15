@@ -1,7 +1,7 @@
-from service.core.evidence_adapter import reference_records
+from service.core.evidence.adapter import reference_records
 from tests.evidence_helpers import make_evidence_record, make_tool_result, make_query
-from service.core.evidence_verification import verify_evidence
-from service.core.evidence_pipeline import build_answer_context
+from service.core.evidence.verification import verify_evidence
+from service.core.answering.answer_context import build_answer_context
 from types import SimpleNamespace
 
 import pytest
@@ -9,10 +9,10 @@ import pytest
 from agent.orchestrator import (
     AgentExecution,
     AgentRun,
-    collect_tool_evidence,
 )
 from agent.schemas import ToolResult
-from service.core import chat
+from agent.loop import collect_tool_evidence
+from service.core.answering import chat
 
 
 @pytest.mark.unit
@@ -44,7 +44,7 @@ def test_chat_builds_two_model_orchestrator_with_rag_and_web_tools(monkeypatch):
     assert captured["planner_model"] == chat.AGENT_MODEL
     assert captured["answer_model"] == chat.CHAT_MODEL
     assert captured["planner_client"] is captured["answer_client"]
-    assert captured["fallback_tool"].name == "search_knowledge_base"
+    assert "fallback_tool" not in captured
 
 
 @pytest.mark.unit

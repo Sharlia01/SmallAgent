@@ -1,12 +1,12 @@
 import pytest
 
-from service.core.end_to_end_evaluation import (
+from evaluation.end_to_end import (
     aggregate_e2e_results,
     build_e2e_summary,
     evaluate_refusal,
     evaluate_sufficiency,
 )
-from service.core.retrieval_evaluation import (
+from evaluation.retrieval import (
     build_error_case,
     build_summary,
     evaluate_retrieval_case,
@@ -250,7 +250,7 @@ def test_e2e_summary_aggregates_retrieval_scores_and_slices(top_k):
     overall = summary["overall"]
     before = overall["retrieval_metrics"]
     after = overall["post_gate_metrics"]
-    assert summary["result_schema_version"] == "1.2"
+    assert summary["result_schema_version"] == "2.0"
     assert summary["metric_ks"] == [top_k]
     assert before["query_count"] == 4
     assert before["evaluated_query_count"] == 3

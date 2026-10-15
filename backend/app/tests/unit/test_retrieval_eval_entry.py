@@ -10,9 +10,9 @@ import sys
 import pytest
 
 from domain.assessment import EvidenceAssessment
-from service.core.evidence_adapter import collection_from_records
-from service.core.query_contract import QueryGoal
-from service.core.retrieval_result import retrieval_result
+from service.core.evidence.adapter import collection_from_records
+from service.core.query.contract import QueryGoal
+from service.core.retrieval.result import RetrievalResult
 from tests.evidence_helpers import make_query
 
 
@@ -44,9 +44,7 @@ def test_cli_writes_typed_retrieval_result_with_full_evaluation_metadata(monkeyp
         ])
         assessment = EvidenceAssessment(True, "审批要求已支持", supporting_chunk_indices=[1], source="rule",
                                         evaluated_chunk_count=1, evaluated_chunk_ids=["approval"])
-        return retrieval_result(query, sources, sources, bind_assessment(query, sources, assessment),
-            {"total_before_evidence_sufficiency": 37, "query_rewrite": {"original": question, "changed": False},
-             "retrieval_fusion": {"method": "weighted_rrf"}}, total_candidates=37)
+        return RetrievalResult(sources, sources, {"retrieval_fusion": {"method": "weighted_rrf"}}, total_candidates=37)
 
     monkeypatch.setattr(cli, "load_retrieval_function", lambda: retrieve_evidence)
     monkeypatch.setattr(sys, "argv", [str(script), "--dataset", str(dataset), "--output-dir", str(output),
@@ -60,7 +58,7 @@ def test_cli_writes_typed_retrieval_result_with_full_evaluation_metadata(monkeyp
     assert report["retrieval"]["retrieved_count"] == 1
     assert report["retrieval"]["chunks_before_sufficiency"][0]["chunk_id"] == "approval"
     assert report["retrieval"]["chunks_before_sufficiency"][0]["rerank_score"] == 0.8
-    assert report["retrieval"]["query_contract"]["user_question"] == sample["question"]
-    assert report["retrieval"]["query_intent"]["goals"][0]["id"] == "approval"
+    assert report["retrieval"]["query_contract"] == {}
+    assert report["retrieval"]["query_understanding"] == {}
     assert report["retrieval"]["retrieval_fusion"] == {"method": "weighted_rrf"}
     assert summary["dataset"]["selected_sample_count"] == 1

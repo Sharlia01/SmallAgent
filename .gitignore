@@ -44,6 +44,8 @@ backend/nltk_data/**/*.zip
 *.mp4
 wsl启动rag项目/
 .vscode/
+*.drawio
+.codex/
 
 # 机器学习模型文件：保留在本地，不提交到仓库
 *.onnx
