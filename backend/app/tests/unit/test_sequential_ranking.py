@@ -3,9 +3,9 @@
 from copy import deepcopy
 import pytest
 
-from service.core import retrieval
-from service.core.query_planning import QuerySubqueryPlan
-from service.core.sequential_retrieval import BridgeExtraction
+from service.core.retrieval import fusion as retrieval
+from agent.plans import AgentTask as QuerySubqueryPlan
+from service.core.evidence.bindings import BridgeExtraction
 
 
 pytestmark = pytest.mark.unit

@@ -1,18 +1,206 @@
 {
-  "version": "finance-3",
-  "business_scopes": ["光伏", "煤电", "气电", "火电", "水电", "风电"],
+  "version": "finance-4",
+  "business_scopes": [
+    "光伏",
+    "煤电",
+    "气电",
+    "火电",
+    "水电",
+    "风电"
+  ],
   "aliases": {
-    "归母净利润": ["归属于母公司股东的净利润", "归属于母公司所有者的净利润", "归属于母公司净利润"],
-    "扣非归母净利润": ["扣除非经常性损益后归属于母公司股东的净利润"],
-    "营业收入": ["营收"],
-    "每股收益": ["EPS"],
-    "每股红利": ["每股股利", "DPS"],
-    "市盈率": ["PE", "P/E"],
-    "市净率": ["PB", "P/B"],
-    "经营活动现金流量净额": ["经营活动产生的现金流量净额", "经营现金流净额"],
-    "企业自由现金流": ["FCFF"],
-    "股权自由现金流": ["FCFE"],
-    "装机容量": ["装机量"]
+    "归母净利润": [
+      "归属于母公司股东的净利润",
+      "归属于母公司所有者的净利润",
+      "归属于母公司净利润"
+    ],
+    "扣非归母净利润": [
+      "扣除非经常性损益后归属于母公司股东的净利润"
+    ],
+    "营业收入": [
+      "营收"
+    ],
+    "每股收益": [
+      "EPS"
+    ],
+    "每股红利": [
+      "每股股利",
+      "DPS"
+    ],
+    "市盈率": [
+      "PE",
+      "P/E"
+    ],
+    "市净率": [
+      "PB",
+      "P/B"
+    ],
+    "经营活动现金流量净额": [
+      "经营活动产生的现金流量净额",
+      "经营现金流净额"
+    ],
+    "企业自由现金流": [
+      "FCFF"
+    ],
+    "股权自由现金流": [
+      "FCFE"
+    ],
+    "装机容量": [
+      "装机量"
+    ]
   },
-  "metrics": ["归母净利润", "扣非归母净利润", "净利润", "营业收入", "营业成本", "基本每股收益", "稀释每股收益", "每股收益", "每股红利", "市盈率", "市净率", "经营活动现金流量净额", "经营活动现金流", "企业自由现金流", "股权自由现金流", "现金流", "累计装机容量", "新增装机容量", "装机容量", "发电量", "上网电量", "上网电价", "利用小时", "煤价", "分红", "股息率", "估值", "毛利率", "净利率", "资产负债率", "财务费用率", "财务费用金额", "财务费用", "销售费用率", "研发费用率", "管理费用率", "销售费用", "研发费用", "管理费用", "同比", "环比", "预测", "实际", "截至", "分别"]
+  "metrics": [
+    "经营活动现金流",
+    "现金流",
+    "累计装机容量",
+    "新增装机容量",
+    "装机容量",
+    "发电量",
+    "上网电量",
+    "上网电价",
+    "利用小时",
+    "煤价",
+    "分红",
+    "估值",
+    "同比",
+    "环比",
+    "预测",
+    "实际",
+    "截至",
+    "分别"
+  ],
+  "financial_metrics": {
+    "企业自由现金流": {
+      "value_dimension": "money"
+    },
+    "净利润": {
+      "value_dimension": "money"
+    },
+    "净利率": {
+      "value_dimension": "ratio"
+    },
+    "净资产": {
+      "value_dimension": "money"
+    },
+    "利润总额": {
+      "value_dimension": "money"
+    },
+    "固定资产": {
+      "value_dimension": "money"
+    },
+    "基本每股收益": {
+      "value_dimension": "money_per_share"
+    },
+    "存货": {
+      "value_dimension": "money"
+    },
+    "存货净额": {
+      "value_dimension": "money"
+    },
+    "存货账面余额": {
+      "value_dimension": "money"
+    },
+    "市净率": {
+      "value_dimension": "multiple"
+    },
+    "市盈率": {
+      "value_dimension": "multiple"
+    },
+    "应收票据及账款": {
+      "value_dimension": "money"
+    },
+    "归母净利润": {
+      "value_dimension": "money"
+    },
+    "总负债": {
+      "value_dimension": "money"
+    },
+    "总资产": {
+      "value_dimension": "money"
+    },
+    "所有者权益": {
+      "value_dimension": "money"
+    },
+    "扣非归母净利润": {
+      "value_dimension": "money"
+    },
+    "每股收益": {
+      "value_dimension": "money_per_share"
+    },
+    "每股红利": {
+      "value_dimension": "money_per_share"
+    },
+    "毛利率": {
+      "value_dimension": "ratio"
+    },
+    "研发费用": {
+      "value_dimension": "money"
+    },
+    "研发费用率": {
+      "value_dimension": "ratio"
+    },
+    "稀释每股收益": {
+      "value_dimension": "money_per_share"
+    },
+    "管理费用": {
+      "value_dimension": "money"
+    },
+    "管理费用率": {
+      "value_dimension": "ratio"
+    },
+    "经营活动现金流量净额": {
+      "value_dimension": "money"
+    },
+    "经营现金流": {
+      "value_dimension": "money"
+    },
+    "股东权益": {
+      "value_dimension": "money"
+    },
+    "股息率": {
+      "value_dimension": "ratio"
+    },
+    "股权自由现金流": {
+      "value_dimension": "money"
+    },
+    "营业利润": {
+      "value_dimension": "money"
+    },
+    "营业成本": {
+      "value_dimension": "money"
+    },
+    "营业收入": {
+      "value_dimension": "money"
+    },
+    "负债总额": {
+      "value_dimension": "money"
+    },
+    "财务费用": {
+      "value_dimension": "money"
+    },
+    "财务费用率": {
+      "value_dimension": "ratio"
+    },
+    "财务费用金额": {
+      "value_dimension": "money"
+    },
+    "货币资金": {
+      "value_dimension": "money"
+    },
+    "资产总额": {
+      "value_dimension": "money"
+    },
+    "资产负债率": {
+      "value_dimension": "ratio"
+    },
+    "销售费用": {
+      "value_dimension": "money"
+    },
+    "销售费用率": {
+      "value_dimension": "ratio"
+    },
+    "预付账款": {
+      "value_dimension": "money"
+    }
+  }
 }

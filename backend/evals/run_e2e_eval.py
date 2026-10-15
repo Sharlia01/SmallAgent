@@ -38,23 +38,20 @@ from run_retrieval_eval import (  # noqa: E402
     load_dataset,
     select_samples,
 )
-from service.core.citation_evaluation import evaluate_citations  # noqa: E402
-from service.core.end_to_end_evaluation import (  # noqa: E402
+from evaluation.citations import evaluate_citations  # noqa: E402
+from evaluation.end_to_end import (  # noqa: E402
     E2E_RESULT_SCHEMA_VERSION,
     build_e2e_summary,
     evaluate_answer_quality,
     evaluate_refusal,
     evaluate_sufficiency,
 )
-from service.core.faithfulness_evaluation import (  # noqa: E402
+from evaluation.faithfulness import (  # noqa: E402
     evaluate_faithfulness,
 )
-from service.core.grounded_answer import (  # noqa: E402
-    DEFAULT_ANSWER_MODEL,
-    execute_grounded_turn,
-)
-from service.core.agent_evaluation import execute_agent_turn  # noqa: E402
-from service.core.retrieval_evaluation import (  # noqa: E402
+from service.core.answering.turn import DEFAULT_ANSWER_MODEL  # noqa: E402
+from evaluation.agent import execute_agent_turn  # noqa: E402
+from evaluation.retrieval import (  # noqa: E402
     build_error_case,
     evaluate_retrieval_case,
     resolve_metric_ks,
@@ -94,7 +91,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--final-rrf-k", type=int, default=10)
     parser.add_argument("--match-threshold", type=float, default=0.8)
     parser.add_argument("--answer-model", default=None)
-    parser.add_argument("--execution-mode", choices=["grounded", "agent"], default="grounded")
     parser.add_argument("--planner-model", default=None)
     parser.add_argument("--judge-model", default=None)
     parser.add_argument("--judge-timeout", type=float, default=20.0)
@@ -215,7 +211,10 @@ def error_result(
         "retrieval": retrieval_error["retrieval"],
         "retrieval_metrics": retrieval_error["retrieval_metrics"],
         "post_gate_metrics": retrieval_error["post_gate_metrics"],
+        "verification_evidence_metrics": None,
+        "answer_evidence_metrics": None,
         "gate_metrics": retrieval_error["gate_metrics"],
+        "evidence_sufficiency_reference": retrieval_error["evidence_sufficiency_reference"],
         "answer": "",
         "response_mode": "error",
         "documents": [],
@@ -263,7 +262,7 @@ def main() -> int:
     validate_e2e_samples(samples)
     if args.validate_only:
         print(json.dumps({"dataset": str(args.dataset.resolve()), "selected_samples": len(samples),
-                          "execution_mode": args.execution_mode, "valid": True}, ensure_ascii=False, indent=2))
+                          "execution_mode": "agent", "valid": True}, ensure_ascii=False, indent=2))
         return 0
     index_names = expand_index_names(args.index_name)
     index_argument: str | list[str] = (
@@ -307,16 +306,15 @@ def main() -> int:
     for position, sample in enumerate(samples, start=1):
         case_started = time.perf_counter()
         try:
-            execute = execute_agent_turn if args.execution_mode == "agent" else execute_grounded_turn
-            execution_options = {"planner_client": client, "planner_model": args.planner_model} if args.execution_mode == "agent" else {}
-            turn = execute(
+            turn = execute_agent_turn(
                 index_names=index_argument,
                 question=str(sample["question"]),
                 answer_client=client,
                 answer_model=answer_model,
+                planner_client=client,
+                planner_model=args.planner_model,
                 retrieval_options=retrieval_options,
                 conversation_history=sample.get("conversation_history"),
-                **execution_options,
             )
             retrieval_case = evaluate_retrieval_case(
                 sample,
@@ -380,10 +378,14 @@ def main() -> int:
                 "retrieval": retrieval_case["retrieval"],
                 "retrieval_metrics": retrieval_case["retrieval_metrics"],
                 "post_gate_metrics": retrieval_case["post_gate_metrics"],
+                "verification_evidence_metrics": retrieval_case.get("verification_evidence_metrics"),
+                "answer_evidence_metrics": retrieval_case.get("answer_evidence_metrics"),
                 "gate_metrics": retrieval_case["gate_metrics"],
+                "evidence_sufficiency_reference": retrieval_case["evidence_sufficiency_reference"],
                 "evidence_matches_before_sufficiency": retrieval_case[
                     "evidence_matches_before_sufficiency"
                 ],
+                "evidence_matches": retrieval_case["evidence_matches"],
                 "answer": turn.answer,
                 "thinking": turn.thinking,
                 "response_mode": turn.response_mode,
@@ -397,7 +399,7 @@ def main() -> int:
             print(
                 f"[{position}/{len(samples)}] {sample['id']} "
                 f"mode={turn.response_mode} "
-                f"retrieval_hit={retrieval_case['retrieval_metrics'][f'hit_at_{args.top_k}']} "
+                f"verification_recall={(retrieval_case.get('verification_evidence_metrics') or {}).get('recall')} "
                 f"citations={citation_metrics['citation_count']} "
                 f"faithfulness={faithfulness_metrics['faithfulness_score']} "
                 f"behavior_correct={refusal_metrics['correct']} "
@@ -452,16 +454,13 @@ def main() -> int:
             "pipeline": "knowledge_base_only",
             "index_names": index_names,
             "answer_model": answer_model,
-            "execution_mode": args.execution_mode,
+            "execution_mode": "agent",
             "planner_model": args.planner_model or os.getenv("AGENT_MODEL", "deepseek-v4-pro"),
             "answer_temperature": 0,
             "judge_model": judge_model,
             "judge_enabled": judge_model is not None,
             "faithfulness_enabled": judge_model is not None,
-            "sequential_retrieval_enabled": environment_flag(
-                "RAG_SEQUENTIAL_RETRIEVAL_ENABLED",
-                True,
-            ),
+            "execution_scope": "agent_knowledge_base",
             "bridge_extraction_model": os.getenv(
                 "RAG_BRIDGE_EXTRACTION_MODEL",
                 "qwen3.7-flash-2026-07-15",

@@ -1,6 +1,6 @@
 import pytest
 
-from service.core.constraint_compatibility import (
+from service.core.retrieval.constraints import (
     evaluate_constraint_compatibility,
     extract_measurement_dimensions,
     extract_organizations,

@@ -2,6 +2,8 @@
 
 一个基于RAG（检索增强生成）技术的智能文档问答系统，支持多种文档格式的解析和问答。
 
+后端业务模块的职责、调用入口和资源路径约定见 [核心模块目录说明](app/service/core/README.md)。
+
 ## 🚀 快速启动
 
 ### 环境要求
@@ -25,17 +27,15 @@ EMBEDDING_BACKEND=local
 BGE_MODEL_HOST_PATH=../../models/bge-small-zh-v1.5
 RERANKER_BACKEND=local
 RERANKER_MODEL_HOST_PATH=../../models/bge-reranker-v2-m3
-RAG_QUERY_INTENT_ENABLED=true
-RAG_PARALLEL_RETRIEVAL_ENABLED=true
-RAG_PARALLEL_COVERAGE_PER_SUBQUERY=2
-QUERY_REWRITE_ENABLED=true
-QUERY_EXPANSION_ENABLED=true
+AGENT_MODEL=deepseek-v4-pro
+AGENT_MAX_STEPS=3
+RETRIEVAL_ALIAS_EXPANSION_ENABLED=true
 RAG_EVIDENCE_SUFFICIENCY_ENABLED=true
 ```
 
 Embedding 和重排默认分别使用本地 `bge-small-zh-v1.5` 与
 `bge-reranker-v2-m3`，也可以各自切换到远程推理服务；DashScope Key 用于 RAG
-查询意图识别、查询规范化与扩展及聊天模型。本地模型宿主机路径都相对于本目录的
+Agent 需求理解、规划、证据核验及聊天模型。本地模型宿主机路径都相对于本目录的
 `docker-compose.yml`。
 
 远程 GPU 模式配置示例：
@@ -66,16 +66,11 @@ docker compose up -d --build
 Embedding 必须使用相同模型版本、归一化方式和 512 维输出，否则必须重新入库。
 完整 GPU 主机部署说明见 `gpu_inference/README.md`。
 
-查询管线现在以不可变的用户原问题为准，先做有来源的指代消解，再识别语义目标、任务类型和依赖，确定 `single`、`parallel`、`sequential`、`graph` 或 `clarify` 路由。改写和扩展分别控制；正式查询也可进行经过校验的同义词扩展。多查询最多 8 个节点，先校验目标覆盖、局部约束、模板和依赖，再进行有界执行，合并证据后按完整问题重排。桥接失败保留已取得证据，缺失独立目标可定向补查一次。详细契约、运行流程、预算、回滚方式和已知边界见 [查询管线设计](docs/query_pipeline.md)。
+Agent 统一完成口语规范化、目标提取、约束绑定、歧义判断和初始任务规划。工具执行后按完整目标核验累计证据，缺口交给 Agent 补查。知识库仅执行搜索、固定别名适配、过滤、排序和表格上下文补全，不再独立分析意图或拆分问题。详细边界、数据对象和配置迁移见 [核心架构说明](app/service/core/README.md#agent-统一理解与规划)。
 
-两跳结果去重合并后，额外使用用户原始问题统一重排一次，并重新检查原问题的限定条件。首页在容量允许时保留经过校验的桥接来源片段和第二跳的独立证据，其余位置按统一排名补齐；保留证据也按统一排名展示，不固定置顶。最终重排只决定顺序，不再次用原问题分数过滤辅助证据。统一重排失败时保留两跳结果，回退到各跳名次的等权 RRF，并记录失败来源。设置 `RAG_SEQUENTIAL_RETRIEVAL_ENABLED=false` 可关闭整个递进式检索并回退单跳。
+财务数值问题在 Agent 首次理解时生成结构化事实要求和计算操作数。财务核验只检查证据是否满足这些要求，不再次解析问题；待确认的公司和期间由有来源的执行结果绑定。不支持的指标显式保留为缺口，不能以空要求跳过核验。具体协议见 `app/service/core/README.md`。
 
-`RAG_PARALLEL_RETRIEVAL_ENABLED=false` 可关闭并行检索并回退到原问题单次检索；`RAG_PARALLEL_COVERAGE_PER_SUBQUERY` 控制每个子问题在首页的保底候选数，默认为 2，并会根据页容量自动压缩。并行与递进检索的额外统一重排失败时，均按各子查询名次做等权 RRF 回退。
-
-重排后的最终 Top 片段会再经过证据充分性检查：只有当所有时间范围、指标、限定条件和子问题都有直接证据时才保留结果，否则返回空结果并记录 `evidence_sufficiency`诊断。设置 `RAG_EVIDENCE_SUFFICIENCY_ENABLED=false` 可关闭该检查。调用异常默认保守拒绝返回；只有在可用性优先于证据保证时才设置 `RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN=true`。
-
-设置 `RAG_QUERY_INTENT_ENABLED=false` 可关闭意图判断并恢复全量改写策略，设置 `QUERY_REWRITE_ENABLED=false` 只关闭改写，设置 `QUERY_EXPANSION_ENABLED=false` 只关闭扩展；无变换基线需要同时关闭两者。
-
+历史指代消解保留原文来源；跨工具依赖必须从证据取得变量，同一报告范围由服务端继承。证据不足时保留部分结果用于补查，最终不充分则拒答。财务事实、视觉证据和引用一致性校验保持启用。
 
 3. **启动所有服务**
 ```bash
@@ -268,3 +263,5 @@ docker compose up -d LS_api
 ## 🎯 访问地址
 
 - API文档: http://localhost:8000/docs
+
+财务核验默认使用混合模式：规则无法确定的关系按固定需求交给模型抽取和独立核验，规则继续检查原始数值、来源位置及计算。核验报告分别记录缺失、歧义、冲突、能力限制和服务故障，Agent 据此补查、澄清或停止。参见 [财务关系核验架构](app/service/core/README.md#财务关系的混合核验)。旧环境的 `RAG_FINANCIAL_FACT_MODEL_ENABLED=false` 仍被兼容；如要启用新策略，请显式设置 `RAG_FINANCIAL_VERIFICATION_MODE=hybrid`。

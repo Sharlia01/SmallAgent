@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from service.core.faithfulness_evaluation import evaluate_faithfulness
+from evaluation.faithfulness import evaluate_faithfulness
 
 
 class FakeCompletions:

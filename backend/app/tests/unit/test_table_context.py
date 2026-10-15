@@ -1,6 +1,6 @@
 import pytest
 
-from service.core.table_context import (
+from service.core.retrieval.table_context import (
     expand_table_chunk_context,
     expand_table_contexts,
 )

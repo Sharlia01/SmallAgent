@@ -1,19 +1,19 @@
 from tests.evidence_helpers import bind_assessment
-from service.core.evidence_adapter import collection_from_records
+from service.core.evidence.adapter import collection_from_records
 import pytest
 
 from agent.schemas import ToolResult
 from agent.tools import rag_search
 from agent.tools.base import AgentTool
-from service.core.retrieval_result import retrieval_result
-from service.core.evidence_adapter import assessment_from_record
+from service.core.retrieval.result import RetrievalResult
+from service.core.evidence.adapter import assessment_from_record
 
 
 @pytest.mark.unit
 def test_rag_tool_returns_standard_result_and_preserves_sources(monkeypatch):
     calls = []
 
-    def fake_retrieve_content(index_name, query, *, page_size, context):
+    def fake_retrieve_content(index_name, query, *, page_size):
         calls.append((index_name, query, page_size))
         evidence = collection_from_records([
             {
@@ -30,8 +30,7 @@ def test_rag_tool_returns_standard_result_and_preserves_sources(monkeypatch):
                 "image_id": "image-1",
             }
         ])
-        report = bind_assessment(context, evidence, assessment_from_record({"sufficient": True, "source": "model"}))
-        return retrieval_result(context, evidence, collection_from_records([]), report, {})
+        return RetrievalResult(evidence=evidence)
 
     monkeypatch.setattr(
         rag_search,
@@ -48,7 +47,7 @@ def test_rag_tool_returns_standard_result_and_preserves_sources(monkeypatch):
     assert result.success is True
     assert result.error is None
     assert result.diagnostics == {"result_count": 1, "top_k": 8}
-    assert result.assessment.sufficient is True
+    assert not hasattr(result, "assessment")
     assert result.content == "[1] 内部制度.pdf\n差旅申请需要提前审批。"
     evidence = next(iter(result.evidence))
     assert evidence.source.kind == "knowledge_base"
@@ -60,12 +59,9 @@ def test_rag_tool_returns_standard_result_and_preserves_sources(monkeypatch):
 
 @pytest.mark.unit
 def test_rag_tool_treats_no_matches_as_a_success(monkeypatch):
-    def retrieve(*args, context, **kwargs):
+    def retrieve(*args, **kwargs):
         evidence = collection_from_records([])
-        report = bind_assessment(context, evidence, assessment_from_record({
-            "sufficient": False, "source": "rule", "missing_requirements": ["直接证据"],
-        }))
-        return retrieval_result(context, evidence, evidence, report, {})
+        return RetrievalResult(evidence=evidence)
 
     monkeypatch.setattr(rag_search, "retrieve_evidence", retrieve)
 
@@ -75,7 +71,7 @@ def test_rag_tool_treats_no_matches_as_a_success(monkeypatch):
     assert len(result.evidence) == 0
     assert result.content == rag_search.EMPTY_RESULT_MESSAGE
     assert result.diagnostics["result_count"] == 0
-    assert result.assessment.sufficient is False
+    assert not hasattr(result, "assessment")
 
 
 @pytest.mark.unit

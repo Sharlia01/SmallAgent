@@ -22,7 +22,7 @@ from service.core.rag.utils.doc_store_conn import MatchTextExpr
 
 from service.core.rag.nlp import rag_tokenizer, term_weight, synonym
 
-
+# 把用户的自然语言问题，转换成搜索引擎能使用的、带权重的关键词检索表达式。
 class FulltextQueryer:
     def __init__(self):
         self.tw = term_weight.Dealer()
@@ -295,6 +295,7 @@ class FulltextQueryer:
                     if group_query
                 ]
             )
+            #包含搜索字段、查询表达式、匹配条件的 MatchTextExpr
             return MatchTextExpr(
                 self.query_fields,
                 query,

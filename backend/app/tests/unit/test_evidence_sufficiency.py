@@ -1,10 +1,10 @@
-from domain.facts import FactEvidenceBundle
-from service.core.evidence_adapter import collection_from_records
+from domain.facts import FinancialFactAssessment
+from service.core.evidence.adapter import collection_from_records
 from types import SimpleNamespace
 
 import pytest
 
-from service.core import evidence_sufficiency
+from service.core.evidence import sufficiency as evidence_sufficiency
 
 
 class FakeCompletions:
@@ -58,7 +58,7 @@ def test_model_accepts_evidence_that_covers_every_requirement(monkeypatch):
     decision = evidence_sufficiency.assess_evidence_sufficiency("2025年全年营业收入和归母净利润是多少？",
         collection_from_records(chunks()),
         client=fake_client(completions),
-        facts=FactEvidenceBundle())
+        facts=FinancialFactAssessment())
 
     assert decision.sufficient is True
     assert decision.source == "model"
@@ -101,7 +101,7 @@ def test_system_prompt_preserves_company_internal_entity_scope(monkeypatch):
     decision = evidence_sufficiency.assess_evidence_sufficiency("先找出归母净利润最高的电源板块，再说明该类电源的发电量。",
         collection_from_records(company_segments),
         client=fake_client(completions),
-        facts=FactEvidenceBundle())
+        facts=FinancialFactAssessment())
 
     assert decision.sufficient is True
     system_prompt = completions.calls[0]["messages"][0]["content"]
@@ -130,7 +130,7 @@ def test_model_rejects_partial_evidence_and_names_missing_requirement(
             }
         ]),
         client=fake_client(completions),
-        facts=FactEvidenceBundle())
+        facts=FinancialFactAssessment())
 
     assert decision.sufficient is False
     assert decision.missing_requirements == ["2025年全年实际数据"]
@@ -145,7 +145,7 @@ def test_empty_evidence_is_rejected_without_calling_model(monkeypatch):
     decision = evidence_sufficiency.assess_evidence_sufficiency("这份报告的收入是多少？",
         collection_from_records([]),
         client=fake_client(completions),
-        facts=FactEvidenceBundle())
+        facts=FinancialFactAssessment())
 
     assert decision.sufficient is False
     assert decision.source == "rule"
@@ -182,7 +182,7 @@ def test_provider_failure_is_fail_closed_by_default(monkeypatch):
     decision = evidence_sufficiency.assess_evidence_sufficiency("2025年全年营业收入是多少？",
         collection_from_records(chunks()),
         client=fake_client(completions),
-        facts=FactEvidenceBundle())
+        facts=FinancialFactAssessment())
 
     assert decision.sufficient is False
     assert decision.source == "fallback"
@@ -198,7 +198,7 @@ def test_provider_failure_can_fail_open(monkeypatch):
     decision = evidence_sufficiency.assess_evidence_sufficiency("2025年全年营业收入是多少？",
         collection_from_records(chunks()),
         client=fake_client(completions),
-        facts=FactEvidenceBundle())
+        facts=FinancialFactAssessment())
 
     assert decision.sufficient is True
     assert decision.source == "fallback"
@@ -213,7 +213,7 @@ def test_disabled_check_preserves_retrieved_evidence(monkeypatch):
     decision = evidence_sufficiency.assess_evidence_sufficiency("2025年全年营业收入是多少？",
         collection_from_records(chunks()),
         client=fake_client(completions),
-        facts=FactEvidenceBundle())
+        facts=FinancialFactAssessment())
 
     assert decision.sufficient is True
     assert decision.source == "disabled"

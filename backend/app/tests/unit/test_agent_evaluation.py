@@ -1,146 +1,126 @@
-import json
-from types import SimpleNamespace
-
+"""独立问答与端到端评测共用 Agent；外部报告不能替代服务端核验。"""
 import pytest
-
-from agent.orchestrator import MinimalAgent
-from agent.tools.rag_search import RagSearchTool
-from service.core.agent_evaluation import execute_agent_turn
-from domain.assessment import EvidenceAssessment
-from service.core.end_to_end_evaluation import evaluate_refusal
-from service.core import agent_evaluation, evidence_verification, retrieval
-from service.core.evidence_adapter import collection_from_records
-from service.core.evidence_assessment import finalize_assessment
-from service.core.retrieval_result import retrieval_result
-
+from agent import loop
+from evaluation.agent import execute_agent_turn
+from tests.agent_helpers import ModelClient, initial, records, coverage_verifier, task
+from tests.unit.test_agent_orchestrator import AnswerClient
+from service.core.retrieval.result import adapt_retrieval_records
+from service.core.query.contract import RetrievalTask
 
 pytestmark = pytest.mark.unit
 
 
-class Client:
-    def __init__(self, responses):
-        self.responses = iter(responses)
-        self.calls = []
-        self.chat = SimpleNamespace(completions=self)
-
-    def create(self, **kwargs):
-        self.calls.append(kwargs)
-        return next(self.responses)
-
-
-def call(query, **extra):
-    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
-        content="", tool_calls=[SimpleNamespace(id="call-1", function=SimpleNamespace(
-            name="search_knowledge_base", arguments=json.dumps({"query": query, **extra}),
-        ))],
-    ))])
-
-
-def answer_stream():
-    return [SimpleNamespace(choices=[SimpleNamespace(
-        finish_reason="stop", delta=SimpleNamespace(content="答案。##1$$", reasoning_content=None),
-    )])]
-
-
-def chunk(identifier="e1"):
-    return {"chunk_id": identifier, "doc_id": "d1", "docnm_kwd": "报告.pdf",
-            "content_with_weight": "2025年全年实际利润为10亿元。"}
-
-
-def test_agent_eval_keeps_user_contract_when_planner_drops_conditions(monkeypatch):
-    monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_ENABLED", "false")
-    observed = []
-    question = "2025年全年实际利润是多少，不含预测值？"
-    history = [{"role": "user", "content": "请看报告"}]
-    def retrieve(index, query, *, request, **options):
-        observed.append((index, query, request))
-        return {"total": 1, "chunks": [chunk()], "query_contract": request.to_dict(),
-                "evidence_sufficiency": {"sufficient": True, "source": "model"}}
-    planner, answer = Client([call("利润")]), Client([answer_stream()])
-    result = execute_agent_turn(index_names="authorized-index", question=question,
-                                conversation_history=history, planner_client=planner,
+def test_evaluation_preserves_contract_and_returns_full_evidence(monkeypatch):
+    monkeypatch.setattr(loop, "verify_evidence", coverage_verifier())
+    planner, answer = ModelClient([initial()]), AnswerClient()
+    calls = []
+    def retrieve(index, query, **options):
+        calls.append(query)
+        return {"chunks": records(), "evidence_sufficiency": {"sufficient": False}}
+    result = execute_agent_turn(index_names="test", question="员工培训要求", planner_client=planner,
                                 answer_client=answer, retrieval_function=retrieve)
-    assert observed[0][0:2] == ("authorized-index", "利润")
-    assert observed[0][2].user_question == question
-    assert observed[0][2].history == (("user", "请看报告"),)
-    assert result.answer == "答案。##1$$"
-    assert len(observed) == 1
-    assert len(planner.calls) == 1
-    assert result.raw_retrieval["agent_execution"]["stop_reason"] == "evidence_ready"
-    assert result.raw_retrieval["query_runtime"]["counts"]["model"] == 1
-    assert all(event["status"] != "error" for event in result.raw_retrieval["query_runtime"]["events"])
-    assert result.raw_retrieval["evidence_sufficiency"]["sufficient"] is True
-
-
-def test_default_agent_evaluation_passes_typed_sources_and_reuses_server_report(monkeypatch):
-    observed = []
-
-    def retrieve(index, question, *, context, **options):
-        sources = collection_from_records([chunk()])
-        assessment = finalize_assessment(context, sources,
-            EvidenceAssessment(True, "已有证据", source="rule", evaluated_chunk_count=1, evaluated_chunk_ids=["e1"]))
-        observed.append((context, assessment))
-        return retrieval_result(context, sources, sources, assessment, {})
-
-    monkeypatch.setattr(retrieval, "_retrieve_evidence_result", retrieve)
-    monkeypatch.setattr(agent_evaluation, "adapt_retrieval_records",
-                        lambda *args: pytest.fail("默认 Agent 评测不能走历史 JSON 入口"))
-    monkeypatch.setattr(evidence_verification, "assess_evidence_sufficiency",
-                        lambda *args, **kwargs: pytest.fail("已绑定的检索报告不能重复语义核验"))
-    result = execute_agent_turn(index_names="authorized-index", question="2025年全年实际利润是多少？",
-                                planner_client=Client([call("利润")]), answer_client=Client([answer_stream()]))
-    context, assessment = observed[0]
     assert result.response_mode == "answer"
-    assert result.raw_retrieval["query_contract"] == context.request.to_dict()
-    assert result.raw_retrieval["evidence_sufficiency"] == assessment.to_dict()
+    assert result.raw_retrieval["query_contract"]["user_question"] == "员工培训要求"
+    assert result.raw_retrieval["query_understanding"]["goals"][0]["id"] == "g1"
+    assert len(result.documents) == 1 and len(calls) == 1
+    assert result.raw_retrieval["evidence_sufficiency"]["sufficient"]
 
 
-def test_clarification_terminates_before_answer_model():
-    answer = Client([])
-    result = execute_agent_turn(index_names="1", question="它的利润是多少？",
-        planner_client=Client([call("利润")]), answer_client=answer,
-        retrieval_function=lambda *args, **kwargs: {
-            "chunks": [], "response_mode": "clarify", "clarification": "它指哪家公司？",
-        })
-    assert result.response_mode == "clarify"
-    assert "指的是哪个对象" in result.answer
-    assert answer.calls == []
-    assert evaluate_refusal({"expected_behavior": "clarify"}, result.response_mode)["correct"]
+def test_external_positive_verdict_cannot_force_answer(monkeypatch):
+    monkeypatch.setattr(loop, "verify_evidence", coverage_verifier(2))
+    answer = AnswerClient()
+    result = execute_agent_turn(index_names="test", question="员工培训要求",
+        planner_client=ModelClient([initial(), {"tasks": []}]), answer_client=answer,
+        retrieval_function=lambda *args, **kwargs: {"chunks": records(), "evidence_sufficiency": {"sufficient": True}})
+    assert result.response_mode == "refuse" and not answer.calls
+    assert len(result.raw_retrieval["chunks_before_sufficiency"]) == 1
 
 
-def test_server_request_cannot_be_injected_in_tool_arguments():
-    tool = RagSearchTool(user_id=1, retriever=lambda *a, **k: pytest.fail("must not execute"))
-    agent = MinimalAgent(client=Client([call("利润", _request={"user_question": "改掉条件"})]),
-                         model="test", tools=[tool], max_steps=1)
-    result = agent.run(question="全年实际利润？")
-    assert result.tool_results[0].diagnostics["error_type"] == "invalid_arguments"
-
-
-@pytest.mark.parametrize("sufficient", [True, False])
-def test_external_report_is_rechecked_and_current_verdict_controls_agent(monkeypatch, sufficient):
-    def retrieve(index, query, *, request, **options):
-        return {"chunks": [], "chunks_before_sufficiency": [chunk()],
-                "query_contract": request.to_dict(),
-                "evidence_sufficiency": {"sufficient": False, "source": "model",
-                                         "missing_requirements": ["实际利润"]}}
+@pytest.mark.parametrize("typed", [False, True])
+@pytest.mark.parametrize("required_count", [2, 3])
+def test_evaluation_snapshot_keeps_all_evidence_on_answer_and_refusal(monkeypatch, typed, required_count):
     checked = []
-    def verify(question, evidence, **kwargs):
-        checked.append((question, evidence))
-        return EvidenceAssessment(sufficient, "联合校验", [] if sufficient else ["实际利润"],
-                                            [1], "model", 1, ["e1"])
-    monkeypatch.setattr("service.core.evidence_verification.assess_evidence_sufficiency", verify)
-    planner = Client([call("利润"), call("利润")])
-    answer = Client([answer_stream()] if sufficient else [])
-    result = execute_agent_turn(index_names="1", question="2025年全年实际利润？",
-        planner_client=planner, answer_client=answer, retrieval_function=retrieve)
-    assert result.raw_retrieval["agent_execution"]["stop_reason"] == ("evidence_ready" if sufficient else "no_progress")
-    assert result.raw_retrieval["agent_execution"]["retrieval_calls"] == 1
-    assert result.raw_retrieval["evidence_sufficiency"]["sufficient"] is sufficient
-    assert result.response_mode == ("answer" if sufficient else "refuse")
-    assert bool(result.raw_retrieval["chunks"]) is sufficient
-    assert checked[0][0] == "2025年全年实际利润？"
-    assert len(checked) == 1
-    assert len(planner.calls) == (1 if sufficient else 2)
-    if not sufficient:
-        observations = [message for message in planner.calls[1]["messages"] if message["role"] == "tool"]
-        assert "实际利润" in observations[0]["content"]
+    monkeypatch.setattr(loop, "verify_evidence", coverage_verifier(required_count, checked))
+
+    def retrieve(index, query, **options):
+        # 外部快照与主要结果不必互相包含；两边的资料都要进入核验和评测。
+        if typed:
+            return adapt_retrieval_records(records("c1"), {"candidate_chunks": records("c2")},
+                                           task=RetrievalTask(query, ("g1",)))
+        return {"chunks": records("c1"), "chunks_before_sufficiency": records("c2")}
+
+    result = execute_agent_turn(index_names="test", question="员工培训要求",
+        planner_client=ModelClient([initial(), {"tasks": []}]), answer_client=AnswerClient(),
+        retrieval_function=retrieve)
+    snapshot = result.raw_retrieval["chunks_before_sufficiency"]
+    assert [item.id for item in checked[0][1]] == ["c2", "c1"]
+    assert [chunk["chunk_id"] for chunk in snapshot] == ["c2", "c1"]
+    assert result.response_mode == ("answer" if required_count == 2 else "refuse")
+    if required_count == 3:
+        assert result.raw_retrieval["chunks"] == [] and result.documents == []
+
+
+def test_evaluation_snapshot_merges_replanned_results_in_verification_order(monkeypatch):
+    checked = []
+    monkeypatch.setattr(loop, "verify_evidence", coverage_verifier(2, checked))
+    responses = iter([
+        {"chunks": records("c1")},
+        {"chunks": records("c1") + records("c2")},
+    ])
+    result = execute_agent_turn(index_names="test", question="员工培训要求",
+        planner_client=ModelClient([initial(), {"tasks": [task(id="s2", query="员工培训要求 完整制度")]}]),
+        answer_client=AnswerClient(), retrieval_function=lambda *args, **kwargs: next(responses))
+    assert result.response_mode == "answer"
+    assert [len(evidence) for _, evidence in checked] == [1, 2]
+    assert [chunk["chunk_id"] for chunk in result.raw_retrieval["chunks_before_sufficiency"]] == ["c1", "c2"]
+
+
+@pytest.mark.parametrize("refuse", [False, True])
+def test_repaired_sixth_evidence_is_scored_and_only_selected_context_is_delivered(monkeypatch, refuse):
+    from evaluation.retrieval import evaluate_retrieval_case, aggregate_agent_evidence, aggregate_retrieval_stages
+    from evaluation.end_to_end import evaluate_sufficiency
+    from service.core.evidence.assessment import finalize_assessment
+    from domain.assessment import EvidenceAssessment
+
+    def verify(context, evidence, **kwargs):
+        sufficient = len(evidence) == 6 and not refuse
+        return finalize_assessment(context, evidence, EvidenceAssessment(
+            sufficient, "只采用最后一次找到的培训条款", source="rule",
+            evaluated_chunk_ids=[item.id for item in evidence],
+            supporting_chunk_indices=[6] if sufficient else [],
+        ))
+
+    monkeypatch.setattr(loop, "verify_evidence", verify)
+    noise = [records(f"noise-{i}", text=f"无关信息{i}")[0] for i in range(5)]
+    gold = records("gold")
+    responses = iter([{"chunks": noise}, {"chunks": gold}])
+    answer = AnswerClient()
+    result = execute_agent_turn(
+        index_names="test", question="员工培训要求", retrieval_options={"page_size": 5},
+        planner_client=ModelClient([initial(), {"tasks": [task(id="s2", query="培训制度全文")]}, {"tasks": []}]),
+        answer_client=answer, retrieval_function=lambda *args, **kwargs: next(responses),
+    )
+    assert result.raw_retrieval["evaluation_scope"] == "agent_evidence_sets"
+    assert len(result.raw_retrieval["chunks_before_sufficiency"]) == 6
+    assert [c["query"] for c in result.raw_retrieval["retrieval_calls"]] == ["员工培训要求", "培训制度全文"]
+    assert [c["chunk_id"] for c in result.raw_retrieval["chunks"]] == ([] if refuse else ["gold"])
+    if not refuse:
+        assert "每年培训一次" in answer.calls[0]["messages"][-1]["content"]
+        assert "无关信息" not in answer.calls[0]["messages"][-1]["content"]
+    sample = {"id": "sixth-evidence", "answerable": True,
+              "relevant_evidence": [{"document_name": "制度", "text": "员工培训要求：每年培训一次"}]}
+    case = evaluate_retrieval_case(sample, result.raw_retrieval, latency_ms=1, top_k=5, match_threshold=1)
+    assert case["retrieval_metrics"] is None and case["post_gate_metrics"] is None
+    assert case["verification_evidence_metrics"]["recall"] == 1
+    assert case["answer_evidence_metrics"]["recall"] == (0 if refuse else 1)
+    decision = evaluate_sufficiency(sample, case)
+    assert decision["expected_sufficient"] is True
+    assert decision["unsafe_accept"] is False
+    assert decision["false_rejection"] is refuse
+    summary = aggregate_agent_evidence([case])
+    assert summary["verification_evidence_metrics"]["recall"] == 1
+    calls = summary["retrieval_call_metrics"]["by_top_k"]["5"]
+    assert calls["query_count"] == 2 and calls["hit_at_5"] == 0.5
+    gate = aggregate_retrieval_stages([case], top_k=5)["gate_metrics"]
+    assert gate["evidence_sufficient_answerable_decision_count"] == 1
+    assert gate["false_rejection_with_sufficient_evidence_count"] == int(refuse)

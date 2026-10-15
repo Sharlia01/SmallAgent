@@ -6,10 +6,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from domain.facts import FactEvidenceBundle
-from service.core import evidence_sufficiency as sufficiency
-from service.core.evidence_adapter import collection_from_records
-from service.core.query_runtime import QueryRuntime, query_runtime
+from domain.facts import FinancialFactAssessment
+from service.core.evidence import sufficiency as sufficiency
+from service.core.evidence.adapter import collection_from_records
+from service.core.runtime.context import QueryRuntime, query_runtime
 
 
 pytestmark = pytest.mark.unit
@@ -57,30 +57,25 @@ def model_policy(monkeypatch):
 
 
 @pytest.mark.parametrize("recovered", [True, False])
-def test_transport_retry_preserves_attempts_and_observation_scope(recovered):
+def test_transport_retry_preserves_attempts_and_logs_failure(recovered, caplog):
     completions = ScriptedCompletions(TimeoutError("first request failed"),
                                      completion() if recovered else TimeoutError("second request failed"))
     with query_runtime(QueryRuntime(max_model_calls=2)) as runtime:
         result = sufficiency.assess_evidence_sufficiency(
-            "差旅如何审批？", sources(), facts=FactEvidenceBundle(), client=client(completions),
+            "差旅如何审批？", sources(), facts=FinancialFactAssessment(), client=client(completions),
         )
     assert len(completions.calls) == runtime.counts["model"] == 2
     assert result.diagnostics["attempts"] == 2
     assert result.sufficient is recovered
     assert result.source == ("model" if recovered else "fallback")
-    requests = [event for event in runtime.events if event["phase"] == "request"]
-    assert [event["attempt"] for event in requests] == [1, 2]
-    assert len({event["operation_id"] for event in requests}) == 1
-    recovery = [event for event in runtime.events if event["phase"] == "recovery"]
-    assert [event["status"] for event in recovery] == (["retry"] if recovered else ["retry", "failed"])
-    final = runtime.events[-1]
-    assert final["phase"] == "completion"
-    assert final["operation_id"] == requests[0]["operation_id"]
-    assert final["end_reason"] == ("verified_after_retry" if recovered else "service_unavailable")
+    assert "Evidence verification request failed; retrying once" in caplog.text
+    if not recovered:
+        assert "Evidence verification failed (attempts=2, kind=service_unavailable)" in caplog.text
+    assert "events" not in runtime.snapshot()
 
 
 @pytest.mark.parametrize("constraint", ["call_budget", "deadline", "retry_disabled"])
-def test_request_retry_respects_runtime_and_policy(monkeypatch, constraint):
+def test_request_retry_respects_runtime_and_policy(monkeypatch, constraint, caplog):
     runtime = QueryRuntime(max_model_calls=1 if constraint == "call_budget" else 2,
                            timeout_seconds=1 if constraint == "deadline" else 45)
     if constraint == "retry_disabled":
@@ -88,26 +83,26 @@ def test_request_retry_respects_runtime_and_policy(monkeypatch, constraint):
     completions = ScriptedCompletions(TimeoutError("request failed"), completion())
     with query_runtime(runtime):
         result = sufficiency.assess_evidence_sufficiency(
-            "差旅如何审批？", sources(), facts=FactEvidenceBundle(), client=client(completions),
+            "差旅如何审批？", sources(), facts=FinancialFactAssessment(), client=client(completions),
         )
     assert len(completions.calls) == runtime.counts["model"] == 1
     assert result.diagnostics["attempts"] == 1
     assert result.diagnostics["failure_kind"] == "service_unavailable"
-    recovery = [event for event in runtime.events if event["phase"] == "recovery"]
-    assert [event["status"] for event in recovery] == ["failed"]
+    assert "retrying once" not in caplog.text
+    assert "Evidence verification failed" in caplog.text
 
 
-def test_exhausted_budget_does_not_start_provider_request():
+def test_exhausted_budget_does_not_start_provider_request(caplog):
     completions = ScriptedCompletions(completion())
     with query_runtime(QueryRuntime(max_model_calls=0)) as runtime:
         result = sufficiency.assess_evidence_sufficiency(
-            "差旅如何审批？", sources(), facts=FactEvidenceBundle(), client=client(completions),
+            "差旅如何审批？", sources(), facts=FinancialFactAssessment(), client=client(completions),
         )
     assert completions.calls == []
     assert result.diagnostics["failure_kind"] == "budget_exhausted"
     assert result.diagnostics["attempts"] == 1
-    request = next(event for event in runtime.events if event["phase"] == "request")
-    assert request["status"] == "blocked" and request["request_sent"] is False
+    assert runtime.counts.get("model", 0) == 0
+    assert "budget_exhausted" in caplog.text
 
 
 @pytest.mark.parametrize("response, rejected_phase", [
@@ -117,29 +112,29 @@ def test_exhausted_budget_does_not_start_provider_request():
     (completion(finish_reason="length"), "semantic_validation"),
     (SimpleNamespace(choices=[]), "parse"),
 ])
-def test_invalid_responses_fail_without_transport_retry(response, rejected_phase):
+def test_invalid_responses_fail_without_transport_retry(response, rejected_phase, caplog):
     completions = ScriptedCompletions(response, completion())
     with query_runtime(QueryRuntime(max_model_calls=2)) as runtime:
         result = sufficiency.assess_evidence_sufficiency(
-            "差旅如何审批？", sources(), facts=FactEvidenceBundle(), client=client(completions),
+            "差旅如何审批？", sources(), facts=FinancialFactAssessment(), client=client(completions),
         )
     assert len(completions.calls) == 1
     assert result.diagnostics["attempts"] == 1
     assert result.diagnostics["failure_kind"] == "contract_rejected"
-    assert any(event["phase"] == rejected_phase and event["status"] == "rejected" for event in runtime.events)
-    assert not any(event["phase"] == "recovery" for event in runtime.events)
+    assert "kind=contract_rejected" in caplog.text
+    assert "retrying once" not in caplog.text
 
 
 def test_client_configuration_failure_has_no_request_attempt(monkeypatch):
     def unavailable_client():
         raise RuntimeError("missing provider configuration")
 
-    monkeypatch.setattr(sufficiency, "get_evidence_sufficiency_client", unavailable_client)
+    monkeypatch.setattr(sufficiency, "get_verification_client", unavailable_client)
     with query_runtime() as runtime:
-        result = sufficiency.assess_evidence_sufficiency("差旅如何审批？", sources(), facts=FactEvidenceBundle())
+        result = sufficiency.assess_evidence_sufficiency("差旅如何审批？", sources(), facts=FinancialFactAssessment())
     assert result.diagnostics["attempts"] == 0
     assert result.diagnostics["failure_kind"] == "configuration_or_request_error"
-    assert not any(event["phase"] == "request" for event in runtime.events)
+    assert runtime.counts.get("model", 0) == 0
 
 
 @pytest.mark.parametrize("require_semantic, enabled", [(False, "true"), (True, "false"), (True, "true")])
@@ -151,7 +146,7 @@ def test_visual_rule_precedes_semantic_execution_policy(monkeypatch, require_sem
         "evidence_type_kwd": "figure", "visual_status_kwd": "disabled",
     }])
     result = sufficiency.assess_evidence_sufficiency(
-        "图中哪一年的柱为负？", evidence, facts=FactEvidenceBundle(),
+        "图中哪一年的柱为负？", evidence, facts=FinancialFactAssessment(),
         client=client(completions), require_semantic=require_semantic,
     )
     assert result.sufficient is False and result.source == "rule"
@@ -161,11 +156,10 @@ def test_visual_rule_precedes_semantic_execution_policy(monkeypatch, require_sem
 
 
 def test_question_limit_does_not_start_model_or_derived_calculation(monkeypatch):
-    monkeypatch.setattr(sufficiency, "build_derived_evidence", lambda *args: pytest.fail("超长输入不应执行计算"))
     completions = ScriptedCompletions(AssertionError("must not call provider"))
     result = sufficiency.assess_evidence_sufficiency(
         "问题" * sufficiency.MAX_EVIDENCE_QUESTION_CHARS, sources(),
-        facts=FactEvidenceBundle(), client=client(completions),
+        facts=FinancialFactAssessment(), client=client(completions),
     )
     assert result.diagnostics["failure_kind"] == "input_limit"
     assert result.diagnostics["attempts"] == 0
@@ -180,11 +174,10 @@ def test_calculation_losing_model_context_keeps_original_source_proof(monkeypatc
                 ]}]
     original = deepcopy(derived)
     monkeypatch.setattr(sufficiency, "MAX_EVIDENCE_CHUNKS", 1)
-    monkeypatch.setattr(sufficiency, "build_derived_evidence", lambda *args: derived)
     completions = ScriptedCompletions(completion())
     with query_runtime() as runtime:
         result = sufficiency.assess_evidence_sufficiency(
-            "差旅如何审批？", evidence, facts=FactEvidenceBundle(), client=client(completions),
+            "差旅如何审批？", evidence, facts=FinancialFactAssessment(derived_evidence=derived), client=client(completions),
         )
     payload = json.loads(completions.calls[0]["messages"][1]["content"])
     projected = payload["derived_evidence"][0]
@@ -194,5 +187,4 @@ def test_calculation_losing_model_context_keeps_original_source_proof(monkeypatc
     assert [item["chunk_index"] for item in projected["inputs"]] == [1, None]
     assert result.facts.derived_evidence == original == derived
     assert result.evaluated_chunk_ids == ["first"]
-    calculation_event = next(event for event in runtime.events if event["phase"] == "calculation")
-    assert calculation_event["calculations"] == original and calculation_event["supported_count"] == 1
+    assert "events" not in runtime.snapshot()

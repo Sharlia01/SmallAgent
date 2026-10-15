@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from service.core import sequential_retrieval
+from service.core.evidence import bindings as sequential_retrieval
 
 
 class FakeCompletions:

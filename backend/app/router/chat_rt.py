@@ -5,10 +5,10 @@ from fastapi.responses import StreamingResponse
 import os
 from dotenv import load_dotenv
 from typing import List, Optional
-from service.core.file_parse import execute_insert_process
-from service.core.api.utils.file_utils import get_project_base_directory
+from service.core.ingestion.pipeline import execute_insert_process
+from service.core.resources.paths import get_project_base_directory
 from fastapi_jwt import JwtAuthorizationCredentials
-from service.core.chat import get_chat_completion
+from service.core.answering.chat import get_chat_completion
 from service.auth import access_security
 from utils import logger
 from database.knowledgebase_operations import insert_knowledgebase, verify_user_knowledgebase

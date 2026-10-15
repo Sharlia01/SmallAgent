@@ -19,12 +19,12 @@ import time
 from collections import defaultdict
 #数据类，类似于其他语言中的结构体
 from dataclasses import dataclass, field as dataclass_field
-from service.core.evidence_metadata import (
+from service.core.evidence.metadata import (
     EVIDENCE_FIELDS,
     evidence_metadata,
     ranking_text,
 )
-from service.core.entity_retrieval import (
+from service.core.retrieval.entities import (
     COMPANY_FILTER_KEY, CompanyConstraint, resolve_company_constraint,
 )
 
@@ -32,7 +32,7 @@ from service.core.rag.settings import TAG_FLD, PAGERANK_FLD
 from service.core.rag.utils import rmSpace
 from service.core.rag.nlp import rag_tokenizer, query
 import numpy as np
-from service.core.constraint_compatibility import (
+from service.core.retrieval.constraints import (
     evaluate_constraint_compatibility,
 )
 from service.core.rag.utils.doc_store_conn import (

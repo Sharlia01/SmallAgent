@@ -1,67 +1,59 @@
-"""类型化检索结果在输出边界保留评测信息。"""
-
-from tests.evidence_helpers import bind_assessment
-
-import json
-
-import numpy as np
+"""检索适配不解释问题、不信任旧报告，也不清空部分证据。"""
+from service.core.retrieval.result import RetrievalResult, adapt_retrieval_records, retrieval_record
+from service.core.evidence.adapter import collection_from_records
+from service.core.query.contract import RetrievalTask
+from tests.agent_helpers import records
 import pytest
-
-from domain.assessment import EvidenceAssessment
-from service.core.evidence_adapter import collection_from_records
-from service.core.query_contract import QueryGoal
-from service.core.query_contract import QueryRequest
-from service.core import retrieval
-from service.core.retrieval_result import retrieval_record, retrieval_result
-from tests.evidence_helpers import make_query
 
 
 pytestmark = pytest.mark.unit
 
 
-@pytest.mark.parametrize("sufficient", [True, False])
-def test_output_preserves_candidates_query_and_ranking_when_gate_changes(sufficient):
-    query = make_query("差旅如何审批？", (QueryGoal("approval", "差旅审批要求", source_spans=("审批",)),))
-    candidates = collection_from_records([
-        {"chunk_id": "approval", "docnm_kwd": "制度.pdf", "content_with_weight": "差旅申请需要审批。",
-         "rerank_score": np.float32(0.8), "retrieval_ranks": {"keyword_original": 2}},
-        {"chunk_id": "other", "content_with_weight": "其他规定。"},
-    ])
-    evidence = candidates.select(["approval"]) if sufficient else collection_from_records([])
-    assessment = EvidenceAssessment(sufficient, "逐目标核验", [] if sufficient else ["审批要求"],
-                                     [1], "rule", 2, ["approval", "other"])
-    diagnostics = {"query_rewrite": {"original": query.question, "changed": False},
-                   "retrieval_fusion": {"method": "weighted_rrf"},
-                   "total_before_evidence_sufficiency": 37,
-                   "doc_aggs": [{"doc_name": "制度.pdf", "count": 37}]}
-    retrieved = retrieval_result(query, evidence, candidates, bind_assessment(query, candidates or evidence, assessment), diagnostics, total_candidates=37)
-    exported = json.loads(json.dumps(retrieval_record(retrieved), ensure_ascii=False))
-
-    assert retrieved.total_candidates == 37
-    assert exported["total"] == (37 if sufficient else 0)
-    assert exported["total_before_evidence_sufficiency"] == 37
-    assert [item["chunk_id"] for item in exported["chunks_before_sufficiency"]] == ["approval", "other"]
-    assert exported["chunks_before_sufficiency"][0]["rerank_score"] == pytest.approx(0.8)
-    assert exported["chunks_before_sufficiency"][0]["retrieval_ranks"] == {"keyword_original": 2}
-    assert exported["query_contract"] == query.request.to_dict()
-    assert exported["query_intent"]["goals"][0]["id"] == "approval"
-    assert exported["query_rewrite"] == diagnostics["query_rewrite"]
-    assert exported["retrieval_fusion"] == diagnostics["retrieval_fusion"]
-    assert bool(exported["doc_aggs"]) is sufficient
-    assert exported["evidence_sufficiency"]["sufficient"] is sufficient
-    assert "query_contract" not in retrieved.diagnostics
+def test_external_verdict_does_not_gate_or_verify_search_results():
+    result = adapt_retrieval_records(records(), {"evidence_sufficiency": {"sufficient": False}, "query_intent": {"goals": []}})
+    assert len(result.evidence) == 1
+    assert not hasattr(result, "assessment") and not hasattr(result, "understanding")
+    assert "evidence_sufficiency" not in result.diagnostics
 
 
-def test_explicit_request_is_preserved_by_the_unified_retrieval_entry(monkeypatch):
-    request = QueryRequest.from_user("差旅如何审批？", [{"role": "user", "content": "请查看差旅制度"}])
-    observed = []
+def test_external_candidates_merge_without_duplicates_and_preserve_order_and_task():
+    task = RetrievalTask("员工培训要求", ("g1",), ("doc1",))
+    result = adapt_retrieval_records(records(), {
+        "candidate_chunks": records("c2") + records(), "total": 100,
+    }, task=task)
+    exported = retrieval_record(result)
+    assert [item.id for item in result.evidence] == ["c2", "c1"]
+    assert len(result.evidence.traces("c1")) == 1
+    assert result.evidence.traces("c1")[0].query == task.query
+    assert exported["chunks"] == exported["chunks_before_sufficiency"]
+    assert [chunk["chunk_id"] for chunk in exported["chunks"]] == ["c2", "c1"]
+    assert "candidate_chunks" not in result.diagnostics
+    assert not hasattr(result, "candidates")
+    assert exported["total"] == 100
+    assert exported["retrieval_task"]["document_ids"] == ("doc1",)
+    assert "response_mode" not in exported
 
-    def execute(index, question, *, context, **options):
-        observed.append(context.request)
-        return retrieval_result(context, collection_from_records([]), collection_from_records([]), None, {})
 
-    monkeypatch.setattr(retrieval, "_retrieve_evidence_result", execute)
-    result = retrieval.retrieve_evidence("test-index", request.user_question, request=request)
-    assert observed == [request]
-    assert result.request is request
-    assert retrieval_record(result)["query_contract"] == request.to_dict()
+def test_external_candidates_survive_empty_primary_results_and_record_conflicts():
+    result = adapt_retrieval_records([], {"candidate_chunks": records(text="候选原文")})
+    assert result.evidence.get("c1").text == "候选原文"
+
+    conflicting = adapt_retrieval_records(records(text="不同原文"), {
+        "candidate_chunks": records(text="候选原文"),
+    })
+    assert len(conflicting.evidence) == 1
+    assert conflicting.evidence.get("c1").text == "候选原文"
+    assert len(conflicting.evidence.conflicts) == 1
+
+
+def test_copy_preserves_sources_but_isolates_collection_and_diagnostics():
+    result = RetrievalResult(
+        evidence=collection_from_records(records()),
+        diagnostics={"stage_latency_ms": {"total": 10}},
+    )
+    copied = result.copy()
+    copied.evidence.merge(collection_from_records(records("c2")))
+    copied.diagnostics["stage_latency_ms"]["total"] = 20
+    assert [item.id for item in result.evidence] == ["c1"]
+    assert copied.evidence.get("c1") is result.evidence.get("c1")
+    assert result.diagnostics["stage_latency_ms"]["total"] == 10

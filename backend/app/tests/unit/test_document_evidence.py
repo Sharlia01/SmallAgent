@@ -1,5 +1,5 @@
 from tests.evidence_helpers import make_query
-from service.core.evidence_adapter import collection_from_records
+from service.core.evidence.adapter import collection_from_records
 from tests.evidence_helpers import make_evidence_record, make_tool_result
 import json
 from types import SimpleNamespace
@@ -8,22 +8,23 @@ from unittest.mock import Mock
 from PIL import Image
 import pytest
 
-from service.core.table_evidence import (
+from service.core.ingestion.tables import (
     bind_table_rows,
     extract_visual_table,
     parse_table_object,
     table_evidence,
 )
-from service.core.table_models import build_table_chunks, make_table_id
-from service.core.figure_evidence import figure_evidence
+from domain.tables import build_table_chunks, make_table_id
+from service.core.ingestion.figures import figure_evidence
 from service.core.rag.nlp import tokenize_table
 from service.core.rag.nlp import rag_tokenizer
-from service.core import file_parse
+from service.core.ingestion import pipeline as file_parse
+from service.core.persistence import evidence_store
 from service.core.rag.utils import es_conn
-from service.core.evidence_verification import verify_evidence
-from service.core.retrieval import format_retrieved_chunk
-from service.core.evidence_adapter import evidence_from_record, reference_records
-from agent.orchestrator import collect_tool_evidence
+from service.core.evidence.verification import verify_evidence
+from service.core.retrieval.pipeline import format_retrieved_chunk
+from service.core.evidence.adapter import evidence_from_record, reference_records
+from agent.loop import collect_tool_evidence
 from agent.schemas import ToolResult
 
 
@@ -369,7 +370,7 @@ def test_table_tokenization_separates_search_text_from_llm_markdown(monkeypatch)
 
 def test_chunk_ids_include_document_and_position_and_images_are_saved(monkeypatch, tmp_path):
     monkeypatch.setattr(file_parse, "batch_generate_embeddings", lambda texts: [[0.1] * 512 for _ in texts])
-    monkeypatch.setattr(file_parse, "get_project_base_directory", lambda: str(tmp_path))
+    monkeypatch.setattr(evidence_store, "get_project_base_directory", lambda: str(tmp_path))
     item = {"content_with_weight": "相同内容", "content_ltks": "相同 内容", "content_sm_ltks": "相同 内容",
             "docnm_kwd": "/tmp/report.pdf", "title_tks": "report", "page_num_int": [2],
             "position_int": [(2, 1, 10, 5, 20)], "evidence_type_kwd": "table", "image": Image.new("RGB", (2, 2))}
@@ -392,7 +393,7 @@ def test_process_items_persists_parent_and_embeds_semantic_text(monkeypatch, tmp
         "batch_generate_embeddings",
         lambda texts: captured.extend(texts) or [[0.1] * 512 for _ in texts],
     )
-    monkeypatch.setattr(file_parse, "get_project_base_directory", lambda: str(tmp_path))
+    monkeypatch.setattr(evidence_store, "get_project_base_directory", lambda: str(tmp_path))
     html = (
         "<table><caption>估值表</caption>"
         "<tr><th>公司</th><th>PE</th></tr>"
@@ -409,7 +410,7 @@ def test_process_items_persists_parent_and_embeds_semantic_text(monkeypatch, tmp
     assert captured == [item["table_semantic_text_with_weight"]]
     assert processed[0]["content_with_weight"] == item["table_markdown_excerpt_with_weight"]
     reference = processed[0]["table_object_ref_kwd"]
-    parent = file_parse.load_table_object(reference)
+    parent = evidence_store.load_table_object(reference)
     assert parent["table_id"] == processed[0]["table_id_kwd"]
     assert parent["provenance"]["document_name"] == "report.pdf"
     assert parent["provenance"]["parser_version"] == file_parse.PARSER_VERSION

@@ -1,6 +1,8 @@
 # RAG 评估
 
-本目录保存 RAG 系统的离线评估数据和后续评估脚本。JSONL 是评测集的主格式，每行是一个完整、独立的 JSON 对象。
+本目录保存 Agent RAG 系统的离线评估数据和评估脚本。JSONL 是评测集的主格式，每行是一个完整、独立的 JSON 对象。
+
+当前边界：`run_retrieval_eval.py` 只执行给定查询的召回与排序；`run_e2e_eval.py` 默认运行完整 Agent，包括理解、初始规划、工具调用、证据核验、缺口补查和回答。纯检索不执行意图识别或充分性判定。检索结果结构版本为 `3.2`，端到端结果结构版本为 `3.1`；不应与旧版内含规划的检索成绩直接比较。端到端从 3.0 起将每次搜索排名、完整核验证据、实际回答上下文分别评分，不再把累计顺序当作 Top K 排名；3.1 起充分性评分及拒答归因共用独立的评测侧标签。
 
 ## 当前数据集
 
@@ -92,7 +94,7 @@ python evals/run_retrieval_eval.py \
 - `expected_retrieval`：期望的 `single`、`parallel` 或 `sequential` 检索模式及跳数；
   当前用于诊断和后续路由评测，不参与检索相关性分数。
 - `relevant_evidence`：标准证据数组；每项包含文件名、PDF 页码和证据内容。若同一段原文在摘要和正文中重复出现，`page` 记录它首次出现的物理页码，页码从 PDF 首页按 1 开始计算。表格和图表证据还包含 `evidence_type` 与 `locator`，分别记录证据模态和具体表格/图号位置。
-- `evidence_requirements`：多证据题的强约束；只有所有要求都命中时，Hit 才算成功。
+- `evidence_requirements`：多证据题的强约束；只有所有要求都命中时，Hit 才算成功。每个 `alternatives` 分支内的 atom 必须全部满足，分支之间任选其一；atom 类型支持 `text`、`table_row` 和 `figure`，其中图表须提供 `locator` 或 `text`。
 - `metadata`：难度、标签、`dev/test/challenge` 数据划分、源文档日期及不可回答原因等信息。
 
 v2 校验还会检查证据 ID 唯一性、claim 到 evidence 的引用关系、期望行为、检索模式，
@@ -100,24 +102,11 @@ v2 校验还会检查证据 ID 唯一性、claim 到 evidence 的引用关系、
 
 评测脚本通过统一入口 `retrieve_evidence()` 获取 `RetrievalResult`，在评测输出处使用 `retrieval_record()` 生成 JSON。结果保留 `chunk_id`、各召回分支的原始排名与分数、RRF 分数、最终语义重排分数、候选总数及查询诊断。当前评测集尚未把标准证据映射到 ES 中的稳定 `chunk_id`，因此评测脚本先校验文档名，再对返回片段和 `relevant_evidence[].text` 做规范化文本匹配。完成第一轮基线并确认切块稳定后，可以把标准 chunk ID 补入证据对象，进一步减少模糊匹配。
 
-检索入口使用不可变用户需求、语义目标、确定性路由、计划校验和有界执行。支持 `single`、`parallel`、`sequential`、`graph`、`clarify`；独立节点可并发，混合图最多 8 个节点。结果保留上下文绑定、局部约束、每步证据来源、预算与缺口补查诊断。改写与扩展开关相互独立，完整无变换基线应同时关闭 `QUERY_REWRITE_ENABLED` 和 `QUERY_EXPANSION_ENABLED`。完整流程、降级行为和当前边界见 [查询管线设计](../docs/query_pipeline.md)。
+当前检索入口只执行给定查询，包括混合召回、重排、过滤、固定别名扩展及表格上下文补全。它不理解需求、不生成子查询、不补查，也不判定答案是否充分。设置 `RETRIEVAL_ALIAS_EXPANSION_ENABLED=false` 可关闭固定别名扩展。原模型改写和扩展开关已移除。
 
-每一跳的语义重排后都会进行第二阶段加权 RRF：语义重排名次权重为 `0.4`，第一阶段检索 RRF 名次权重为 `0.6`，默认平滑常数为 `10`。这种做法只融合两边的名次，不直接混合量纲不同的原始分数。再执行确定性的限定条件兼容性检查，当前覆盖时间范围、实际值/预测值/目标、表图定位符和明确实体；候选未出现可比限定时记为 `unknown`，只有出现明确互斥限定时才记为 `conflict`。明确冲突先降级，其余候选按第二阶段融合分排序。
+端到端问答由 Agent 一次生成需求和初始计划，统一执行并行、多跳和跨工具任务，根据累计证据缺口补查。知识库限定评测只注册知识库工具，统一调用 `execute_agent_turn`，无需选择执行模式。模块边界见 [核心架构说明](../app/service/core/README.md#agent-统一理解与规划)。
 
-递进式检索还会把两跳结果去重，以用户原始问题对合并候选统一重排一次，
-并按原问题重新检查限定条件。不同跳的原始分数不直接比较。首页容量允许时，
-保留第一跳已校验的桥接来源片段以及第二跳按本跳排名选出的独立证据，
-其余位置按统一排名补齐；最后按统一排名展示选中的证据，不按检索跳次固定置顶。
-统一重排不再施加相似度阈值，以免丢失对原问题分数较低、但回答所必需的辅助证据。
-`top_k=1` 时无法保证两跳覆盖，按原问题排名返回一条结果。
-
-`retrieval.retrieval_fusion.final_rerank` 记录原始问题、候选数、判定来源、
-保留的证据 ID 和失败原因。候选数最多为两跳返回片段数之和，去重后只请求一次模型。
-每个 chunk 的 `final_ranking` 记录统一重排名次与 `coverage_reserved`；
-本跳的语义分数、RRF 分数、融合名次和限定诊断保存在 `sequential_subqueries` 中。
-如果额外重排调用失败，保留已取得的两跳证据，按各跳名次做等权 RRF 回退
-（使用 `rrf_k`）；`final_rerank.source=fallback`，统一语义分数为 `null`，
-`final_ranking.fallback_rrf_score` 记录回退分数。
+新纯检索结果与旧版包含规划、补查、充分性过滤的结果不可直接比较。检索结果表示命中而非允许回答，端到端评测才统计最终拒答和回答质量。
 
 对于 `evidence_type=figure` 的样本，`text` 是人工核对图片后写下的视觉事实。当前检索评分优先匹配 `locator`（图标题），因此命中表示找到了目标图的文字定位信息，不代表片段已保留视觉事实或足以回答问题。图表样本应与纯文本、表格样本分开统计。
 
@@ -131,7 +120,7 @@ v2 校验还会检查证据 ID 唯一性、claim 到 evidence 的引用关系、
 
 ## 运行检索评估
 
-评测脚本直接调用生产环境使用的检索器，不调用最终回答模型，但会调用查询处理、重排和证据充分性校验所配置的模型。它会保存 Top K chunk、`chunk_id`、各分支排名和原始分数、RRF 分数、语义重排分数、充分性诊断、位置和耗时，但不会把体积较大的 embedding 向量写入结果文件。
+纯检索评测调用生产搜索入口，仅使用 Embedding 和重排模型，不调用生成式查询处理或充分性核验模型。它会保存 Top K chunk、`chunk_id`、各分支排名和原始分数、RRF 分数、语义重排分数、充分性诊断、位置和耗时，但不会把体积较大的 embedding 向量写入结果文件。
 当前 Embedding 为本地 `bge-small-zh-v1.5`（512 维）。旧的 1024 维
 `text-embedding-v3` 文档必须重新上传生成 `q_512_vec` 后才能评测。
 重排使用本地 `BAAI/bge-reranker-v2-m3`；切换重排模型不需要重新生成向量。
@@ -213,7 +202,9 @@ docker compose exec LS_api \
 
 同名结果默认不会被覆盖。需要明确覆盖时添加 `--overwrite`，或通过 `--run-name` 使用一个新名称。
 
-新结果使用 `result_schema_version: "2.5"`，将指标分为三组：
+历史 2.x 结果将指标分为三组；当前纯检索 3.2 沿用这些字段：
+
+以下三组字段兼容历史记录。当前纯检索仅以 `retrieval_metrics` 衡量效果，`gate_metrics` 没有实际判定，`post_gate_metrics` 不代表回答放行。端到端 3.0 的累计集合改用下文的独立指标。
 
 | 分组 | 数据来源 | 用途 |
 | --- | --- | --- |
@@ -250,7 +241,7 @@ docker compose exec LS_api \
 单独体现。建议结合 `by_question_type` 和 `by_source_modality` 查看切片，
 不要只比较整体均值。
 
-逐题 `retrieval.stage_latency_ms` 记录阶段耗时；并发节点的工作时间会重叠，不能将各字段相加作为总延迟。`stage_latency_semantics` 标明统计口径：
+逐题 `retrieval.stage_latency_ms` 记录阶段耗时。当前纯检索主要记录召回、重排与总耗时；下列其余字段用于读取旧结果，不能把缺省值解释为执行了对应阶段。历史并发节点的工作时间会重叠，不能将各字段相加作为总延迟。
 
 - `query_transform`：意图识别、查询改写和扩展。
 - `initial_retrieval`：关键词/向量召回及 RRF 融合；多查询或多跳时为各次召回之和。
@@ -296,18 +287,53 @@ AllRequirementsHit、拒答召回率等指标以 `1` 为理想值；`error_rate`
   检索报错的样本分别计入
   `disabled_query_count`、`unavailable_query_count`、`error_count`，不进入拒答率分母。
 
-可回答题拒答率不等同于误拒率：原文有答案，不代表召回片段足以回答。2.3 使用
-门控前 `Recall@K=1`（全部标准证据或 requirements 已命中）自动完成这层归因。
+可回答题拒答率不等同于误拒率：原文有答案，不代表召回片段足以回答。历史版本使用
+门控前 `Recall@K=1` 做近似归因；当前使用统一的 `evidence_sufficiency_reference`，
+不再由 recall 重新推断。该标签独立于系统自己的放行决定。
 逐题 `gate_metrics` 记录
 `pre_gate_evidence_sufficient` 和 `rejection_attribution`；后者可能为
 `correct_rejection_after_insufficient_evidence`、
 `false_rejection_with_sufficient_evidence` 或 `correct_unanswerable_rejection`。
 
+`evidence_sufficiency_reference` 保存 `expected_sufficient`（true/false/null）、
+`status`（sufficient/insufficient/unknown）、`source`、`reason` 及规则版本。
+逐题 `gate_metrics`、`sufficiency_metrics` 和拒答归因汇总读取同一份已保存标签。
+规则如下：
+
+- 显式 `expected_evidence_sufficient` 优先，标记来源为 `annotation`；这是评测方的覆盖标签，
+  必须确保适用于本次证据，不能把可回答题的静态 answerable 标签当作它使用。
+- 没有核验前快照时为 unknown；有快照的不可回答题为 insufficient。
+- 对可回答题，检查每个标准证据或 requirement 的全部匹配候选。文本匹配之外，
+  表格要求 `table_binding_kwd=bound`，图表要求 `visual_status_kwd=extracted`。
+  明确 unbound 或未提取的来源不可用；状态缺失或无法识别时为 unknown。
+- requirement 的一个分支必须全部 atom 可用；只要有一个完整可用分支即可。
+  最早的坏片段不会遮住后面的好片段，也不能将不同分支的残缺证据拼成一个完整方案。
+- 所有要求均可用才充分；存在明确无法满足的要求则不充分；其余为 unknown。
+  `candidate_matches` 记录全部命中来源及可用性原因，`alternative_matches` 记录全部分支，
+  原有最早命中排名继续用于检索指标，不用于替代可用性判断。
+
+unknown 不进入充分性正确率、危险放行率和误拒率分母，也不获得正确/错误拒答归因。
+端到端汇总的 `sufficiency_metrics.expected_unknown_count` 和 `actual_unavailable_count`
+分别统计期望标签未知与缺少实际布尔判定，二者可能重叠；`decision_count` 是两者都
+可用的评分分母。门控仍保留实际拒答行为计数，无法归因的可回答题单独计数。
+旧记录缺少统一标签时，归因汇总记为未知，不从旧 recall 猜测。历史已存分数保留其
+原始口径，重新评测才会生成新标签。这一规则仍依赖现有文本匹配，不代表数值语义
+核验；模糊匹配对关键数字的容错问题另行处理。
+
 逐题结果保存 `retrieval.chunks_before_sufficiency`、
 `retrieval.retrieved_count_before_sufficiency`、`retrieval.empty_before_sufficiency`，
-以及 `evidence_matches_before_sufficiency`，以便复查被拒绝的证据及其原始排名。
-`retrieval.total_before_evidence_sufficiency` 保存检查前的候选总数，
-与 Top K 片段数不同。检查前后的片段均通过同一序列化逻辑去除 embedding 向量。
+以及 `evidence_matches_before_sufficiency`，以便复查被拒绝的证据及其位置。
+当前类型化检索结果只有一份 `evidence`；纯检索出口从它生成
+`chunks` 和 `chunks_before_sufficiency`。端到端问答的快照来自 Agent
+实际累计并交给 `verify_evidence` 入口的完整资料，按累计顺序去重，不再截成前 K 条；
+这是核验流程的来源集合，不是内部语义模型经过投影和长度限制后的请求正文。
+最终回答上下文按实际引用顺序单独写入 `chunks`，其 `content_with_weight` 是回答模型
+实际看到的 block 正文，原始来源保存在 `source_content_with_weight` 和 `documents`。
+拒答时保留核验快照，回答集合为空；没有执行核验时快照为 `null`。
+此快照不包含检索器内部已被重排或 Top-K 筛除的全部候选。
+纯检索或历史结果中的 `retrieval.total_before_evidence_sufficiency` 保存检查前的候选总数，
+与 Top K 片段数不同。Agent 的每次调用候选数在 `retrieval.calls` 中，不能用最后一次
+调用代表全部搜索。所有评分片段均通过同一序列化逻辑去除 embedding 向量。
 
 2.2 不再写出与 `post_gate_metrics` 完全重复的逐题 `metrics`，也移除了汇总中重复平铺的
 Hit、Recall、MRR、空结果率、旧拒答率和旧 fallback 率。新结果统一读取上述三组指标；
@@ -316,7 +342,7 @@ Hit、Recall、MRR、空结果率、旧拒答率和旧 fallback 率。新结果�
 聚合器仍可读取带旧 `metrics` 字段的 2.1 历史逐题结果。
 2.3 在保持上述字段兼容的基础上增加门控拒绝归因指标。
 2.4 增加逐题阶段耗时及其整体和切片聚合。
-`average_latency_ms` 是完整检索流程的平均耗时，包含充分性检查，并非某一阶段的耗时。
+`average_latency_ms` 是当前执行边界的平均耗时。3.0 的纯检索不包含规划和充分性检查，历史 2.x 结果可能包含。
 
 历史结果没有检查前快照时，检查前指标及片段标为 `null`，计入 `unavailable_query_count`，
 不补成零分，也不从最终输出推测。已记录的空列表则是实际空检索，会计入评分。
@@ -328,7 +354,7 @@ Hit、Recall、MRR、空结果率、旧拒答率和旧 fallback 率。新结果�
 
 `run_e2e_eval.py` 在不读写聊天数据库、Redis、会话标题和推荐问题的情况下，执行与
 线上相同的知识库检索、证据充分性检查、回答提示词和流式模型响应。该 runner 固定为
-`knowledge_base_only`，不会让 Web 搜索补答知识库不可回答题。默认 `--execution-mode grounded` 直接走检索；`--execution-mode agent` 通过真实 Agent 和 KB 工具执行，支持 `--planner-model`，可检测模型提炼查询时丢失用户约束的问题。Web/KB 混合工具路由仍需独立数据集评估。
+`knowledge_base_only`，不会让 Web 搜索补答知识库不可回答题。统一通过真实 Agent 和 KB 工具执行，支持 `--planner-model`。已移除 `--execution-mode` 参数，旧命令需删去该选项及其值；报告中的 `execution_mode` 固定记录为 `agent`。Web/KB 混合工具路由仍需独立数据集评估。
 
 ```bash
 docker compose exec LS_api \
@@ -354,7 +380,12 @@ Faithfulness，以及逐条 claim 与引用证据的蕴含关系。可通过 `--
 
 每条结果包含：
 
-- `retrieval_metrics`、`gate_metrics`、`post_gate_metrics`：与检索 runner 相同的三阶段指标。
+- `retrieval.calls`：每次真实检索的查询、K、耗时、错误、独立排序片段及 `retrieval_metrics`。
+- `verification_evidence_metrics`：完整核验来源集合的覆盖指标，无 Top-K 截断。
+- `answer_evidence_metrics`：实际回答上下文的覆盖指标，只评估采用的片段和实际正文。
+- `evidence_sufficiency_reference`：根据完整核验集合匹配结果与模态状态生成的独立评测标签。
+- `gate_metrics`：拒答及归因；归因读取统一评测标签，不从 recall 推断。
+- 根节点 `retrieval_metrics`、`post_gate_metrics` 在新 Agent 记录中为 `null`，不再伪造累计排名；旧文件仍能按原口径读取。
 - `answer_metrics`：答案正确性和要求覆盖度；仅对实际回答的可回答题评分。
 - `faithfulness_metrics`：把答案拆成事实主张，并使用全部最终检索证据判断是否直接
   支持；不依赖回答有没有引用标记。包含 `faithfulness_score`、事实主张数、支持及
@@ -364,9 +395,8 @@ Faithfulness，以及逐条 claim 与引用证据的蕴含关系。可通过 `--
   `evidence_truncated` 标记片段列表是否被截断。
 - `citation_metrics`：编号合法率，以及 judge 启用时的引用完整率、精确率和召回率。
 - `refusal_metrics`：期望与实际的 `answer/refuse/clarify` 行为、危险作答和过度拒答。
-- `sufficiency_metrics`：以本次闸门前 Top K 是否覆盖全部标准证据作为期望标签，统计
-  危险放行和错误拒绝。未提取视觉事实的图表和结构未绑定的表格默认不算充分；如有
-  人工复核标签，可用样本字段 `expected_evidence_sufficient` 显式覆盖。
+- `sufficiency_metrics`：将实际判定与 `evidence_sufficiency_reference` 比较，统计
+  危险放行和错误拒绝；标签未知时 `correct=null`，不参与正确率。同步保留标签来源与原因。
 
 Faithfulness 的逐题公式为：
 
@@ -383,28 +413,26 @@ faithfulness_score = 被全部最终证据支持的事实主张数 / 事实主�
 `non_perfect_sample_ids.refusal_metrics.refusal_recall` 和
 `non_perfect_sample_ids.sufficiency_metrics.accuracy`。危险作答、过度拒答、危险放行和
 错误拒绝等反向指标以 `0` 为理想值。
-端到端结果结构版本已更新为 `1.2`。
+端到端结果结构版本为 `3.1`。旧结果中的累计 Top K 已经截断，或缺少完整匹配候选及模态可用性信息；需要重新运行，不能与新分数直接横比。
 
-端到端汇总文件现在同时包含整体检索指标，无需再单独运行检索评测。以
-`--top-k 5` 为例，查看以下路径：
+端到端汇总按题型切片，以下路径也存在于 `metrics.by_question_type.<题型>`：
 
-- `metrics.overall.retrieval_metrics.recall_at_5`：充分性检查前的平均召回率。
-- `metrics.overall.retrieval_metrics.mrr_at_5`：充分性检查前的平均倒数排名。
-- 同组的 `hit_at_5`、`precision_at_5`、`all_requirements_hit_at_5` 和
-  `duplicate_rate_at_5`：命中率、精确率、多证据完整命中率和重复率。
-- `metrics.overall.post_gate_metrics`：充分性检查后交给回答模型的证据指标。
+- `metrics.overall.verification_evidence_metrics.recall`：完整核验来源集合的宏平均覆盖率。
+- `metrics.overall.answer_evidence_metrics.recall`：实际回答上下文的宏平均覆盖率。
+- 两个集合指标组还包含 `hit`、`precision`、`all_requirements_hit`、`duplicate_rate`，
+  不带 `@K`，也不提供 MRR。precision 的分母为该集合实际片段数，空集合时为 `null`。
+  已知空集合的可回答题 recall 为 0；缺少快照时为未知。各指标同时报告评分分母，
+  并在组内 `non_perfect_sample_ids` 列出未达标样本。
+- `metrics.overall.retrieval_call_metrics.by_top_k.5`：所有 K=5 的真实检索调用的排名统计。
+  这里的 `query_count/evaluated_query_count/error_count` 按调用计数，不按用户问题计数；
+  不同 K 分开汇总。每次调用都以整道题的 gold 作诊断（`reference_scope=whole_question`），
+  子查询本来只覆盖部分要求，不能把这个分数当作子查询成功率或整体任务完成率。
 - `metrics.overall.gate_metrics`：放行、拒绝、检查失败及拒绝原因归因统计。
 
-`metrics.by_question_type` 中也包含这三组统计。
-`non_perfect_sample_ids` 同步提供检索指标对应的未达标样本 ID，原有答案、引用和
-拒答指标及其样本列表继续保留。运行结束后终端也会打印整体统计。
-
-统计口径与检索 runner 共用：Hit/Recall/Precision/MRR 只对成功且该阶段数据可用的
-可回答题做宏平均；不可回答题、执行异常和缺失阶段数据不补成零分。检索指标组包含
-`evaluated_query_count`、`unavailable_query_count`、`error_count` 等计数；无可用分母
-时指标为 `null`。多证据题的 MRR 仍按全部要求被满足时的排名计算。
-K 跟随实际 `--top-k`，例如 `--top-k 10` 只输出 `@10`。这些检索统计不依赖 judge，
-使用 `--no-judge` 时仍然输出；历史结果文件不会被自动改写。
+集合质量只对成功且数据可用的可回答题做宏平均；不可回答题、执行异常和缺失数据
+不补成零分。`retrieval_call_metrics` 区分没有调用（已记录的空列表）与没有调用快照
+（未知）。每次检索仍沿用原有 Hit/MRR 规则。纯检索 runner 的 @K 口径不变。
+这些统计不依赖 judge，使用 `--no-judge` 时仍然输出；历史结果文件不会被自动改写。
 
 证据不充分时，runner 与线上知识库工具共用确定性拒答策略，不调用回答模型。
 数据集可选字段 `expected_behavior` 可显式取 `answer`、`refuse` 或 `clarify`；`conversation_history` 可提供 user/assistant 历史消息。省略行为时从
@@ -434,7 +462,19 @@ python evals/html_report.py evals/results/agent_test_smoke_20261008.jsonl
 ```bash
 docker compose exec LS_api python /app/evals/run_e2e_eval.py \
   --dataset /app/evals/data/power_reports_eval_v2_dev.jsonl \
-  --execution-mode agent --index-name <用户ID> --split dev --run-name agent_dev_v3
+  --index-name <用户ID> --split dev --run-name agent_dev_v3
 ```
 
-汇总 `query_metrics` 记录计划回退率、`expected_retrieval.mode` 与路由的一致率、目标支持率、补查成功率、模型/检索调用数和 token 报告覆盖数。路由一致率是规划诊断，不替代证据或答案质量。缺少 runtime 或 token 用量的样本标为不可用，不补成零。Agent 模式包含规划调用；最终回答、Web 搜索与 judge 成本不在查询 runtime 内。样本数、失败率和各切片应与成本、P95/P99 一起审阅。
+逐题 `agent_execution` 记录任务、工具查询、依赖绑定和停止原因。`query_metrics` 保留历史规划字段供旧记录读取；新 Agent 不再生成旧 RAG 的路由与补查报告，缺失字段不能当成成功率。请求 runtime 记录规划、证据核验、桥接及工具搜索预算；最终回答流和 judge 成本另行统计。样本数、失败率和各切片应与成本、P95/P99 一起审阅。
+
+### 结构化财务需求回归
+
+首次 Agent 理解响应包含 `financial`，其中事实、计算、未解决要求均关联目标和原文。端到端逐题检索诊断保留 `query_understanding.financial`（固定需求）、`financial_requirements`（当前绑定结果）和 `financial_bindings`（绑定来源）。纯检索不生成这些对象。
+
+重点检查公司与期间的对应、实际/预测口径、未知指标是否遗漏、计算基期与操作数方向、补查变量绑定以及缓存版本。财务证据单元测试使用固定需求夹具，理解协议由独立测试覆盖，避免在核验测试中继续调用已删除的问句解析器。
+
+### 财务关系核验回归
+
+`financial_fact_bundle` 新增 `requirement_results`、`relationship_results`、`verification_status` 和诊断信息。测试应分别统计支持、缺失、歧义、冲突、能力限制与核验失败，不能把服务故障统计为无答案。对有标注的真实样本另行衡量误放行率与误拒绝率；模拟模型响应的单元测试不代表实际模型准确率。
+
+覆盖跨句主体/期间、表头与原始坐标、脚注口径、近似值、伪造引文、数字截取、规则与模型配对分歧、不同需求缓存隔离、补查新增来源、模型超时和预算耗尽。`test_financial_relationships.py` 使用固定候选与判断响应，不联网。完整离线单元回归可设置 `RAG_FINANCIAL_FACT_MODEL_ENABLED=false`，混合核验测试会显式开启 hybrid 并注入模拟客户端。

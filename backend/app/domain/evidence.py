@@ -166,8 +166,8 @@ class EvidenceStructure:
 class RetrievalTrace:
     """某次检索命中记录，排名和分数不改变原始证据的身份。"""
 
-    query: str = ""
-    scores: Mapping[str, Any] = field(default_factory=dict)
+    query: str = ""  ## 用什么查询搜到的
+    scores: Mapping[str, Any] = field(default_factory=dict)  # 这次检索的分数、排名等信息
 
     def __post_init__(self):
         object.__setattr__(self, "scores", freeze(self.scores))
@@ -191,21 +191,21 @@ class Evidence:
     def version(self) -> str:
         return fingerprint(self)
 
-
+# 同一个证据 ID，对应了不同的证据数据，新增的证据和EvidenceCollection中已有的证据不一致
 @dataclass(frozen=True, slots=True)
 class EvidenceConflict:
-    evidence_id: str
-    retained_version: str
-    incoming_version: str
+    evidence_id: str  # 证据 ID
+    retained_version: str  # 保留的版本
+    incoming_version: str  # 新增的版本
 
 
 class EvidenceCollection:
     """按稳定标识合并证据，集中维护顺序、检索轨迹和身份冲突。"""
 
     def __init__(self, evidence: Iterable[Evidence] = ()):
-        self._items: dict[str, Evidence] = {}
-        self._traces: dict[str, list[RetrievalTrace]] = {}
-        self._conflicts: list[EvidenceConflict] = []
+        self._items: dict[str, Evidence] = {}  #证据，按 ID 存放
+        self._traces: dict[str, list[RetrievalTrace]] = {}  #每条证据的检索记录
+        self._conflicts: list[EvidenceConflict] = []  #证据冲突记录，主要检查同一个证据编号是否有被混用
         for item in evidence:
             self.add(item)
 

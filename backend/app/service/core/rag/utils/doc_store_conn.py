@@ -60,10 +60,10 @@ class SparseVector:
 class MatchTextExpr(ABC):
     def __init__(
         self,
-        fields: list[str],
-        matching_text: str,
-        topn: int,
-        extra_options: dict = dict(),
+        fields: list[str],  #搜索哪些索引字段，可以指定字段权重	["title_tks^10", "content_ltks^2"]
+        matching_text: str, #检索表达式，包含关键词、词权重、同义词或短语等	"(营业收入)^3 OR (营收)^1"
+        topn: int,  #表达式携带的预期召回数量
+        extra_options: dict = dict(),  #附加检索配置
     ):
         self.fields = fields
         self.matching_text = matching_text

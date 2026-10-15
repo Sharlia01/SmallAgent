@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from domain.evidence import fingerprint
-from domain.facts import FactEvidenceBundle
+from domain.facts import FinancialFactAssessment
 
 EvidenceAssessmentSource = Literal["model", "rule", "fallback", "disabled"]
 
@@ -24,7 +24,7 @@ class EvidenceAssessment:
     goal_coverage: list[dict[str, Any]] = field(default_factory=list)
     used_derived_evidence_ids: list[str] = field(default_factory=list)
     verification_status: str = "completed"
-    facts: FactEvidenceBundle = field(default_factory=FactEvidenceBundle)
+    facts: FinancialFactAssessment = field(default_factory=FinancialFactAssessment)
     diagnostics: dict[str, Any] = field(default_factory=dict)
     query_version: str = ""
     evidence_version: str = ""

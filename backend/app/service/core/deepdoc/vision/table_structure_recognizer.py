@@ -22,7 +22,7 @@ from collections import Counter
 import numpy as np
 from huggingface_hub import snapshot_download
 
-from service.core.api.utils.file_utils import get_project_base_directory
+from service.core.resources.paths import get_project_base_directory
 from service.core.rag.nlp import rag_tokenizer
 from .recognizer import Recognizer
 

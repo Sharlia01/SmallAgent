@@ -26,12 +26,12 @@ from elasticsearch import BadRequestError, Elasticsearch
 from elasticsearch.helpers import scan
 from elasticsearch_dsl import UpdateByQuery, Q, Search, Index
 from service.core.rag.utils import singleton
-from service.core.api.utils.file_utils import get_project_base_directory
+from service.core.resources.paths import get_project_base_directory
 from service.core.rag.utils.doc_store_conn import MatchExpr, OrderByExpr, MatchTextExpr, MatchDenseExpr, FusionExpr
 from service.core.rag.nlp import is_english
 from dotenv import load_dotenv
-from service.core.query_runtime import current_runtime, QueryBudgetExceeded
-from service.core.entity_retrieval import COMPANY_FILTER_KEY, CANDIDATE_STATUSES
+from service.core.runtime.context import current_runtime, QueryBudgetExceeded
+from service.core.retrieval.entities import COMPANY_FILTER_KEY, CANDIDATE_STATUSES
 
 load_dotenv()
 

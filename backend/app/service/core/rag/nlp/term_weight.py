@@ -22,7 +22,7 @@ import re
 import os
 import numpy as np
 from service.core.rag.nlp import rag_tokenizer
-from service.core.api.utils.file_utils import get_project_base_directory
+from service.core.resources.paths import get_project_base_directory
 
 
 class Dealer:

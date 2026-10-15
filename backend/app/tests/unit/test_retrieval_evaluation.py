@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from service.core.retrieval_evaluation import (
+from evaluation.retrieval import (
     build_error_case,
     build_summary,
     evaluate_retrieval_case,
@@ -227,7 +227,7 @@ def test_rejected_hit_keeps_pre_gate_ranking_and_serializable_evidence():
         "evidence_sufficiency": {"source": "model", "sufficient": False},
     }, metric_ks=(1, 3, 5))
 
-    assert result["result_schema_version"] == "2.5"
+    assert result["result_schema_version"] == "3.2"
     assert result["retrieval"]["metric_ks"] == [1, 3, 5]
     assert result["retrieval_metrics"]["hit_at_1"] is False
     assert result["retrieval_metrics"]["hit_at_3"] is True
@@ -500,7 +500,7 @@ def test_summary_keeps_correct_denominators_and_all_slices():
     )
     summary = build_summary([accepted, rejected, unanswerable, failed], top_k=5)
     overall = summary["overall"]
-    assert summary["result_schema_version"] == "2.5"
+    assert summary["result_schema_version"] == "3.2"
     assert summary["metric_ks"] == [5]
     assert "hit_at_1" not in overall["retrieval_metrics"]
     assert "hit_at_3" not in overall["retrieval_metrics"]

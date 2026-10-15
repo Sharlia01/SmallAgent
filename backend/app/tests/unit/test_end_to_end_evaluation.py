@@ -1,12 +1,12 @@
 import pytest
 
-from service.core.end_to_end_evaluation import (
+from evaluation.end_to_end import (
     aggregate_e2e_results,
     build_e2e_summary,
     evaluate_refusal,
     evaluate_sufficiency,
 )
-from service.core.retrieval_evaluation import (
+from evaluation.retrieval import (
     build_error_case,
     build_summary,
     evaluate_retrieval_case,
@@ -136,28 +136,15 @@ def test_e2e_aggregation_reports_unsafe_answers_and_over_refusals():
 
 @pytest.mark.unit
 def test_unread_figure_match_is_relevant_but_not_sufficient():
-    result = evaluate_sufficiency(
-        {"answerable": True},
-        {
-            "evidence_matches_before_sufficiency": [
-                {
-                    "matched": True,
-                    "matched_chunk_id": "figure-1",
-                    "evidence_type": "figure",
-                }
-            ],
-            "retrieval": {
-                "chunks_before_sufficiency": [
-                    {
-                        "chunk_id": "figure-1",
-                        "evidence_type_kwd": "figure",
-                        "visual_status_kwd": "disabled",
-                    }
-                ],
-                "evidence_sufficiency": {"sufficient": False},
-            },
-        },
-    )
+    sample = {"answerable": True, "relevant_evidence": [
+        {"document_name": "报告.pdf", "evidence_type": "figure", "locator": "图1 收入", "text": "收入增长"}
+    ]}
+    case = evaluate_retrieval_case(sample, {
+        "chunks_before_sufficiency": [{"chunk_id": "figure-1", "document_name": "报告.pdf",
+                                        "content_with_weight": "图1 收入", "visual_status_kwd": "disabled"}],
+        "chunks": [], "evidence_sufficiency": {"source": "rule", "sufficient": False},
+    }, latency_ms=1, top_k=5, match_threshold=1)
+    result = evaluate_sufficiency(sample, case)
 
     assert result["expected_sufficient"] is False
     assert result["correct"] is True
@@ -250,7 +237,7 @@ def test_e2e_summary_aggregates_retrieval_scores_and_slices(top_k):
     overall = summary["overall"]
     before = overall["retrieval_metrics"]
     after = overall["post_gate_metrics"]
-    assert summary["result_schema_version"] == "1.2"
+    assert summary["result_schema_version"] == "3.1"
     assert summary["metric_ks"] == [top_k]
     assert before["query_count"] == 4
     assert before["evaluated_query_count"] == 3

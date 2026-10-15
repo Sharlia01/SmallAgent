@@ -3,7 +3,7 @@ import json
 
 import pytest
 
-from service.core.citation_evaluation import evaluate_citations, parse_answer_claims
+from evaluation.citations import evaluate_citations, parse_answer_claims
 
 
 class FakeCompletions:
