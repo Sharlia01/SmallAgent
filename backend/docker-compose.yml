@@ -47,6 +47,7 @@ services:
     volumes:
       - ./app:/app/app
       - ./evals:/app/evals
+      - ./logs:/app/logs
       - ./pdf:/app/pdf:ro
       - ./nltk_data:/usr/local/nltk_data
       - "${BGE_MODEL_HOST_PATH:-../../models/bge-small-zh-v1.5}:/models/bge-small-zh-v1.5:ro"

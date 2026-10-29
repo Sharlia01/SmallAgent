@@ -5,7 +5,6 @@ import pytest
 from agent.loop import collect_tool_evidence
 from agent.schemas import ToolResult
 from domain.assessment import EvidenceAssessment
-from domain.facts import FinancialFactAssessment
 from service.core.evidence import verification as verification
 from service.core.evidence.adapter import collection_from_records, reference_records
 from service.core.evidence.assessment import finalize_assessment, verification_policy_version
@@ -34,17 +33,10 @@ def assessment(evidence, *, sufficient=True):
 def test_reuse_requires_the_same_semantic_mode(monkeypatch, initial_mode):
     query, evidence = make_query("差旅如何审批？"), sources()
     checked = []
-    facts_checked = []
-
-    def facts(*args, **kwargs):
-        facts_checked.append(kwargs["allow_model"])
-        return FinancialFactAssessment()
-
     def sufficiency(question, sources, *, require_semantic, **kwargs):
         checked.append(require_semantic)
         return assessment(sources)
 
-    monkeypatch.setattr(verification, "assess_financial_facts", facts)
     monkeypatch.setattr(verification, "assess_evidence_sufficiency", sufficiency)
     first = verification.verify_evidence(query, evidence, require_semantic=initial_mode)
     assert first.require_semantic is initial_mode
@@ -53,7 +45,7 @@ def test_reuse_requires_the_same_semantic_mode(monkeypatch, initial_mode):
     second = verification.verify_evidence(query, evidence, previous=first, require_semantic=not initial_mode)
     assert second is not first
     assert second.require_semantic is not initial_mode
-    assert checked == facts_checked == [initial_mode, not initial_mode]
+    assert checked == [initial_mode, not initial_mode]
     assert not first.matches(query.version, evidence.version, verification_policy_version(),
                              require_semantic=not initial_mode)
     with pytest.raises(ValueError, match="核验模式"):
@@ -103,6 +95,100 @@ def test_external_subset_preserves_full_evidence_order_for_report_reuse(monkeypa
     tool = ToolResult("search_knowledge_base", query.question, "", evidence=result.evidence)
     combined = collect_tool_evidence([tool])
     assert [item.id for item in combined] == ["first", "second"]
-    monkeypatch.setattr(verification, "assess_financial_facts",
+    monkeypatch.setattr(verification, "assess_evidence_sufficiency",
                         lambda *args, **kwargs: pytest.fail("同一证据集合的报告应复用"))
     assert verification.verify_evidence(query, combined, previous=report) is report
+
+
+def test_context_budget_change_invalidates_previous_report(monkeypatch):
+    query, evidence = make_query("差旅如何报销？"), sources()
+    monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_CONTEXT_TOKENS", "16384")
+    report = finalize_assessment(query, evidence, assessment(evidence))
+    monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_CONTEXT_TOKENS", "32768")
+    assert not report.matches(query.version, evidence.version, verification_policy_version())
+
+
+def incremental_fixture(monkeypatch, *, conflict=False):
+    query = make_query("收入和原因？")
+    old = collection_from_records([
+        {"chunk_id": identifier, "content_with_weight": identifier + " 原文"}
+        for identifier in ("unused", "global", "goal")
+    ])
+    def first_check(question, evidence, **kwargs):
+        return EvidenceAssessment(
+            False, "原因缺失", source="model", missing_requirements=["原因"],
+            evaluated_chunk_ids=[item.id for item in evidence], evaluated_chunk_count=len(evidence),
+            supporting_chunk_indices=[2, 3],
+            goal_coverage=[{"goal_id": "income", "status": "conflict" if conflict else "supported",
+                            "supporting_chunk_ids": ["goal"]},
+                           {"goal_id": "reason", "status": "missing",
+                            "supporting_chunk_ids": ["global"]}],
+        )
+    monkeypatch.setattr(verification, "assess_evidence_sufficiency", first_check)
+    previous = verification.verify_evidence(query, old)
+    current = old.copy()
+    current.merge(collection_from_records([{"chunk_id": "new", "content_with_weight": "新增原因"}]))
+    return query, current, previous
+
+
+def test_incremental_union_reindexes_and_binds_complete_scope(monkeypatch):
+    query, current, previous = incremental_fixture(monkeypatch)
+    calls = []
+    def check(question, evidence, **kwargs):
+        calls.append([item.id for item in evidence])
+        return EvidenceAssessment(True, "完整", source="model", supporting_chunk_indices=[1, 3],
+                                  evaluated_chunk_ids=calls[-1], evaluated_chunk_count=len(evidence))
+    monkeypatch.setattr(verification, "assess_evidence_sufficiency", check)
+    report = verification.verify_evidence(query, current, previous=previous)
+    assert calls == [["global", "goal", "new"]]
+    context = build_answer_context(query, current, report)
+    assert [block.evidence_id for block in context.blocks] == ["global", "new"]
+    assert verification.verify_evidence(query, current, previous=report) is report
+    assert len(calls) == 1
+    assert previous.evaluated_chunk_ids == ["unused", "global", "goal"]
+
+
+@pytest.mark.parametrize("failure", ["insufficient", "input_limit", "service_unavailable"])
+def test_incremental_restores_material_only_for_evidence_shortfall(monkeypatch, failure):
+    query, current, previous = incremental_fixture(monkeypatch)
+    calls = []
+    def check(question, evidence, **kwargs):
+        calls.append([item.id for item in evidence])
+        if len(calls) == 2:
+            return assessment(evidence)
+        return EvidenceAssessment(False, "未通过", source="model" if failure == "insufficient" else "fallback",
+                                  verification_status="completed" if failure == "insufficient" else "unavailable",
+                                  diagnostics={"failure_kind": failure})
+    monkeypatch.setattr(verification, "assess_evidence_sufficiency", check)
+    report = verification.verify_evidence(query, current, previous=previous)
+    assert calls[0] == ["global", "goal", "new"]
+    restored = failure != "service_unavailable"
+    assert len(calls) == (2 if restored else 1)
+    assert report.diagnostics["incremental_restored_full_input"] is restored
+    if restored:
+        assert calls[1] == [item.id for item in current]
+
+
+@pytest.mark.parametrize("change", ["content", "removed", "query", "policy", "conflict", "tampered"])
+def test_incremental_invalid_old_scope_uses_all_candidates(monkeypatch, change):
+    query, current, previous = incremental_fixture(monkeypatch, conflict=change == "conflict")
+    if change == "content":
+        current = collection_from_records([
+            {"chunk_id": item.id, "content_with_weight": "修改" if item.id == "global" else item.text}
+            for item in current
+        ])
+    elif change == "removed":
+        current = current.select(["unused", "goal", "new"])
+    elif change == "query":
+        query = make_query("另一个问题")
+    elif change == "policy":
+        monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_CONTEXT_TOKENS", "12345")
+    elif change == "tampered":
+        previous.goal_coverage.clear()
+    calls = []
+    def check(question, evidence, **kwargs):
+        calls.append([item.id for item in evidence])
+        return assessment(evidence)
+    monkeypatch.setattr(verification, "assess_evidence_sufficiency", check)
+    verification.verify_evidence(query, current, previous=previous)
+    assert calls == [[item.id for item in current]]

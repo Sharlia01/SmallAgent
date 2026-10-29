@@ -347,3 +347,33 @@ def test_e2e_summary_preserves_multi_evidence_completion_rank():
         assert metrics["hit_at_5"] == 1.0
         assert metrics["all_requirements_hit_at_5"] == 1.0
         assert metrics["mrr_at_5"] == pytest.approx(1 / 3, abs=1e-6)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('outcome', ['invalid_plan', 'unsupported_capability', 'calculation_error', 'execution_error'])
+def test_non_evidence_failures_are_not_scored_as_correct_refusals(outcome):
+    sample = {'id': 'sample', 'answerable': False, 'expected_behavior': 'refuse', 'evidence': []}
+    decision = {'sufficient': False, 'source': 'rule', 'outcome': outcome}
+    raw = {'chunks': [], 'chunks_before_sufficiency': [], 'evidence_sufficiency': decision,
+           'agent_execution': {'outcome': outcome}}
+    case = evaluate_retrieval_case(sample, raw, latency_ms=1, top_k=5, match_threshold=0.8)
+    refusal = evaluate_refusal(sample, 'refuse', outcome=outcome)
+    sufficiency = evaluate_sufficiency(sample, case)
+    assert refusal['correct'] is None and refusal['actual_behavior'] == outcome
+    assert sufficiency['correct'] is None and sufficiency['actual_sufficient'] is None
+    assert case['gate_metrics']['rejected'] is None
+    assert case['gate_metrics']['rejection_attribution'] == outcome
+    result = {**case, 'outcome': outcome, 'response_mode': 'refuse', 'latency_ms': {'total': 1},
+              'refusal_metrics': refusal, 'sufficiency_metrics': sufficiency,
+              'answer_metrics': {}, 'faithfulness_metrics': {}, 'citation_metrics': {}}
+    summary = aggregate_e2e_results([result])
+    assert summary['refusal_metrics']['actual_refusal_count'] == 0
+    assert summary['refusal_metrics']['refusal_precision'] is None
+    assert summary['outcome_counts'] == {outcome: 1}
+    assert summary['non_evidence_failure_count'] == 1
+
+
+@pytest.mark.unit
+def test_genuine_insufficient_evidence_still_counts_as_normal_refusal():
+    result = evaluate_refusal({'answerable': False}, 'refuse', outcome='insufficient_evidence')
+    assert result['correct'] is True and result['actual_behavior'] == 'refuse'

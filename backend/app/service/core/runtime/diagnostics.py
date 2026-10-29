@@ -31,6 +31,10 @@ def failure_details(error: Exception, *, default_rule: str = "unexpected_error",
     for name in ("node_id", "goal_id"):
         if getattr(error, name, None) is not None:
             fields[name] = getattr(error, name)
+    source_spans = getattr(error, "source_spans", None)
+    if source_spans is not None:
+        fields["source_spans"] = [span[:1000] for span in source_spans[:8]]
+        fields["source_spans_truncated"] = len(source_spans) > 8 or any(len(span) > 1000 for span in source_spans)
     context = getattr(error, "context", None)
     if context:
         # 诊断信息不包含提供方对象或大小不受限的数据。

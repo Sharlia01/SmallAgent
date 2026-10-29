@@ -67,9 +67,9 @@ def test_structured_table_cells_match_before_rendered_content():
     }
     retrieved = {
         "docnm_kwd": "国电电力.pdf",
-        "table_cells_kwd": [
+        "table_cells_slice_obj": {"rows": [{"cells": [
             "001289.sz", "龙源电力", "16.65", "1392", "19.6",
-        ],
+        ]}]},
         "content_with_weight": "文本措辞可以与gold不同",
     }
 
@@ -95,7 +95,7 @@ def test_table_field_aliases_match_chinese_english_and_unit_labels(
     }
     retrieved = {
         "docnm_kwd": "国电电力.pdf",
-        "table_cells_kwd": [extracted_label, "14.3", "8.20"],
+        "table_cells_slice_obj": {"rows": [{"cells": [extracted_label, "14.3", "8.20"]}]},
     }
 
     assert table_row_chunk_match_score(evidence, retrieved) == 1.0
@@ -108,7 +108,7 @@ def test_table_numeric_units_and_currency_scales_are_normalized():
     }
     retrieved = {
         "docnm_kwd": "国电电力.pdf",
-        "table_cells_kwd": ["归母净利润", "7,050百万元", "0.400元"],
+        "table_cells_slice_obj": {"rows": [{"cells": ["归母净利润", "7,050百万元", "0.400元"]}]},
     }
 
     assert table_row_chunk_match_score(evidence, retrieved) == 1.0
@@ -121,7 +121,7 @@ def test_table_numeric_normalization_does_not_merge_incompatible_units():
     }
     retrieved = {
         "docnm_kwd": "国电电力.pdf",
-        "table_cells_kwd": ["指标", "10%"],
+        "table_cells_slice_obj": {"rows": [{"cells": ["指标", "10%"]}]},
     }
 
     assert table_row_chunk_match_score(evidence, retrieved) == 0.0
@@ -134,7 +134,7 @@ def test_table_field_aliases_do_not_merge_distinct_financial_metrics():
     }
     retrieved = {
         "docnm_kwd": "国电电力.pdf",
-        "table_cells_kwd": ["市净率（PB）", "14.3"],
+        "table_cells_slice_obj": {"rows": [{"cells": ["市净率（PB）", "14.3"]}]},
     }
 
     assert table_row_chunk_match_score(evidence, retrieved) == 0.0
@@ -149,7 +149,7 @@ def test_structured_table_cell_mismatch_cannot_be_hidden_by_duplicate_text():
     }
     retrieved = {
         "docnm_kwd": "国电电力.pdf",
-        "table_cells_kwd": ["龙源电力", "18.6"],
+        "table_cells_slice_obj": {"rows": [{"cells": ["龙源电力", "18.6"]}]},
         "content_with_weight": "龙源电力 19.6",
     }
 
@@ -164,7 +164,7 @@ def test_reliable_parent_expansion_matches_a_neighboring_table_row():
     }
     retrieved = {
         "docnm_kwd": "国电电力.pdf",
-        "table_cells_kwd": ["归母净利润", "7050", "7895", "8717"],
+        "table_cells_slice_obj": {"rows": [{"cells": ["归母净利润", "7050", "7895", "8717"]}]},
         "table_context_obj": {
             "reliable": True,
             "rows": [{
@@ -187,7 +187,7 @@ def test_unreliable_parent_expansion_cannot_override_atomic_cell_mismatch():
     }
     retrieved = {
         "docnm_kwd": "国电电力.pdf",
-        "table_cells_kwd": ["每股收益", "0.41"],
+        "table_cells_slice_obj": {"rows": [{"cells": ["每股收益", "0.41"]}]},
         "table_context_obj": {
             "reliable": False,
             "rows": [{"cells": ["每股收益", "0.40"]}],

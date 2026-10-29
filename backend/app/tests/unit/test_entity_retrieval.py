@@ -1,4 +1,4 @@
-"""所有独立检索分支都必须携带相同的公司范围。"""
+"""所有召回分支仅按显式文档/知识库范围过滤，公司仅作为排序线索。"""
 
 from copy import deepcopy
 
@@ -6,8 +6,8 @@ import pytest
 
 from service.core.retrieval import pipeline as retrieval
 from service.core.retrieval import entities as entity_retrieval
-from service.core.entities.attribution import EntityRegistry
-from service.core.retrieval.entities import resolve_company_constraint, COMPANY_FILTER_KEY
+from service.core.entities.registry import EntityRegistry
+from service.core.retrieval.entities import resolve_company_hints
 from service.core.rag.nlp.search_v2 import Dealer
 from service.core.rag.utils.doc_store_conn import MatchTextExpr, MatchDenseExpr, OrderByExpr
 from service.core.rag.utils.es_conn import ESConnection
@@ -47,16 +47,16 @@ def registry(monkeypatch):
     ("营业收入是什么", (), "no_registered_company"),
 ])
 def test_query_scope_uses_reviewed_identity_and_keeps_uncertainty(registry, question, ids, status):
-    scope = resolve_company_constraint(question)
+    scope = resolve_company_hints(question)
     assert scope.entity_ids == ids
     assert scope.status == status
-    assert scope.enabled == bool(ids)
+    assert scope.resolved == bool(ids)
     assert scope.registry_version == registry.version
 
 
 
 
-def test_every_branch_and_keyword_retry_keep_identical_company_scope(registry):
+def test_every_branch_preserves_document_scope_without_company_filter(registry):
     calls = []
 
     class Store:
@@ -86,23 +86,22 @@ def test_every_branch_and_keyword_retry_keep_identical_company_scope(registry):
     ), "乙公司 营业收入")
     result = dealer.search(request, ["42"], ["kb-a"])
 
-    # 原词、原词放宽、扩展词、扩展词放宽、向量；全部无结果也不取消公司限制。
+    # 原词、放宽词、扩展词、向量均保留显式文档范围，不附加公司归属门槛。
     assert len(calls) == 5
     assert all(condition == {
         "kb_id": ["kb-a"], "doc_id": ["doc-a"], "available_int": 1,
-        COMPANY_FILTER_KEY: ["a"],
     } for condition, _ in calls)
     assert [expression.extra_options["minimum_should_match"] for _, expression in calls[:4]] == [
         0.3, 0.1, 0.3, 0.1,
     ]
     assert isinstance(calls[-1][1], MatchDenseExpr)
-    assert result.ids == []
+    assert result.candidate_ids == []
 
 
 def test_keyword_and_knn_use_same_prefilter_with_existing_scopes(registry, monkeypatch):
     monkeypatch.setenv("ELASTIC_PASSWORD", "test-only-password")
     connection = ESConnection()
-    condition = {COMPANY_FILTER_KEY: ["a"], "doc_id": ["doc-a"], "kb_id": ["kb-a"], "available_int": 1}
+    condition = {"doc_id": ["doc-a"], "kb_id": ["kb-a"], "available_int": 1}
     saved_condition = deepcopy(condition)
     expressions = [
         MatchTextExpr(["content_ltks"], "营收", 10, {"minimum_should_match": 0.3}),
@@ -119,17 +118,13 @@ def test_keyword_and_knn_use_same_prefilter_with_existing_scopes(registry, monke
     assert "query" not in bodies[1]  # 向量候选在搜索前筛选，不在搜完后删除。
     assert {"terms": {"doc_id": ["doc-a"]}} in lexical_filter
     assert {"terms": {"kb_id": ["kb-a"]}} in lexical_filter
-    company_filter = lexical_filter[0]["bool"]
-    assert company_filter["minimum_should_match"] == 1
-    assert company_filter["should"][0] == {"terms": {"subject_entity_ids": ["a"]}}
-    assert company_filter["should"][1]["bool"]["must_not"] == [{"exists": {"field": "subject_entity_ids"}}]
-
-
+    serialized = str(bodies)
+    assert "subject_entity_ids" not in serialized and "candidate_subject_entity_ids" not in serialized
 
 
 def test_company_diagnostics_survive_chat_result_format(registry):
-    diagnostic = resolve_company_constraint("甲公司2023营收").to_dict()
-    _, diagnostics = retrieval.format_retrieval_results({"company_constraint": diagnostic, "chunks": []})
-    assert diagnostics["company_constraint"] == diagnostic
-    assert diagnostic["untagged_policy"] == "exclude_when_enabled"
-    assert diagnostic["candidate_ownership"] == "not_verified"
+    diagnostic = resolve_company_hints("甲公司2023营收").to_dict()
+    _, diagnostics = retrieval.format_retrieval_results({"company_hints": diagnostic, "chunks": []})
+    assert diagnostics["company_hints"] == diagnostic
+    assert diagnostic["usage"] == "ranking_hint"
+    assert "untagged_policy" not in diagnostic

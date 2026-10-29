@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from domain.outcomes import NON_EVIDENCE_OUTCOMES, result_outcome
+
 import json
 from collections import Counter, defaultdict
 from typing import Any, Iterable
@@ -65,7 +67,8 @@ def _non_perfect_sample_ids(
     results: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """将未达到理想值的端到端指标映射到相应样本。"""
-    successful = [result for result in results if not result.get("error")]
+    successful = [result for result in results if not result.get("error")
+                  and result_outcome(result) not in NON_EVIDENCE_OUTCOMES]
     answered = [
         result for result in successful if result.get("response_mode") == "answer"
     ]
@@ -282,11 +285,15 @@ def evaluate_answer_quality(
 def evaluate_refusal(
     sample: dict[str, Any],
     response_mode: str,
+    *, outcome: str | None = None,
 ) -> dict[str, Any]:
     expected = sample.get("expected_behavior")
     if expected not in {"answer", "refuse", "clarify"}:
         expected = "answer" if sample.get("answerable") else "refuse"
     actual = response_mode if response_mode in {"answer", "refuse", "clarify"} else "unknown"
+    if outcome in NON_EVIDENCE_OUTCOMES:
+        return {"expected_behavior": expected, "actual_behavior": outcome, "correct": None,
+                "unsafe_answer": False, "over_refusal": False, "outcome": outcome}
     return {
         "expected_behavior": expected,
         "actual_behavior": actual,
@@ -311,7 +318,7 @@ def evaluate_sufficiency(
         retrieval_case.get("retrieval", {}).get("evidence_sufficiency") or {}
     )
     actual = decision.get("sufficient")
-    if not isinstance(actual, bool):
+    if result_outcome(retrieval_case) in NON_EVIDENCE_OUTCOMES or not isinstance(actual, bool):
         actual = None
     return {
         "expected_sufficient": expected,
@@ -354,7 +361,9 @@ def aggregate_e2e_results(
     faithfulness_unsupported_claims = sum(
         int(item.get("unsupported_claim_count") or 0) for item in faithfulness
     )
-    refusal = [result["refusal_metrics"] for result in successful]
+    refusal = [result["refusal_metrics"] for result in successful
+               if result_outcome(result) not in NON_EVIDENCE_OUTCOMES
+               and result["refusal_metrics"].get("actual_behavior") not in NON_EVIDENCE_OUTCOMES]
     expected_refusals = [
         item for item in refusal if item["expected_behavior"] == "refuse"
     ]
@@ -382,6 +391,8 @@ def aggregate_e2e_results(
         **aggregate_agent_evidence(results),
         "query_metrics": aggregate_query_metrics(results),
         "query_count": len(results),
+        "outcome_counts": dict(Counter(result_outcome(item) or ("execution_error" if item.get("error") else "legacy") for item in results)),
+        "non_evidence_failure_count": sum(result_outcome(item) in NON_EVIDENCE_OUTCOMES for item in results),
         "successful_query_count": len(successful),
         "error_count": len(results) - len(successful),
         "average_total_latency_ms": _mean(

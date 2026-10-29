@@ -12,6 +12,7 @@ from service.core.query.temporal import normalize_relative_years
 from service.core.evidence.bindings import BridgeExtraction, extract_bridge_value, resolve_query_template
 from service.core.runtime.execution import run_independent
 from service.core.runtime.context import QueryBudgetExceeded, current_runtime
+from agent.tools.restore_table_rows import RestoreTableRowsTool, recovery_hints
 
 
 @dataclass
@@ -19,8 +20,9 @@ class TaskExecution:
     task: AgentTask
     status: str
     result: ToolResult | None = None #某一个任务的工具结果，和任务绑定
-    binding: BridgeExtraction | None = None
+    binding: BridgeExtraction | None = None  # 给下一个依赖此任务的任务，下一个任务的变量和从证据中提取的实际值
     error: str | None = None
+    cache_hit: bool = False
 
     def observation(self, *, include_content: bool = True) -> dict[str, Any]:
         # 重规划只需状态、桥接来源和有限片段；完整证据仍保存在运行状态中供核验。
@@ -31,10 +33,14 @@ class TaskExecution:
                         for item in list(result.evidence)[:3]]
         return {
             "task_id": self.task.id, "status": self.status, "error": self.error or (result.error if result else None),
+            "cache_hit": self.cache_hit,
+            "retrieval_status": ("succeeded" if result.success else "failed") if result else "not_executed",
+            "binding_status": ("resolved" if self.binding else "unresolved") if self.task.output_slot else "not_requested",
             "binding": self.binding.to_dict() if self.binding else None,
             "query": result.query if result else None,
             "result_count": len(result.evidence) if result else 0,
             "snippets": snippets,
+            "recoverable_rows": recovery_hints(result),
         }
 
 
@@ -43,12 +49,36 @@ class ToolExecutor:
         self.tools = {tool.name: tool for tool in tools}
         if len(self.tools) != len(tools):
             raise ValueError("工具名称不能重复")
+        if "search_knowledge_base" in self.tools:
+            self.tools.setdefault(RestoreTableRowsTool.name, RestoreTableRowsTool())
         self._bridge_extractor = bridge_extractor or extract_bridge_value
 
     def definitions(self):
         return [{"type": "function", "function": {
             "name": tool.name, "description": tool.description, "parameters": tool.parameters,
         }} for tool in self.tools.values()]
+
+    def is_repeated_direct_plan(self, plan: AgentPlan, context: QueryContext, cache: dict) -> bool:
+        """仅拦截整份均为成功缓存命中的直接搜索；依赖、绑定和恢复任务交给执行器。"""
+        if not plan.tasks:
+            return False
+        for task in plan.tasks:
+            if (task.tool not in {"search_knowledge_base", "search_web"}
+                    or not task.query or task.query_template or task.depends_on
+                    or task.output_slot or task.required_slots or task.binding_key or task.inherit_document_scope):
+                return False
+            if any(goal.subject_slot for goal in context.goals if goal.id in task.goal_ids):
+                return False
+            names = context.company_names(task.goal_ids, subject_refs=task.subject_refs)
+            scope = None
+            if names is not None:
+                from service.core.retrieval.entities import company_hints_from_names
+                scope = company_hints_from_names(names)
+            query = normalize_relative_years(task.query, context.request.reference_date)
+            result = cache.get((task.tool, query, (), task.top_k, scope))
+            if result is None or not result.success:
+                return False
+        return True
 
     def execute_task(self, task: AgentTask, context: QueryContext,
                      completed: dict[str, TaskExecution], cache: dict) -> TaskExecution:
@@ -60,7 +90,8 @@ class ToolExecutor:
         # 将查询模板中的变量替换成前置任务的结果
         query = resolve_query_template(task.query_template, slots) if task.query_template else task.query
         # 依据请求的参考日期处理“去年”等相对年份
-        query = normalize_relative_years(query, context.request.reference_date)
+        if task.tool != RestoreTableRowsTool.name:
+            query = normalize_relative_years(query, context.request.reference_date)
 
         # 如果任务要求在前置证据所在的同一份文档中继续查找，就检查
         document_ids = ()
@@ -72,8 +103,21 @@ class ToolExecutor:
             if any(parent.task.tool != "search_knowledge_base" for parent in parents):
                 return TaskExecution(task, "blocked", error="内部文档范围只能来自知识库任务")
             document_ids = tuple(sorted(scopes))
-        request = RetrievalTask(query, task.goal_ids, document_ids) # 构造实际检索请求
-        identity = (task.tool, query, document_ids, task.top_k)
+        names = context.company_names(task.goal_ids, subject_refs=task.subject_refs)
+        scope = None
+        if names is not None:
+            from service.core.retrieval.entities import company_hints_from_names
+            subject_slots = {g.subject_slot for g in context.goals if g.id in task.goal_ids
+                             and g.subject_slot and g.subject_slot != (task.binding_key or task.output_slot)}
+            subject_values = {parent.task.binding_key or parent.binding.slot: parent.binding.value
+                              for parent in parents}
+            # 主体必须来自当前任务实际消费的前置证据，不能猜测或借用其他分支。
+            if subject_slots - subject_values.keys():
+                return TaskExecution(task, "blocked", error="主体变量尚无经过来源校验的证据绑定")
+            names = tuple(dict.fromkeys((*names, *(subject_values[slot] for slot in sorted(subject_slots)))))
+            scope = company_hints_from_names(names)
+        request = RetrievalTask(query, task.goal_ids, document_ids, scope)
+        identity = (task.tool, query, document_ids, task.top_k, scope)
         if identity in cache:
             result = replace(cache[identity], task=request)
             status = "cached"
@@ -84,7 +128,9 @@ class ToolExecutor:
                 if task.tool != "search_knowledge_base" and current_runtime() is not None:
                     current_runtime().reserve("retrieval")
                 kwargs = {"top_k": task.top_k} if "top_k" in tool.parameters.get("properties", {}) else {}
-                if callable(getattr(tool, "run_for_task", None)):
+                if isinstance(tool, RestoreTableRowsTool):
+                    result = tool.run_from_history(context, task=request, completed=completed)
+                elif callable(getattr(tool, "run_for_task", None)):
                     result = tool.run_for_task(context, task=request, **kwargs)
                 elif document_ids:
                     raise ValueError("工具不支持服务端文档范围")
@@ -101,14 +147,15 @@ class ToolExecutor:
             if result.success:
                 # 空结果同样缓存；同词重复搜索不会带来新证据，须由 Planner 改变策略。
                 cache[identity] = result
-        execution = TaskExecution(task, status, result)
+        execution = TaskExecution(task, status, result, cache_hit=status == "cached")
         # 从证据中提取输出变量，给依赖这个任务的下面的任务使用
         if task.output_slot and result.success:
             if result.evidence:
                 try:
+                    entity_options = {"entity_names": names} if self._bridge_extractor is extract_bridge_value else {}
                     execution.binding = self._bridge_extractor(
                         slot=task.output_slot, original_question=context.question,
-                        first_query=query, chunks=reference_records(result.evidence),
+                        first_query=query, chunks=reference_records(result.evidence), **entity_options,
                     )
                 except QueryBudgetExceeded as error:
                     # 检索已完成，桥接预算耗尽不能抹去刚取得的证据。

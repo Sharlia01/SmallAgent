@@ -1,4 +1,4 @@
-"""原始表格行到领域证据行的轻量转换，供入库归属标注和来源适配共用。"""
+"""原始表格行到领域证据行的轻量转换，保留原表头、单元格和位置供核验模型理解。"""
 
 from collections.abc import Mapping
 from typing import Any

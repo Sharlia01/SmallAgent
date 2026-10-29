@@ -92,9 +92,9 @@ def test_assistant_only_entity_is_not_promoted_to_user_fact():
     assert result.clarification
 
 
-def test_goal_constraints_must_come_from_user_text():
+def test_goal_quotes_must_come_from_user_text():
     with pytest.raises(ValueError, match="goal_source_not_grounded"):
-        parse_goals([{"id": "profit", "text": "利润", "constraints": ["2029年"]}], "2025年利润")
+        parse_goals([{"id": "profit", "text": "利润", "source_spans": ["2029年"]}], "2025年利润")
 
 
 def test_goal_graph_rejects_cycles():

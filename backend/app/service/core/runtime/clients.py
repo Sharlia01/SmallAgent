@@ -1,4 +1,4 @@
-"""证据与财务核验共用的模型客户端配置，不依赖核验业务实现。"""
+"""证据核验与指代消解的模型客户端配置。"""
 
 import os
 from functools import lru_cache
@@ -8,14 +8,25 @@ from openai import OpenAI
 
 load_dotenv()
 
+DEFAULT_AGENT_MODEL = "qwen3.7-flash"
+DEFAULT_AGENT_FALLBACK_MODEL = "qwen3.8-max"
+
+
+def agent_model() -> str:
+    return os.getenv("AGENT_MODEL") or DEFAULT_AGENT_MODEL
+
+
+def agent_fallback_model() -> str:
+    return os.getenv("AGENT_FALLBACK_MODEL") or DEFAULT_AGENT_FALLBACK_MODEL
+
 
 @lru_cache(maxsize=1)
 def get_verification_client() -> OpenAI:
-    api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
-    base_url = os.getenv("DASHSCOPE_BASE_URL", "").strip()
+    api_key = os.getenv("SILICONFLOW_API_KEY", "").strip()
+    base_url = os.getenv("SILICONFLOW_BASE_URL", "").strip()
     if not api_key or not base_url:
         raise RuntimeError(
-            "DASHSCOPE_API_KEY and DASHSCOPE_BASE_URL are required for "
+            "SILICONFLOW_API_KEY and SILICONFLOW_BASE_URL are required for "
             "evidence sufficiency checks"
         )
     return OpenAI(api_key=api_key, base_url=base_url)
@@ -32,7 +43,11 @@ def get_context_client() -> OpenAI:
 
 
 def context_model() -> str:
-    return os.getenv("AGENT_CONTEXT_MODEL", os.getenv("AGENT_MODEL", "deepseek-v4-pro"))
+    return os.getenv("AGENT_CONTEXT_MODEL") or agent_model()
+
+
+def context_fallback_model() -> str:
+    return os.getenv("AGENT_CONTEXT_FALLBACK_MODEL") or agent_fallback_model()
 
 
 def response_content(completion) -> str:

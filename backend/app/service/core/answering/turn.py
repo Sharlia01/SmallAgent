@@ -17,9 +17,10 @@ from service.core.retrieval.result import RetrievalResult, adapt_retrieval_recor
 from service.core.evidence.adapter import reference_records
 from service.core.answering.streaming import collect_answer_stream
 from service.core.query.contract import RetrievalTask
+from service.core.runtime.clients import agent_model
 
 
-DEFAULT_ANSWER_MODEL = "deepseek-v4-pro"
+DEFAULT_ANSWER_MODEL = "qwen3.8-max"
 
 
 @dataclass(frozen=True)
@@ -104,7 +105,7 @@ def execute_agent_turn(
     tool = RagSearchTool(user_id=0, retriever=retrieve)
     orchestrator = AgentOrchestrator(
         planner_client=planner_client or client,
-        planner_model=planner_model or os.getenv("AGENT_MODEL", "deepseek-v4-pro"),
+        planner_model=planner_model or agent_model(),
         answer_client=client, answer_model=answer_model or os.getenv("CHAT_MODEL", DEFAULT_ANSWER_MODEL),
         tools=[tool],
     )
@@ -134,8 +135,6 @@ def execute_agent_turn(
     query = execution.agent_run.query
     raw["query_contract"] = query.request.to_dict() if query else {}
     raw["query_understanding"] = query.understanding.to_dict() if query and query.understanding else {}
-    raw["financial_requirements"] = query.financial_requirements.to_dict() if query and query.financial_requirements else None
-    raw["financial_bindings"] = [asdict(binding) for binding in query.financial_bindings] if query else []
     # 记录实际交给核验器的累计资料，沿用 Agent 的去重顺序和检索轨迹。
     # 即使最终拒答、没有回答引用，也保留此快照供评测定位原因。
     raw["chunks_before_sufficiency"] = (
@@ -143,7 +142,7 @@ def execute_agent_turn(
         if execution.evidence_sufficiency is not None else None
     )
     if execution.evidence_sufficiency is not None:
-        raw["evidence_sufficiency"] = execution.evidence_sufficiency
+        raw["evidence_sufficiency"] = {**execution.evidence_sufficiency, "outcome": execution.agent_run.outcome}
     documents = execution.response_documents
     # 引用保留原始来源；评分使用回答模型真正看到的筛选正文，不能混入未采用的资料。
     context_texts = {block.evidence_id: block.text for block in execution.context.blocks} if execution.context else {}
@@ -156,6 +155,8 @@ def execute_agent_turn(
     raw["total"] = len(raw["chunks"])
     raw["agent_execution"] = {
         "steps": execution.agent_run.steps, "stop_reason": execution.agent_run.stop_reason,
+        "outcome": execution.agent_run.outcome,
+        "replan_decisions": execution.agent_run.replan_decisions,
         "tool_queries": [{"tool": result.tool_name, "query": result.query,
                           "goal_ids": list(result.task.goal_ids) if result.task else []}
                          for result in execution.agent_run.tool_results],

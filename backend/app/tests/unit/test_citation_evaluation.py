@@ -3,7 +3,19 @@ import json
 
 import pytest
 
-from evaluation.citations import evaluate_citations, parse_answer_claims
+from evaluation.citations import _judge_claims, evaluate_citations, parse_answer_claims
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("text", [
+    "2025年上半年收入下降", "- 2027E：3%", "-2.5%", "0.40元",
+    "**2448 + 10049 = 12497百万元**", "### 经营情况", "1. 收入为10亿元",
+])
+def test_claim_parsing_preserves_numeric_and_markdown_prefixes(text):
+    claims = parse_answer_claims(f"  {text} ##1$$  ")
+    assert len(claims) == 1
+    assert claims[0]["text"] == text
+    assert claims[0]["citation_ids"] == [1]
 
 
 class FakeCompletions:
@@ -23,6 +35,44 @@ class FakeCompletions:
                 )
             ]
         )
+
+
+@pytest.mark.unit
+def test_judge_shares_evidence_without_changing_each_claim_citations():
+    # 重复引用只传一份正文；相同正文的不同来源仍保留各自编号。
+    documents = [
+        {"document_name": "甲.pdf", "content_with_weight": "收入10亿元"},
+        {"document_name": "乙.pdf", "content_with_weight": "收入10亿元"},
+        {"document_name": "未引用.pdf", "content_with_weight": "不应发送"},
+    ]
+    claims = [
+        {"claim_index": 1, "text": "甲收入10亿元", "citation_ids": [1, 1]},
+        {"claim_index": 2, "text": "比较两份报告", "citation_ids": [2, 1]},
+        {"claim_index": 3, "text": "无效引用", "citation_ids": [0, 9]},
+        {"claim_index": 4, "text": "没有引用", "citation_ids": []},
+    ]
+
+    def create(**kwargs):
+        payload = json.loads(kwargs["messages"][1]["content"])
+        assert [item["citation_ids"] for item in payload["items"]] == [[1], [2, 1], [], []]
+        assert payload["evidence"] == [
+            {"citation_id": index, "document_name": document["document_name"],
+             "content": document["content_with_weight"]}
+            for index, document in enumerate(documents[:2], start=1)
+        ]
+        assert all("cited_evidence" not in item for item in payload["items"])
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+            "assessments": [
+                {"claim_index": claim["claim_index"], "requires_citation": True,
+                 "supported": claim["claim_index"] <= 2, "reason": "测试支持关系"}
+                for claim in claims
+            ],
+        })))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    assessments = _judge_claims(claims, documents, client=client, model="judge", timeout=20)
+    assert [item["supported"] for item in assessments] == [True, True, False, False]
+    assert claims[0]["citation_ids"] == [1, 1]  # 输入不被修改，原有统计口径保持不变。
 
 
 @pytest.mark.unit

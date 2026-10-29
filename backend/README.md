@@ -27,8 +27,11 @@ EMBEDDING_BACKEND=local
 BGE_MODEL_HOST_PATH=../../models/bge-small-zh-v1.5
 RERANKER_BACKEND=local
 RERANKER_MODEL_HOST_PATH=../../models/bge-reranker-v2-m3
-AGENT_MODEL=deepseek-v4-pro
-AGENT_MAX_STEPS=3
+AGENT_MODEL=qwen3.7-flash
+AGENT_FALLBACK_MODEL=qwen3.8-max
+AGENT_CONTEXT_MODEL=qwen3.7-flash
+AGENT_CONTEXT_FALLBACK_MODEL=qwen3.8-max
+AGENT_MAX_STEPS=2 # 首次检索 + 最多一轮补查
 RETRIEVAL_ALIAS_EXPANSION_ENABLED=true
 RAG_EVIDENCE_SUFFICIENCY_ENABLED=true
 ```
@@ -68,9 +71,9 @@ Embedding 必须使用相同模型版本、归一化方式和 512 维输出，�
 
 Agent 统一完成口语规范化、目标提取、约束绑定、歧义判断和初始任务规划。工具执行后按完整目标核验累计证据，缺口交给 Agent 补查。知识库仅执行搜索、固定别名适配、过滤、排序和表格上下文补全，不再独立分析意图或拆分问题。详细边界、数据对象和配置迁移见 [核心架构说明](app/service/core/README.md#agent-统一理解与规划)。
 
-财务数值问题在 Agent 首次理解时生成结构化事实要求和计算操作数。财务核验只检查证据是否满足这些要求，不再次解析问题；待确认的公司和期间由有来源的执行结果绑定。不支持的指标显式保留为缺口，不能以空要求跳过核验。具体协议见 `app/service/core/README.md`。
+财务与其他问题统一使用目标文本和约束，不再生成财务事实或计算契约。每轮检索后统一核验原始证据；输入充分时，最终回答模型直接计算并引用依据。具体协议见 `app/service/core/README.md`。
 
-历史指代消解保留原文来源；跨工具依赖必须从证据取得变量，同一报告范围由服务端继承。证据不足时保留部分结果用于补查，最终不充分则拒答。财务事实、视觉证据和引用一致性校验保持启用。
+历史指代消解保留原文来源；跨工具依赖必须从证据取得变量，同一报告范围由服务端继承。证据不足时保留部分结果用于补查，最终不充分则拒答。视觉证据、来源和引用一致性检查继续保留。
 
 3. **启动所有服务**
 ```bash
@@ -125,6 +128,8 @@ python app/rag_cli.py --username <用户名>
 `RAG_API_URL` 指定。使用 `--question "问题"` 可只提一个问题并在回答后退出。
 CLI 请求默认关闭回答后的推荐问题生成；会话标题直接取首次问题的前 30 个字符，
 不再为标题额外调用模型。网页端仍默认生成推荐问题。
+任务间变量提取与推荐问题生成默认使用 `qwen3.7-flash`，分别通过
+`RAG_BRIDGE_EXTRACTION_MODEL` 和 `RECOMMENDED_QUESTIONS_MODEL` 配置。
 
 ### 表格、图表与重新入库
 
@@ -264,4 +269,4 @@ docker compose up -d LS_api
 
 - API文档: http://localhost:8000/docs
 
-财务核验默认使用混合模式：规则无法确定的关系按固定需求交给模型抽取和独立核验，规则继续检查原始数值、来源位置及计算。核验报告分别记录缺失、歧义、冲突、能力限制和服务故障，Agent 据此补查、澄清或停止。参见 [财务关系核验架构](app/service/core/README.md#财务关系的混合核验)。旧环境的 `RAG_FINANCIAL_FACT_MODEL_ENABLED=false` 仍被兼容；如要启用新策略，请显式设置 `RAG_FINANCIAL_VERIFICATION_MODE=hybrid`。
+证据核验统一使用 `RAG_EVIDENCE_SUFFICIENCY_*` 配置，每轮检查目标与原始来源的对应及覆盖。旧 `RAG_FINANCIAL_*` 已停用，数值计算交由回答模型完成。参见 [统一证据核验与回答计算](app/service/core/README.md#统一证据核验与回答计算)。

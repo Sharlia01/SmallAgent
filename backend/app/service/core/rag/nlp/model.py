@@ -665,7 +665,7 @@ def get_chat_completion_block(session_id, question, references):
     
         # 调用模型生成回答
         completion = client.chat.completions.create(
-            model="deepseek-v4-pro",
+            model="qwen3.8-max",
             messages=[{"role": "user", "content": prompt}],
             stream=False,
         )

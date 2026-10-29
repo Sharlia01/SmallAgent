@@ -105,9 +105,10 @@ class AgentOrchestrator:
             context=context,
         )
         logger.info(
-            "PERF session_id=%s stage=agent_run_total status=ok "
+            "PERF session_id=%s stage=agent_run_total outcome=%s "
             "steps=%s stop_reason=%s duration_ms=%.1f",
             session_id,
+            agent_run.outcome,
             agent_run.steps,
             agent_run.stop_reason,
             (time.perf_counter() - started_at) * 1000,
@@ -119,7 +120,7 @@ class AgentOrchestrator:
         assessment = agent_run.assessment
         assert assessment is not None, "拒答前必须完成证据核验"
         return AgentExecution(agent_run=agent_run,
-                              direct_answer=render_evidence_refusal(assessment.to_dict()), response_mode="refuse")
+                              direct_answer=render_evidence_refusal({**assessment.to_dict(), "outcome": agent_run.outcome}), response_mode="refuse")
 
     @staticmethod
     def _prepare_answer(query: QueryContext, agent_run: AgentRun,

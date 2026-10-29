@@ -71,7 +71,8 @@ def stub_scores(monkeypatch, hops, scores):
 
     def rerank(question, documents):
         calls.append((question, documents))
-        return [by_content[text] for text in documents], None
+        assert all('"文档名": "甲公司.pdf"' in text for text in documents)
+        return [by_content[text.split("\n正文：\n", 1)[1]] for text in documents], None
 
     monkeypatch.setattr(retrieval, "rerank_similarity", rerank)
     return calls

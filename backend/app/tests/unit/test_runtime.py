@@ -1,6 +1,7 @@
 """请求预算、缓存及跨模块执行上下文的行为约束。"""
 
 import json
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,63 @@ from service.core.runtime.execution import run_independent
 from service.core.runtime.model_calls import model_completion
 
 pytestmark = pytest.mark.unit
+
+
+def test_validation_source_spans_are_bounded_without_changing_the_error():
+    from service.core.query.validation import QueryValidationError
+    from service.core.runtime.diagnostics import failure_details
+    spans = ('原' * 1001,) * 9
+    error = QueryValidationError('invalid_source', '引文无效', goal_id='g1', source_spans=spans)
+    details = failure_details(error)
+    assert details['goal_id'] == 'g1'
+    assert details['source_spans'] == ['原' * 1000] * 8
+    assert details['source_spans_truncated'] is True
+    assert error.source_spans == spans
+
+
+@pytest.mark.parametrize("messages", [
+    [{"role": "system", "content": '只返回 {"tasks": []}。'}, {"role": "user", "content": "补查资料"}],
+    [{"role": "user", "content": "资料中提到了 JSON，但没有规定输出格式"}],
+    [{"role": "system", "content": [{"type": "text", "text": "输出符合指定结构的对象"}]}],
+    [{"role": "developer", "content": "返回任务列表"}],
+])
+def test_json_mode_adds_trusted_instruction_without_mutating_input(messages):
+    from tests.agent_helpers import ModelClient
+    original = deepcopy(messages)
+    client = ModelClient([{}, {}])
+    model_completion(client, "agent_replan", model="test", messages=messages,
+                     response_format={"type": "json_object"})
+    prepared = client.calls[0]["messages"]
+    trusted = [message["content"] for message in prepared if message["role"] in {"system", "developer"}]
+    assert "JSON" in json.dumps(trusted, ensure_ascii=False)
+    assert messages == original
+    assert client.calls[0]["response_format"] == {"type": "json_object"}
+    # 已准备请求再次经过同一入口，不重复追加格式要求。
+    model_completion(client, "agent_replan", model="test", messages=prepared,
+                     response_format={"type": "json_object"})
+    assert client.calls[1]["messages"] == prepared
+
+
+@pytest.mark.parametrize("content", ["仅返回 JSON 对象", "Return a json object", [
+    {"type": "text", "text": "Return JSON"},
+]])
+def test_json_mode_preserves_existing_format_instruction(content):
+    from tests.agent_helpers import ModelClient
+    messages = [{"role": "system", "content": content}]
+    client = ModelClient([{}])
+    model_completion(client, "analysis", model="test", messages=messages,
+                     response_format={"type": "json_object"})
+    assert client.calls[0]["messages"] == messages
+
+
+@pytest.mark.parametrize("options", [{}, {"response_format": {"type": "text"}},
+                                      {"response_format": {"type": "json_schema", "json_schema": {"name": "test"}}}])
+def test_other_response_modes_do_not_receive_json_object_instruction(options):
+    from tests.agent_helpers import ModelClient
+    client = ModelClient([{}])
+    messages = [{"role": "system", "content": "自然语言回答用户的问题"}]
+    model_completion(client, "answer", model="test", messages=messages, **options)
+    assert client.calls[0]["messages"] == messages
 
 
 def test_budget_is_shared_by_parallel_workers():
@@ -33,7 +91,7 @@ def test_model_budget_prevents_another_provider_call():
     client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(
         create=lambda **kwargs: calls.append(kwargs) or SimpleNamespace(usage=None),
     )))
-    with query_runtime(QueryRuntime(max_model_calls=1)):
+    with query_runtime(QueryRuntime(timeout_seconds=45, max_model_calls=1)):
         model_completion(client, "analysis", model="test", timeout=120)
         with pytest.raises(QueryBudgetExceeded):
             model_completion(client, "rewrite", model="test")

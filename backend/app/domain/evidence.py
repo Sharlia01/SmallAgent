@@ -119,6 +119,22 @@ class EvidenceTable:
         object.__setattr__(self, "rows", tuple(self.rows))
         object.__setattr__(self, "metadata", freeze(self.metadata))
 
+    def source_notes(self) -> list[str]:
+        """去掉可确定重建的重复行文本，保留旧索引仅存于语义文本中的说明。"""
+        semantic_text = self.metadata.get("table_semantic_text_with_weight")
+        if not isinstance(semantic_text, str):
+            return []
+        represented = {self.caption}
+        for row in self.rows:
+            represented.update((row.context, row.preamble,
+                                "；".join(part for part in (self.caption, row.context) if part)))
+            for headers, cells in ((row.headers, row.cells),
+                                   (row.original_headers, row.original_cells)):
+                represented.add("；".join(f"{header}：{cell or '（空白）'}"
+                                          for header, cell in zip(headers, cells)))
+        # 只删除完全匹配的派生文本，不猜测单位、主体或改写原始说明。
+        return list(dict.fromkeys(line for line in semantic_text.splitlines()
+                                  if line.strip() and line not in represented))
 
 @dataclass(frozen=True, slots=True)
 class EvidenceFigure:
@@ -130,30 +146,16 @@ class EvidenceFigure:
 
 
 @dataclass(frozen=True, slots=True)
-class EvidenceAttribution:
-    subject_ids: tuple[str, ...] = ()
-    subject_status: str = "unknown"
-    subject_proof: tuple[Mapping[str, Any], ...] = ()
-    metadata: Mapping[str, Any] = field(default_factory=dict)
-
-    def __post_init__(self):
-        object.__setattr__(self, "subject_ids", tuple(self.subject_ids))
-        object.__setattr__(self, "subject_proof", freeze(self.subject_proof))
-        object.__setattr__(self, "metadata", freeze(self.metadata))
-
-
-@dataclass(frozen=True, slots=True)
 class EvidenceStructure:
     """解析器提供的可核查结构；只存来源数据，不存本次查询的结论。
 
-    来源适配器将不同解析器版本收口为表格、图表和归属类型。
+    来源适配器将不同解析器版本收口为表格与图表类型。
     核验器直接读取规范字段，解析器附加数据仅在输出边界使用。
     """
 
     kind: str = "text"
     table: EvidenceTable = field(default_factory=EvidenceTable)
     figure: EvidenceFigure = field(default_factory=EvidenceFigure)
-    attribution: EvidenceAttribution = field(default_factory=EvidenceAttribution)
     locator: str = ""
     parser_version: str = ""
     coordinates: Mapping[str, Any] = field(default_factory=dict)
@@ -176,10 +178,10 @@ class RetrievalTrace:
 @dataclass(frozen=True, slots=True)
 class Evidence:
     id: str
-    text: str
-    source: EvidenceSource
-    location: EvidenceLocation = field(default_factory=EvidenceLocation)
-    structure: EvidenceStructure = field(default_factory=EvidenceStructure)
+    text: str  #content_with_weight，缺少该字段时使用 content
+    source: EvidenceSource  #文档 ID、名称、知识库、URL 等
+    location: EvidenceLocation = field(default_factory=EvidenceLocation) #页码、位置、表格行列等
+    structure: EvidenceStructure = field(default_factory=EvidenceStructure) #文本、表格、图片及其结构信息
 
     def __post_init__(self):
         if not isinstance(self.id, str) or not self.id.strip():
@@ -189,7 +191,29 @@ class Evidence:
 
     @property
     def version(self) -> str:
+        '''用于快照及核验报告范围'''
         return fingerprint(self)
+
+    @property
+    def source_content_fingerprint(self) -> str:
+        """来源内容身份，不把检索排名和候选诊断当成原文变化。
+
+        完整 version 仍用于快照及核验报告范围；此指纹仅用于同 ID 冲突检查。
+        """
+        structure, table = self.structure, self.structure.table
+        return fingerprint({
+            "text": self.text, "source": self.source, "location": self.location,
+            "kind": structure.kind, "locator": structure.locator,
+            "parser_version": structure.parser_version, "coordinates": structure.coordinates,
+            "figure": structure.figure,
+            "table": {
+                "binding": table.binding, "binding_source": table.binding_source,
+                "reliable": table.reliable, "caption": table.caption, "rows": table.rows,
+                # 原始列及顺序已由规范 rows 保留，不能对表头或单元格随意排序。
+                "parent_reference": table.metadata.get("table_object_ref_kwd"),
+                "source_notes": table.source_notes(), "footnotes": table.metadata.get("footnotes"),
+            },
+        })
 
 # 同一个证据 ID，对应了不同的证据数据，新增的证据和EvidenceCollection中已有的证据不一致
 @dataclass(frozen=True, slots=True)
@@ -203,7 +227,7 @@ class EvidenceCollection:
     """按稳定标识合并证据，集中维护顺序、检索轨迹和身份冲突。"""
 
     def __init__(self, evidence: Iterable[Evidence] = ()):
-        self._items: dict[str, Evidence] = {}  #证据，按 ID 存放
+        self._items: dict[str, Evidence] = {}  #证据，按 ID 存放，证据之间有顺序
         self._traces: dict[str, list[RetrievalTrace]] = {}  #每条证据的检索记录
         self._conflicts: list[EvidenceConflict] = []  #证据冲突记录，主要检查同一个证据编号是否有被混用
         for item in evidence:
@@ -232,7 +256,8 @@ class EvidenceCollection:
 
     def add(self, item: Evidence, trace: RetrievalTrace | None = None) -> None:
         previous = self._items.get(item.id)
-        if previous is not None and previous.version != item.version:
+        if (previous is not None
+                and previous.source_content_fingerprint != item.source_content_fingerprint):
             conflict = EvidenceConflict(item.id, previous.version, item.version)
             if conflict not in self._conflicts:
                 self._conflicts.append(conflict)
@@ -271,7 +296,6 @@ class EvidenceCollection:
 class AnswerBlock:
     evidence_id: str
     text: str
-    fact_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,13 +305,23 @@ class Citation:
 
 
 @dataclass(frozen=True, slots=True)
+class AnswerGoalSupport:
+    """核验目标及其在本轮回答中的引用编号，仅作为资料导航。"""
+
+    goal_id: str
+    text: str
+    constraints: tuple[str, ...]
+    supporting_reference_ids: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class AnswerContext:
     """筛选完成的模型输入；原文只通过引用映射提供给展示层。"""
 
     question: str
     blocks: tuple[AnswerBlock, ...]
     citations: tuple[Citation, ...]
-    financial: bool = False
+    goal_support: tuple[AnswerGoalSupport, ...] = ()
 
     def __post_init__(self):
         ids = {citation.evidence.id for citation in self.citations}
@@ -295,3 +329,7 @@ class AnswerContext:
             raise ValueError("回答上下文的引用映射不完整或存在重复来源")
         if tuple(item.number for item in self.citations) != tuple(range(1, len(self.citations) + 1)):
             raise ValueError("引用编号必须连续且从1开始")
+        numbers = {item.number for item in self.citations}
+        if any(not item.supporting_reference_ids or not set(item.supporting_reference_ids) <= numbers
+               for item in self.goal_support):
+            raise ValueError("目标支持来源必须指向本轮回答中的有效引用")

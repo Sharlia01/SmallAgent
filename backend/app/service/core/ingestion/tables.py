@@ -1,7 +1,7 @@
 """将已识别表格转换为上下文完整的独立行。"""
 
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from html import escape, unescape
 from html.parser import HTMLParser
 from io import BytesIO
@@ -9,6 +9,10 @@ import json
 import logging
 import os
 import re
+import math
+
+from service.core.evidence.metadata import primary_table_row
+from domain.table_structure import STRUCTURE_VERSION, COLUMN_HEADER, ROW_GROUP, SPANNING_CELL
 
 from domain.tables import (
     TableObject,
@@ -39,6 +43,8 @@ class Cell:
     rowspan: int = 1
     colspan: int = 1
     scope: str = ""
+    role: str = ""
+    regions: list[dict] = field(default_factory=list)
 
 
 class TableParser(HTMLParser):
@@ -50,10 +56,15 @@ class TableParser(HTMLParser):
         self.cell = None
         self.in_caption = False
         self.depth = 0
+        self.structured = False
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         if tag == "table":
+            version = attrs.get("data-table-structure")
+            if version is not None and version != STRUCTURE_VERSION:
+                raise ValueError("Unsupported table structure version")
+            self.structured = version == STRUCTURE_VERSION
             self.depth += 1
             if self.depth > 1:
                 raise ValueError("Nested tables cannot be bound safely")
@@ -66,6 +77,23 @@ class TableParser(HTMLParser):
             if any(value < 1 or value > 256 for value in spans):
                 raise ValueError("Unsupported table span")
             self.cell = Cell("", tag == "th", *spans, attrs.get("scope", ""))
+            if self.structured:
+                role = attrs.get("data-table-role", "")
+                if role not in {"column_header", "row_group", "data", "ambiguous"}:
+                    raise ValueError("Missing or invalid structural role")
+                regions = json.loads(attrs.get("data-table-regions", "[]"))
+                if not isinstance(regions, list):
+                    raise ValueError("Invalid structure regions")
+                for region in regions:
+                    if not isinstance(region, dict) or region.get("label") not in {COLUMN_HEADER, ROW_GROUP, SPANNING_CELL}:
+                        raise ValueError("Invalid structure label")
+                    bbox = region.get("bbox")
+                    if (not isinstance(bbox, list) or len(bbox) != 4
+                            or not all(isinstance(n, (int, float)) and math.isfinite(n) for n in bbox)
+                            or bbox[0] > bbox[2] or bbox[1] > bbox[3]):
+                        raise ValueError("Invalid structure coordinates")
+                self.cell.role = role
+                self.cell.regions = regions
         elif tag == "br" and self.cell is not None:
             self.cell.text += " "
 
@@ -204,7 +232,7 @@ def bind_table_rows(html: str) -> list[dict]:
     # OCR 常将第一组键值对标成 th；对于窄表，
     # 必须识别出有效列标题，不能将普通数值误当成表头。
     first = next((row for row in parser.rows if len(row) > 1), [])
-    if len(grid[0]) == 2 and first:
+    if not parser.structured and len(grid[0]) == 2 and first:
         heading = re.sub(r"\s|[：:]", "", first[0].text).casefold()
         if heading not in {
             "指标", "项目", "类别", "名称", "年度", "年份", "时间", "季度",
@@ -221,8 +249,39 @@ def bind_table_rows(html: str) -> list[dict]:
     previous_label = ""
     for r, row in enumerate(grid):
         raw = parser.rows[r]
+        if parser.structured:
+            if any(cell.role == "ambiguous" for cell in raw):
+                return fallback
+            nonempty = [cell for cell in raw if cell.text]
+            groups = [cell for cell in nonempty if cell.role == "row_group"]
+            if groups:
+                # 分组名称仅更新上下文；不得覆盖列标题，也不得吞掉混杂的数据。
+                if len(groups) != len(nonempty):
+                    return fallback
+                section = "；".join(dict.fromkeys(cell.text for cell in groups))
+                previous_label = ""
+                continue
+            if not nonempty:
+                continue
+            column_header = any(cell.role == "column_header" for cell in nonempty)
+            if column_header:
+                if any(cell.role != "column_header" for cell in nonempty):
+                    return fallback
+                if result and not previous_header:
+                    headers = []
+                    section = ""
+                    previous_label = ""
+                headers.append(row)
+                previous_header = True
+                continue
+            # 检测器未给出分组角色的孤立行名也可能是空数据行。
+            # 两者无法仅凭结构区分，必须复核，不能沿用前一分组。
+            if len(row) > 1 and row[0] and row[0].text and not any(
+                cell and cell.text for cell in row[1:]
+            ):
+                return fallback
         # 占据整行的单位或章节标签作用于后续行，不能作为列标题。
-        if len(raw) == 1 and raw[0].colspan == len(row) and len(row) > 1:
+        if not parser.structured and len(raw) == 1 and raw[0].colspan == len(row) and len(row) > 1:
             if raw[0].text:
                 if headers and not re.search(r"单位\s*[:：]", raw[0].text):
                     section = raw[0].text
@@ -236,7 +295,7 @@ def bind_table_rows(html: str) -> list[dict]:
             not headers and not result and len(raw) > 1
             and not has_values
         )
-        if explicit_header or inferred_header:
+        if not parser.structured and (explicit_header or inferred_header):
             # 正文中的重复表头表示新的表头区段开始。
             if result and not previous_header:
                 headers = []
@@ -262,6 +321,8 @@ def bind_table_rows(html: str) -> list[dict]:
                 if value and (not path or path[-1] != value):
                     path.append(value)
             labels.append(" / ".join(path) or f"第{c + 1}列（无表头）")
+        if parser.structured and any("（无表头）" in label for label in labels[1:]):
+            return fallback
         values = [cell.text if cell else "" for cell in row]
         if not any(values):
             continue
@@ -279,8 +340,9 @@ def bind_table_rows(html: str) -> list[dict]:
             "locator_kwd": caption,
             "evidence_type_kwd": "table",
             "table_binding_kwd": "bound",
-            "table_headers_kwd": labels,
-            "table_cells_kwd": values,
+            "table_cells_slice_obj": {"rows": [{
+                "row_index": r + 1, "headers": labels, "cells": values,
+            }]},
             "table_row_int": r + 1,
             "table_context_kwd": "；".join(
                 part for part in [*context, section] if part
@@ -358,8 +420,9 @@ def extract_visual_table(image, html: str, *, client=None) -> list[dict]:
                 "table_binding_kwd": "bound",
                 "table_binding_source_kwd": "vision",
                 "table_model_kwd": model,
-                "table_headers_kwd": row["headers"],
-                "table_cells_kwd": row["cells"],
+                "table_cells_slice_obj": {"rows": [{
+                    "row_index": index, "headers": row["headers"], "cells": row["cells"],
+                }]},
                 "table_row_int": index,
                 "table_context_kwd": row["context"],
             }
@@ -431,12 +494,14 @@ def _normalized_parser_cells(html: str) -> dict:
                 "column": column_index,
                 "rowspan": cell.rowspan,
                 "colspan": cell.colspan,
-                "role": "header" if cell.header else "data",
+                "role": cell.role or ("header" if cell.header else "data"),
+                "structure_regions": cell.regions,
                 "scope": cell.scope,
                 "text": cell.text,
             })
 
     return {
+        "structure_version": STRUCTURE_VERSION if parser.structured else None,
         "caption": " ".join(parser.caption.split()),
         "cells": cells,
         "cell_refs": [
@@ -471,8 +536,8 @@ def parse_table_object(
 
     data_rows = []
     for sequence, record in enumerate(records, start=1):
-        headers = record.get("table_headers_kwd")
-        cells = record.get("table_cells_kwd")
+        row = primary_table_row(record)
+        headers, cells = row.get("headers"), row.get("cells")
         if not isinstance(headers, list) or not isinstance(cells, list):
             continue
         if not headers or len(headers) != len(cells):
@@ -491,6 +556,7 @@ def parse_table_object(
         "binding_status": binding_status,
         "binding_source": binding_source,
         "binding_model": first.get("table_model_kwd"),
+        "structure_version": parser_cells.get("structure_version"),
         "cells": parser_cells["cells"],
         "cell_refs": parser_cells["cell_refs"],
         "raw_grid": parser_cells["raw_grid"],

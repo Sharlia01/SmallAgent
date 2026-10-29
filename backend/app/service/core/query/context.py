@@ -1,7 +1,6 @@
 """应用层持有本轮请求，工具共享已经消解和分析的查询上下文。"""
 
-from dataclasses import asdict, dataclass
-from domain.facts import FinancialRequirements, FinancialBinding
+from dataclasses import dataclass
 
 from domain.evidence import fingerprint
 from service.core.query.contract import QueryRequest, QueryGoal, QueryUnderstanding, resolve_request
@@ -11,18 +10,9 @@ from service.core.runtime.context import current_runtime
 @dataclass(slots=True)
 class QueryContext:
     request: QueryRequest  #用户的请求资料包。保存原问题、消解后的问题、聊天历史等
-    understanding: QueryUnderstanding | None = None  # 理解用户目标和财务事实
+    understanding: QueryUnderstanding | None = None  # 用户目标、限定条件及主体
     _resolved: bool = False  #是否做过指代消解
     scope_goal_ids: tuple[str, ...] | None = None
-    resolved_financial: FinancialRequirements | None = None # 根据已有证据补充后的财务需求
-    financial_bindings: tuple[FinancialBinding, ...] = () #记录了slot和value的对应关系，以及记录了这种关系的原始片段
-
-    @property
-    def financial_requirements(self) -> FinancialRequirements | None:
-        value = self.resolved_financial
-        if value is None and self.understanding:
-            value = self.understanding.financial
-        return value.for_goals(set(self.scope_goal_ids)) if value and self.scope_goal_ids is not None else value
 
     def resolve(self) -> QueryRequest:
         if not self._resolved:
@@ -57,8 +47,18 @@ class QueryContext:
             raise ValueError("工具任务必须引用已知目标")
         if set(goal_ids) == known_ids:
             return self
-        return QueryContext(self.request, self.understanding, self._resolved, tuple(sorted(goal_ids)),
-                            self.resolved_financial, self.financial_bindings)
+        return QueryContext(self.request, self.understanding, self._resolved, tuple(sorted(goal_ids)))
+
+    def company_names(self, goal_ids=None, *, subject_refs=None) -> tuple[str, ...] | None:
+        if not self.understanding or self.understanding.entity_names is None:
+            return None
+        goals = self.goals if goal_ids is None else tuple(g for g in self.goals if g.id in goal_ids)
+        refs = {ref for g in goals for ref in g.subject_refs}
+        if subject_refs is not None:
+            if not set(subject_refs) <= refs or (refs and not subject_refs):
+                raise ValueError("任务主体必须属于目标")
+            refs = set(subject_refs)
+        return tuple(dict.fromkeys(e.mention for e in self.understanding.entities if e.ref in refs))
 
     @property
     def clarification(self) -> str | None:
@@ -72,9 +72,7 @@ class QueryContext:
     def version(self) -> str:
         return fingerprint((self.request.to_dict(),
                             self.understanding.to_dict() if self.understanding else None,
-                            self.scope_goal_ids,
-                            self.financial_requirements.to_dict() if self.financial_requirements else None,
-                            [asdict(binding) for binding in self.financial_bindings]))
+                            self.scope_goal_ids))
 
 
 def query_context_for(request: QueryRequest) -> QueryContext:

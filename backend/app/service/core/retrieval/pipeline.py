@@ -9,7 +9,7 @@ from domain.evidence import EvidenceCollection
 from service.core.evidence.adapter import collection_from_records, evidence_from_record
 from service.core.evidence.metadata import evidence_metadata
 from service.core.retrieval.result import RetrievalResult
-from service.core.retrieval.entities import resolve_company_constraint
+from service.core.retrieval.entities import resolve_company_hints
 from service.core.retrieval.table_context import expand_table_contexts
 from service.core.query.semantics import alias_expansions
 from service.core.query.contract import RetrievalTask
@@ -51,13 +51,13 @@ def retrieve_evidence(index_names: str | list[str], question: str, *,
         raise ValueError("分页参数无效")
     query = query.strip()
     started = time.perf_counter()
-    scope = resolve_company_constraint(query)
+    scope = task.company_hints if task and task.company_hints is not None else resolve_company_hints(query)
     options = Dealer.RetrievalOptions(
         kb_ids=None, page=page, page_size=page_size,
         similarity_threshold=similarity_threshold, vector_similarity_weight=vector_similarity_weight,
         candidate_size=candidate_size, rerank_candidate_size=rerank_candidate_size,
         rrf_k=rrf_k, final_reranker_weight=final_reranker_weight, final_rrf_k=final_rrf_k,
-        company_constraint=scope, doc_ids=list(task.document_ids) if task and task.document_ids else None,
+        company_hints=scope, doc_ids=list(task.document_ids) if task and task.document_ids else None,
     )
     # 这里只增加词表里明确等价的别名；模型生成的新搜索方向由 Agent 负责。
     aliases = (alias_expansions(query, 8) if os.getenv("RETRIEVAL_ALIAS_EXPANSION_ENABLED", "true").lower()
@@ -72,20 +72,23 @@ def retrieve_evidence(index_names: str | list[str], question: str, *,
         result.task = task
         return result
     runtime.reserve("retrieval")
+    # raw是经过检索并重排后的结果字典
     raw = get_retrieval_dealer().retrieval(
         question=query, keyword_question=keyword_query, tenant_ids=index_names, options=options,
     )
     chunks = [record if record.get("chunk_id") else {**record, "chunk_id": evidence_from_record(record).id}
               for record in raw.get("chunks", [])]
-    chunks = expand_table_contexts(chunks, query)
-    evidence = collection_from_records(chunks, query=query)
-    diagnostics = retrieval_diagnostics(raw)
+    chunks = expand_table_contexts(chunks, query, candidates=raw.get("table_candidates"))
+    evidence = collection_from_records(chunks, query=query) # 将结果字典转换成evidenceCollection
+    diagnostics = retrieval_diagnostics(raw) # 用于排查问题和评测分析
     diagnostics["keyword_query"] = keyword_query
     diagnostics["alias_terms"] = aliases
     diagnostics["stage_latency_ms"]["total"] = round((time.perf_counter() - started) * 1000, 3)
     # 搜索命中不等于答案充分，所有返回片段均待 Agent 合并后核验。
     result = RetrievalResult(evidence=evidence, diagnostics=diagnostics,
-                             total_candidates=int(raw.get("total") or 0), task=task)
+                             total_candidates=int(raw.get("total") or 0), task=task,
+                             recoverable_evidence=tuple(collection_from_records(
+                                 [row for chunk in chunks for row in chunk.get('_table_recovery_records', [])], query=query)))
     with runtime._lock:
         runtime.cache[key] = result.copy()
     return result
@@ -160,7 +163,7 @@ def retrieval_diagnostics(results: dict[str, Any]) -> dict[str, Any]:
     return {
         "retrieval_fusion": dict(results.get("retrieval_fusion") or {}),
         "doc_aggs": list(results.get("doc_aggs") or []),
-        "company_constraint": dict(results.get("company_constraint") or {}),
+        "company_hints": dict(results.get("company_hints") or {}),
         "stage_latency_ms": dict(results.get("stage_latency_ms") or {}),
         "query_runtime": dict(results.get("query_runtime") or {}),
     }

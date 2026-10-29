@@ -12,10 +12,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from service.core.query.contract import QueryGoal, parse_goals
+from service.core.query.contract import parse_goals
 from service.core.query.preservation import _extract_organizations, validate_query_preservation
 from service.core.runtime.context import QueryRuntime, query_runtime
-from service.core.query.validation import QueryValidationError, validate_goals
 from service.core.evidence.bindings import BridgeExtraction
 
 
@@ -100,59 +99,60 @@ def test_equivalent_queries_are_accepted(original, candidate):
 
 
 
-def test_goal_constraint_cannot_add_a_year_absent_from_the_question():
-    with pytest.raises(QueryValidationError, match="goal_source_not_grounded"):
-        parse_goals([dict(VALUATION_GOALS[1], constraints=["国电电力", "2028年"])], VALUATION)
+def test_goal_constraint_content_is_preserved():
+    goal = parse_goals([dict(VALUATION_GOALS[1], constraints=["国电电力", "2028年"])], VALUATION)[0]
+    assert goal.constraints == ("国电电力", "2028年")
 
 
-def test_paraphrased_constraint_does_not_claim_to_quote_the_question():
+def test_paraphrased_constraint_is_preserved():
     goal = parse_goals([dict(VALUATION_GOALS[1], constraints=["是否昂贵"])], VALUATION)[0]
-    assert goal.constraint_provenance[0]["kind"] == "paraphrase"
-    assert goal.constraint_provenance[0]["source_spans"] == ()
+    assert goal.constraints == ("是否昂贵",)
 
 
-def test_constraint_cannot_move_a_year_to_a_different_metric():
+def test_constraint_relations_are_not_reinterpreted_before_retrieval():
     question = "2025年营业收入和2026年净利润"
-    with pytest.raises(QueryValidationError, match="metric_time_rebound"):
-        parse_goals([dict(id="revenue", text="2025年营业收入", constraints=["2026年营业收入"])], question)
+    goal = parse_goals([dict(id="revenue", text="2025年营业收入", constraints=["2026年营业收入"])], question)[0]
+    assert goal.constraints == ("2026年营业收入",)
 
 
-def test_price_unit_basis_remains_compatible_with_guodian_015():
+def test_price_unit_constraint_preserves_original_wording():
     question = "上半年卖电均价掉了多少，现在一兆瓦时大概多少钱？"
     goal = parse_goals([dict(id="price", text="现在每兆瓦时电价是多少",
                              constraints=["现在", "一兆瓦时", "多少钱"])], question)[0]
-    assert goal.constraints == ("现在", "每兆瓦时", "多少钱")
+    assert goal.constraints == ("现在", "一兆瓦时", "多少钱")
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-@pytest.mark.parametrize(("question", "texts", "rule"), [
-    ("国电电力2024年利润和华能国际2025年利润", ["国电电力2025年利润", "华能国际2024年利润"], "subject_time_rebound"),
-    ("国电电力2025年营业收入和2026年净利润", ["国电电力2026年营业收入", "国电电力2025年净利润"], "metric_time_rebound"),
-    ("图2营业收入，图3归母净利润", ["图3营业收入", "图2归母净利润"], "metric_locator_rebound"),
-    ("国电电力2025年上半年光伏发电量和上网电量同比增幅", ["国电电力2025年上半年光伏发电量同比增幅", "国电电力2025年上半年上网电量同比增幅"], "metric_scope_dropped"),
+@pytest.mark.parametrize(("question", "constraint"), [
+    ("国电电力2025年上半年收入比同期增长多少？", "同期"),
+    ("对比同期（2024年上半年）的收入", "同期（2024年上半年）"),
+    ("购买一兆瓦时电需要多少钱？", "一兆瓦时"),
+    ("购买一千瓦时电需要多少钱？", "一千瓦时"),
 ])
-def test_wrong_local_bindings_are_rejected(question, texts, rule):
-    with pytest.raises(QueryValidationError, match=rule):
-        validate_goals(question, tuple(QueryGoal(f"g{i}", text) for i, text in enumerate(texts)))
+def test_constraints_preserve_period_and_quantity_meaning(question, constraint):
+    goal = parse_goals([dict(id="g1", text=question, constraints=[constraint])], question)[0]
+    assert goal.constraints == (constraint,)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 @pytest.mark.parametrize(("original", "candidate"), [
@@ -163,13 +163,3 @@ def test_wrong_local_bindings_are_rejected(question, texts, rule):
 ])
 def test_acceptance_fixes_do_not_allow_invented_values_or_scopes(original, candidate):
     assert not validate_query_preservation(original, candidate).valid
-
-
-
-
-def test_reporting_period_cannot_move_to_another_metric_in_same_year():
-    question = "2025年上半年营业收入和2025年下半年净利润"
-    with pytest.raises(QueryValidationError, match="metric_period_rebound"):
-        validate_goals(question, (
-            QueryGoal("a", "2025年下半年营业收入"), QueryGoal("b", "2025年上半年净利润"),
-        ))

@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any, Iterable
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -31,21 +35,37 @@ def read_stream_chunk(chunk: Any) -> tuple[Any, str, str]:
     return getattr(choice, "finish_reason", None), answer_text, thinking_text
 
 
+def close_answer_stream(stream: Any) -> None:
+    """释放模型响应连接，不关闭后续规划、评分仍需复用的客户端。"""
+    close = getattr(stream, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            # 清理失败要留日志，但不能覆盖读取阶段的原异常或阻止前端断开清理。
+            logger.warning("关闭回答模型响应流失败", exc_info=True)
+
+
 def collect_answer_stream(stream: Iterable[Any]) -> CollectedAnswer:
     """读取与聊天相同的回答流，不生成 SSE 事件或写入存储。"""
     answer_parts: list[str] = []
     thinking_parts: list[str] = []
     chunk_count = 0
 
-    for chunk in stream:
-        chunk_count += 1
-        finish_reason, answer_text, thinking_text = read_stream_chunk(chunk)
-        if answer_text:
-            answer_parts.append(answer_text)
-        if thinking_text:
-            thinking_parts.append(thinking_text)
-        if finish_reason is not None:
-            break
+    try:
+        for chunk in stream:
+            chunk_count += 1
+            finish_reason, answer_text, thinking_text = read_stream_chunk(chunk)
+            if answer_text:
+                answer_parts.append(answer_text)
+            if thinking_text:
+                thinking_parts.append(thinking_text)
+            if finish_reason is not None:
+                break
+    finally:
+        # finish_reason 后可能还有 usage/[DONE] 事件；提前退出不等于底层响应已关闭。
+        # 不能把连接释放推迟到 GC，否则后续评分请求可能在连接池持锁时回收旧流并死锁。
+        close_answer_stream(stream)
 
     return CollectedAnswer(
         answer="".join(answer_parts),

@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass, field
 from typing import Any
-from domain.evidence import EvidenceCollection
+from domain.evidence import Evidence, EvidenceCollection
 from service.core.evidence.adapter import reference_records
 from service.core.query.contract import RetrievalTask
 
@@ -18,6 +18,8 @@ class ToolResult:
     error: str | None = None
     diagnostics: dict[str, Any] = field(default_factory=dict)
     task: RetrievalTask | None = None
+    # 仅当前运行内可恢复的原始快照，不随 to_dict 作为可用证据导出。
+    recoverable_evidence: tuple[Evidence, ...] = ()
 
     @classmethod
     def failure(cls, *, tool_name: str, query: str, error: str, diagnostics=None):

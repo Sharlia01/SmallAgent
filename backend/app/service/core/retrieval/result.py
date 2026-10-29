@@ -4,7 +4,7 @@ from dataclasses import dataclass, field, replace
 from copy import deepcopy
 from typing import Any
 
-from domain.evidence import EvidenceCollection
+from domain.evidence import Evidence, EvidenceCollection
 from service.core.evidence.adapter import collection_from_records, reference_records
 from service.core.query.contract import RetrievalTask
 
@@ -15,6 +15,7 @@ class RetrievalResult:
     diagnostics: dict[str, Any] = field(default_factory=dict) #检索过程的诊断信息，用于分析耗时
     total_candidates: int | None = None    # 底层检索报告的候选总数，可能总共有50条候选，但只返回了前5条
     task: RetrievalTask | None = None
+    recoverable_evidence: tuple[Evidence, ...] = ()
 
     def copy(self) -> "RetrievalResult":
         # 来源对象内部包含只读映射，不能 deepcopy；集合提供自己的快照复制。
@@ -35,6 +36,8 @@ def adapt_retrieval_records(records: list[dict], diagnostics: dict, *,
         evidence=evidence,
         diagnostics={k: v for k, v in diagnostics.items() if k not in business_fields},
         total_candidates=diagnostics.get("total"), task=task,
+        recoverable_evidence=tuple(collection_from_records(
+            [row for record in records for row in record.get('_table_recovery_records', [])], query=query)),
     )
 
 

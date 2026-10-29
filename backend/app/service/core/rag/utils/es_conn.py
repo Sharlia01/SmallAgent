@@ -31,7 +31,6 @@ from service.core.rag.utils.doc_store_conn import MatchExpr, OrderByExpr, MatchT
 from service.core.rag.nlp import is_english
 from dotenv import load_dotenv
 from service.core.runtime.context import current_runtime, QueryBudgetExceeded
-from service.core.retrieval.entities import COMPANY_FILTER_KEY, CANDIDATE_STATUSES
 
 load_dotenv()
 
@@ -238,25 +237,9 @@ class ESConnection:
         if knowledgebase_ids is not None:
             condition["kb_id"] = knowledgebase_ids
 
+        # 这里只处理知识库、文档、可用状态等显式范围，不推断片段属于哪家公司。
+        # 正文提到同行或缺少实体标签，不能成为排除片段的理由。
         for field, value in condition.items():
-            if field == COMPANY_FILTER_KEY:
-                if not value:
-                    continue
-                if not isinstance(value, list) or not all(isinstance(entity_id, str) and entity_id for entity_id in value):
-                    raise ValueError("Company filter requires a list of nonempty entity IDs")
-                # 已明确属于别家公司的表格行，不能因文件名或候选标签而入选。
-                # 普通文字的候选标签只用来缩小搜索范围，不能证明数字归属。
-                bool_query.filter.append(Q(
-                    "bool", minimum_should_match=1,
-                    should=[
-                        Q("terms", subject_entity_ids=value),
-                        Q("bool", filter=[
-                            Q("terms", candidate_subject_entity_ids=value),
-                            Q("terms", entity_attribution_status_kwd=list(CANDIDATE_STATUSES)),
-                        ], must_not=[Q("exists", field="subject_entity_ids")]),
-                    ],
-                ))
-                continue
             if field == "available_int":
                 if value == 0:
                     bool_query.filter.append(

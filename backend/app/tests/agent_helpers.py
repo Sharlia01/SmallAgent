@@ -32,9 +32,9 @@ def task(id="s1", query="员工培训要求", goal_ids=("g1",), tool="search_kno
     return dict(id=id, query=query, tool=tool, goal_ids=list(goal_ids), **kwargs)
 
 
-def initial(goals=None, tasks=None, *, requires_evidence=True, clarification=None, financial=None):
+def initial(goals=None, tasks=None, *, requires_evidence=True, clarification=None, entities=()):
     return {"understanding": {"goals": [goal()] if goals is None else goals,
-                             "requires_evidence": requires_evidence, "clarification": clarification, "financial": financial},
+                             "entities": list(entities), "requires_evidence": requires_evidence, "clarification": clarification},
             "plan": {"tasks": [task()] if tasks is None else tasks}}
 
 

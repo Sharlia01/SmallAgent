@@ -46,20 +46,20 @@ The Agent is responsible for retrieval decisions and tool execution. A separate 
 
 | Responsibility | Configuration | Current default |
 | --- | --- | --- |
-| Agent routing and tool calls | `AGENT_MODEL` | `qwen3.7-flash-2026-07-15` |
-| Retrieval query normalization | `QUERY_REWRITE_MODEL` | `qwen3.7-flash-2026-07-15` |
-| Evidence sufficiency check | `RAG_EVIDENCE_SUFFICIENCY_MODEL` | `qwen3.7-flash-2026-07-15` |
-| Final answer generation | `CHAT_MODEL` | `deepseek-v4-pro` |
+| Agent routing and tool calls | `AGENT_MODEL` | `qwen3.8-flash` |
+| Retrieval query normalization | `QUERY_REWRITE_MODEL` | `qwen3.8-flash` |
+| Evidence sufficiency check | `RAG_EVIDENCE_SUFFICIENCY_MODEL` | `qwen3.8-flash` |
+| Final answer generation | `CHAT_MODEL` | `qwen3.8-max` |
 | Live web search | `WEB_SEARCH_MODEL` | `qwen-plus` |
-| Suggested questions and session titles | Configured in code | `qwen3.7-flash-2026-07-15` |
+| Suggested questions and session titles | Configured in code | `qwen3.8-flash` |
 | Text embeddings | `EMBEDDING_BACKEND` | Local CPU or remote inference service |
 | Retrieval reranking | `RERANKER_BACKEND` | Local CPU or remote inference service |
 
-Both `AGENT_MODEL` and `CHAT_MODEL` are currently set to `deepseek-v4-pro` in `.env.example`. To use a smaller model for routing and a larger model for answer synthesis, configure them separately in `backend/.env`:
+Both `AGENT_MODEL` and `CHAT_MODEL` are currently set to `qwen3.8-max` in `.env.example`. To use a smaller model for routing and a larger model for answer synthesis, configure them separately in `backend/.env`:
 
 ```env
 AGENT_MODEL=<function-calling router model>
-CHAT_MODEL=deepseek-v4-pro
+CHAT_MODEL=qwen3.8-max
 ```
 
 ## Technology stack

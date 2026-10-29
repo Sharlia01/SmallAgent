@@ -31,6 +31,7 @@ from pypdf import PdfReader as pdf2_read
 from service.core.resources.paths import get_project_base_directory
 from service.core.deepdoc.vision import OCR, Recognizer, LayoutRecognizer, TableStructureRecognizer
 from service.core.rag.nlp import rag_tokenizer
+from domain.table_structure import COLUMN_HEADER, ROW_GROUP, SPANNING_CELL
 from copy import deepcopy
 from huggingface_hub import snapshot_download
 
@@ -234,7 +235,9 @@ class RAGFlowPdfParser:
             return Recognizer.sort_Y_firstly(eles, 0)
 
         # 为表格区域内的文本框添加行、表头、列和跨列标记 R/H/C/SP。
-        headers = gather(r".*header$")
+        column_headers = gather(r"table column header$")
+        row_groups = gather(r"table projected row header$")
+        headers = column_headers + row_groups
         rows = gather(r".* (row|header)")
         spans = gather(r".*spanning")
         clmns = sorted([r for r in self.tb_cpns if re.match(
@@ -243,6 +246,24 @@ class RAGFlowPdfParser:
         for b in self.boxes:
             if b.get("layout_type", "") != "table":
                 continue
+            # 保留检测类别、置信度和页内坐标；H 仅供旧的布局排序使用。
+            b["table_structure"] = []
+            for label, regions in ((COLUMN_HEADER, column_headers),
+                                   (ROW_GROUP, row_groups), (SPANNING_CELL, spans)):
+                candidates = [region for region in regions
+                              if region["pn"] == b["page_number"] - 1]
+                for region in candidates:
+                    if Recognizer.find_overlapped_with_threashold(b, [region], thr=0.3) is None:
+                        continue
+                    offset = self.page_cum_height[region["pn"]]
+                    b["table_structure"].append({
+                        "label": label,
+                        "score": float(region["score"]),
+                        "page_number": int(region["pn"] + self.page_from + 1),
+                        "coordinate_space": "page",
+                        "bbox": [float(region["x0"]), float(region["top"] - offset),
+                                 float(region["x1"]), float(region["bottom"] - offset)],
+                    })
             ii = Recognizer.find_overlapped_with_threashold(b, rows, thr=0.3)
             if ii is not None:
                 b["R"] = ii
@@ -266,10 +287,10 @@ class RAGFlowPdfParser:
 
             ii = Recognizer.find_overlapped_with_threashold(b, spans, thr=0.3)
             if ii is not None:
-                b["H_top"] = spans[ii]["top"]
-                b["H_bott"] = spans[ii]["bottom"]
-                b["H_left"] = spans[ii]["x0"]
-                b["H_right"] = spans[ii]["x1"]
+                b["SP_top"] = spans[ii]["top"]
+                b["SP_bott"] = spans[ii]["bottom"]
+                b["SP_left"] = spans[ii]["x0"]
+                b["SP_right"] = spans[ii]["x1"]
                 b["SP"] = ii
 
     def __ocr(self, pagenum, img, chars, ZM=3):

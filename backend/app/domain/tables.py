@@ -13,7 +13,7 @@ from typing import Any
 
 
 TABLE_OBJECT_SCHEMA_VERSION = "1.0"
-TABLE_PARSER_VERSION = "table-object-v5"
+TABLE_PARSER_VERSION = "table-object-v6"
 
 
 @dataclass(frozen=True)
@@ -196,6 +196,9 @@ def build_table_chunks(table: TableObject) -> list[TableChunk]:
                 "row_index": row_index,
                 "headers": headers,
                 "cells": cells,
+                "context": context,
+                "preamble": preamble,
+                "column_indices": list(range(len(headers))),
             }],
         }
         chunks.append(TableChunk(

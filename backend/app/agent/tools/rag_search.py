@@ -93,6 +93,13 @@ class RagSearchTool:
 
         try:
             retrieve = self._retriever or retrieve_evidence
+            if _context is not None:
+                from dataclasses import replace
+                from service.core.retrieval.entities import company_hints_from_names
+                names = _context.company_names(_task.goal_ids if _task else None)
+                if names is not None and (_task is None or _task.company_hints is None):
+                    _task = _task or RetrievalTask(normalized_query, tuple(g.id for g in _context.goals))
+                    _task = replace(_task, company_hints=company_hints_from_names(names))
             arguments = {"task": _task} if _task is not None else {}
             output = retrieve(str(self._user_id), normalized_query, page_size=top_k, **arguments)
             if isinstance(output, RetrievalResult):
@@ -120,6 +127,7 @@ class RagSearchTool:
             content=_format_evidence(result.evidence),
             evidence=result.evidence,
             task=_task or result.task,
+            recoverable_evidence=result.recoverable_evidence,
             diagnostics={"result_count": len(result.evidence), "top_k": top_k, **result.diagnostics},
         )
 

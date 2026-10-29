@@ -2,9 +2,7 @@ from service.core.evidence.adapter import reference_records
 from service.core.evidence.adapter import collection_from_records
 import pytest
 
-from service.core.retrieval import fusion as retrieval
 from domain.assessment import EvidenceAssessment
-from agent.plans import AgentTask as QuerySubqueryPlan
 from service.core.rag.nlp import search_v2
 from service.core.rag.nlp.search_v2 import reciprocal_rank_fusion
 from evaluation.retrieval import (
@@ -91,173 +89,6 @@ def test_dealer_retrieval_times_initial_retrieval_and_rerank(monkeypatch):
 
 
 
-
-
-
-
-@pytest.mark.unit
-def test_different_rows_in_same_table_are_not_numeric_duplicates():
-    chunks = {
-        "ocf": {
-            "table_id_kwd": "cash-flow-table",
-            "table_row_int": "9",
-            "table_cells_kwd": [
-                "经营活动现金流",
-                "3071",
-                "23940",
-                "31078",
-                "26415",
-                "29468",
-            ],
-        },
-        "fcff": {
-            "table_id_kwd": "cash-flow-table",
-            "table_row_int": "14",
-            "table_cells_kwd": [
-                "企业自由现金流",
-                "123",
-                "456",
-                "789",
-                "1000",
-                "34791",
-            ],
-        },
-    }
-
-    assert not retrieval._duplicates_numeric_fact(
-        "fcff",
-        {"ocf"},
-        chunks,
-    )
-
-
-@pytest.mark.unit
-def test_same_primary_table_row_is_a_numeric_duplicate():
-    chunks = {
-        "first": {
-            "table_id_kwd": "expense-table",
-            "table_row_int": "3",
-        },
-        "second": {
-            "table_id_kwd": "expense-table",
-            "table_row_int": "3",
-        },
-    }
-
-    assert retrieval._duplicates_numeric_fact(
-        "second",
-        {"first"},
-        chunks,
-    )
-
-
-@pytest.mark.unit
-def test_shared_table_header_does_not_make_rows_numeric_duplicates():
-    shared_header = "| 指标 | 2023 | 2024 | 2025E | 2026E | 2027E |"
-    chunks = {
-        "ocf": {
-            "content_with_weight": (
-                shared_header
-                + "\n| 经营活动现金流 | 1 | 2 | 3 | 4 | 5 |"
-            ),
-        },
-        "fcff": {
-            "content_with_weight": (
-                shared_header
-                + "\n| 企业自由现金流 | 6 | 7 | 8 | 9 | 10 |"
-            ),
-        },
-    }
-
-    assert not retrieval._duplicates_numeric_fact(
-        "fcff",
-        {"ocf"},
-        chunks,
-    )
-
-
-@pytest.mark.unit
-def test_parallel_coverage_keeps_original_numeric_question_when_subquery_is_shorter(
-    monkeypatch,
-):
-    original_question = (
-        "国电电力2025年上半年实际归母净利润是多少，"
-        "报告预测2025年全年归母净利润是多少？"
-    )
-
-    def chunk(chunk_id, content, *, evidence_type="text"):
-        return {
-            "chunk_id": chunk_id,
-            "doc_id": "doc-1",
-            "docnm_kwd": "国电电力.pdf",
-            "evidence_type_kwd": evidence_type,
-            "content_with_weight": content,
-        }
-
-    figure = chunk(
-        "approximate-figure",
-        "图3：国电电力归母净利润。视觉模型提取事实（未经人工核验）："
-        "2025年上半年约35亿元。",
-        evidence_type="figure",
-    )
-    actual = chunk(
-        "exact-actual",
-        "2025年上半年公司实际归母净利润36.87亿元。",
-    )
-    forecast = chunk(
-        "exact-forecast",
-        "报告预测2025年全年归母净利润70.50亿元。",
-    )
-    scores = {
-        figure["content_with_weight"]: 0.99,
-        actual["content_with_weight"]: 0.90,
-        forecast["content_with_weight"]: 0.95,
-    }
-
-    class Compatible:
-        def to_dict(self):
-            return {"categories": {}, "conflict_count": 0}
-
-    monkeypatch.setattr(
-        retrieval,
-        "evaluate_constraint_compatibility",
-        lambda *_args, **_kwargs: Compatible(),
-    )
-    monkeypatch.setattr(
-        retrieval,
-        "rerank_similarity",
-        lambda _question, documents: ([scores[text] for text in documents], None),
-    )
-
-    result = retrieval._merge_parallel_subqueries(
-        original_question=original_question,
-        subquery_results=[
-            (
-                QuerySubqueryPlan(
-                    id="actual",
-                    query="国电电力2025年上半年实际归母净利润",
-                ),
-                {"chunks": [figure, actual]},
-            ),
-            (
-                QuerySubqueryPlan(
-                    id="forecast",
-                    query="报告预测2025年全年归母净利润",
-                ),
-                {"chunks": [forecast]},
-            ),
-        ],
-        options=search_v2.Dealer.RetrievalOptions(page_size=2),
-    )
-
-    assert result["retrieval_fusion"]["final_rerank"]["coverage_chunk_ids_by_subquery"] == {
-        "actual": ["exact-actual"],
-        "forecast": ["exact-forecast"],
-    }
-    assert {item["chunk_id"] for item in result["chunks"]} == {
-        "exact-actual",
-        "exact-forecast",
-    }
 
 
 
@@ -408,16 +239,15 @@ def test_search_runs_three_independent_branches_and_rrf_fusion():
         (f"text::{expanded}", {"pagerank_fea": 10}),
         ("vector", None),
     ]
-    assert result.ids == ["shared", "b", "a"]
-    assert result.query_vector == [0.1, 0.2]
-    assert result.branch_weights == pytest.approx(
+    assert result.candidate_ids == ["shared", "b", "a"]
+    assert result.diagnostics.branch_weights == pytest.approx(
         {
             "keyword_original": 0.2,
             "keyword_expanded": 0.2,
             "vector_original": 0.6,
         }
     )
-    assert result.retrieval_ranks["shared"] == {
+    assert result.diagnostics.branch_ranks["shared"] == {
         "keyword_original": 2,
         "keyword_expanded": 1,
         "vector_original": 2,
@@ -447,8 +277,7 @@ def test_search_skips_duplicate_expanded_keyword_branch(monkeypatch):
             ids=[],
             fields={},
             scores={},
-        ),
-        [],
+        )
     )
     dealer._merge_search_branches = lambda branches, weights, **_kwargs: (
         (branches, weights)
@@ -535,12 +364,12 @@ def test_rerank_preserves_semantic_order_without_constraints(monkeypatch):
     dealer = object.__new__(search_v2.Dealer)
     search_result = search_v2.Dealer.SearchResult(
         total=2,
-        ids=["chunk-1", "chunk-2"],
-        field={
+        candidate_ids=["chunk-2", "chunk-1"],
+        candidate_fields={
             "chunk-1": {"content_with_weight": "第一条原始内容"},
             "chunk-2": {"content_with_weight": "第二条原始内容"},
         },
-        rrf_scores={"chunk-1": 0.03, "chunk-2": 0.04},
+        recall_fusion_scores={"chunk-1": 0.03, "chunk-2": 0.04},
     )
     monkeypatch.setattr(
         search_v2,
@@ -559,20 +388,11 @@ def test_rerank_preserves_semantic_order_without_constraints(monkeypatch):
     )
 
     assert semantic_calls == [
-        ("用户原始问题", ["第一条原始内容", "第二条原始内容"])
+        ("用户原始问题", ["第二条原始内容", "第一条原始内容"])
     ]
     assert scores.tolist() == [0.8, 0.8]
-    assert indexes == [1, 0]
-    chunk_two_ranking = search_result.final_ranking["chunk-2"]
-    assert chunk_two_ranking["semantic_reranker_rank"] == 1
-    assert chunk_two_ranking["retrieval_rrf_rank"] == 1
-    assert chunk_two_ranking["final_fusion_score"] == pytest.approx(1 / 11)
-    assert chunk_two_ranking["final_fusion_contributions"] == pytest.approx(
-        {
-            "semantic_reranker": 0.7 / 11,
-            "retrieval_rrf": 0.3 / 11,
-        }
-    )
+    assert indexes == [0, 1]
+    assert search_result.final_fusion_scores["chunk-2"] == pytest.approx(1 / 11)
 
 
 @pytest.mark.unit
@@ -581,14 +401,14 @@ def test_table_reranker_prefers_semantic_text_over_llm_markdown(monkeypatch):
     dealer = object.__new__(search_v2.Dealer)
     search_result = search_v2.Dealer.SearchResult(
         total=1,
-        ids=["table-row"],
-        field={
+        candidate_ids=["table-row"],
+        candidate_fields={
             "table-row": {
                 "content_with_weight": "| 公司 | PE |\n| --- | --- |\n| 龙源电力 | 19.6 |",
                 "table_semantic_text_with_weight": "公司：龙源电力；PE：19.6",
             },
         },
-        rrf_scores={"table-row": 0.03},
+        recall_fusion_scores={"table-row": 0.03},
     )
     monkeypatch.setattr(
         search_v2,
@@ -613,12 +433,12 @@ def test_second_stage_fusion_uses_configured_reranker_weight(monkeypatch):
     dealer = object.__new__(search_v2.Dealer)
     search_result = search_v2.Dealer.SearchResult(
         total=2,
-        ids=["retrieval-first", "semantic-first"],
-        field={
+        candidate_ids=["retrieval-first", "semantic-first"],
+        candidate_fields={
             "retrieval-first": {"content_with_weight": "候选一"},
             "semantic-first": {"content_with_weight": "候选二"},
         },
-        rrf_scores={
+        recall_fusion_scores={
             "retrieval-first": 0.03,
             "semantic-first": 0.02,
         },
@@ -643,10 +463,7 @@ def test_second_stage_fusion_uses_configured_reranker_weight(monkeypatch):
     )
 
     assert indexes == [1, 0]
-    semantic_first = search_result.final_ranking["semantic-first"]
-    assert semantic_first["semantic_reranker_rank"] == 1
-    assert semantic_first["retrieval_rrf_rank"] == 2
-    assert semantic_first["final_fusion_score"] == pytest.approx(
+    assert search_result.final_fusion_scores["semantic-first"] == pytest.approx(
         0.7 / 11 + 0.3 / 12
     )
 
@@ -661,8 +478,7 @@ def test_second_stage_fusion_uses_configured_reranker_weight(monkeypatch):
     )
 
     assert retrieval_weighted_indexes == [0, 1]
-    retrieval_first = search_result.final_ranking["retrieval-first"]
-    assert retrieval_first["final_fusion_score"] == pytest.approx(
+    assert search_result.final_fusion_scores["retrieval-first"] == pytest.approx(
         0.3 / 12 + 0.7 / 11
     )
 
@@ -673,8 +489,8 @@ def test_rerank_demotes_explicit_constraint_conflicts(monkeypatch):
     dealer = object.__new__(search_v2.Dealer)
     search_result = search_v2.Dealer.SearchResult(
         total=2,
-        ids=["half-year", "second-quarter"],
-        field={
+        candidate_ids=["half-year", "second-quarter"],
+        candidate_fields={
             "half-year": {
                 "content_with_weight": (
                     "2025年上半年，公司实现营业收入776.55亿元；"
@@ -690,7 +506,7 @@ def test_rerank_demotes_explicit_constraint_conflicts(monkeypatch):
                 "docnm_kwd": "国电电力.pdf",
             },
         },
-        rrf_scores={
+        recall_fusion_scores={
             "half-year": 0.015543,
             "second-quarter": 0.015008,
         },
@@ -723,12 +539,12 @@ def test_rerank_demotes_explicit_constraint_conflicts(monkeypatch):
 
 
 @pytest.mark.unit
-def test_constraint_rerank_filters_threshold_before_pagination(monkeypatch):
+def test_constraint_rerank_selects_highest_ranked_candidate(monkeypatch):
     dealer = object.__new__(search_v2.Dealer)
     search_result = search_v2.Dealer.SearchResult(
         total=2,
-        ids=["compatible-low-score", "unknown-high-score"],
-        field={
+        candidate_ids=["compatible-low-score", "unknown-high-score"],
+        candidate_fields={
             "compatible-low-score": {
                 "content_with_weight": "2025年第二季度经营情况。",
             },
@@ -763,9 +579,8 @@ def test_retrieval_result_preserves_rrf_and_branch_diagnostics():
     dealer = object.__new__(search_v2.Dealer)
     search_result = search_v2.Dealer.SearchResult(
         total=3,
-        ids=["chunk-1"],
-        query_vector=[0.1, 0.2],
-        field={
+        candidate_ids=["chunk-1"],
+        candidate_fields={
             "chunk-1": {
                 "content_ltks": "盈利 预测",
                 "content_with_weight": "盈利预测证据",
@@ -774,39 +589,33 @@ def test_retrieval_result_preserves_rrf_and_branch_diagnostics():
                 "kb_id": "42",
             }
         },
-        rrf_scores={"chunk-1": 0.031},
-        retrieval_ranks={
-            "chunk-1": {
-                "keyword_original": 2,
-                "keyword_expanded": 1,
-                "vector_original": 4,
-            }
-        },
-        retrieval_scores={
-            "chunk-1": {
-                "keyword_original": 8.0,
-                "keyword_expanded": 12.0,
-                "vector_original": 0.88,
-            }
-        },
-        rrf_contributions={
-            "chunk-1": {
-                "keyword_original": 0.003,
-                "keyword_expanded": 0.004,
-                "vector_original": 0.024,
-            }
-        },
-        branch_totals={
-            "keyword_original": 10,
-            "keyword_expanded": 8,
-            "vector_original": 12,
-        },
-        branch_weights={
-            "keyword_original": 0.2,
-            "keyword_expanded": 0.2,
-            "vector_original": 0.6,
-        },
-        fused_candidate_count=3,
+        recall_fusion_scores={"chunk-1": 0.031},
+        diagnostics=search_v2.SearchDiagnostics(
+            branch_ranks={
+                "chunk-1": {
+                    "keyword_original": 2,
+                    "keyword_expanded": 1,
+                    "vector_original": 4,
+                }
+            },
+            branch_scores={
+                "chunk-1": {
+                    "keyword_original": 8.0,
+                    "keyword_expanded": 12.0,
+                    "vector_original": 0.88,
+                }
+            },
+            branch_hit_counts={
+                "keyword_original": 10,
+                "keyword_expanded": 8,
+                "vector_original": 12,
+            },
+            branch_weights={
+                "keyword_original": 0.2,
+                "keyword_expanded": 0.2,
+                "vector_original": 0.6,
+            },
+        ),
     )
 
     result = dealer._build_retrieval_result(
@@ -819,16 +628,18 @@ def test_retrieval_result_preserves_rrf_and_branch_diagnostics():
     assert chunk["similarity"] == pytest.approx(0.93)
     assert chunk["rerank_score"] == pytest.approx(0.93)
     assert chunk["rrf_score"] == pytest.approx(0.031)
+    assert "rrf_contributions" not in chunk
     assert chunk["term_similarity"] == pytest.approx(12.0)
     assert chunk["vector_similarity"] == pytest.approx(0.88)
+    assert "vector" not in chunk
     assert chunk["retrieval_ranks"]["keyword_expanded"] == 1
     assert chunk["constraint_compatibility"] == {}
     assert chunk["final_ranking"] == {}
     assert result["retrieval_fusion"] == {
         "method": "weighted_rrf",
         "rrf_k": 60,
-        "branch_weights": search_result.branch_weights,
-        "branch_totals": search_result.branch_totals,
+        "branch_weights": search_result.diagnostics.branch_weights,
+        "branch_totals": search_result.diagnostics.branch_hit_counts,
         "fused_candidate_count": 3,
         "rerank_candidate_count": 1,
         "rerank_query": "original_question",
@@ -1424,3 +1235,21 @@ def test_relevant_table_evidence_falls_back_to_flattened_text():
     assert result["post_gate_metrics"]["recall_at_5"] == 1.0
     assert result["post_gate_metrics"]["mrr_at_5"] == 1.0
     assert result["first_relevant_rank"] == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("recall_scores", [{"z": 0.03, "a": 0.03}, {}])
+def test_final_fusion_preserves_retrieval_order_for_ties_and_plain_search(monkeypatch, recall_scores):
+    result = search_v2.Dealer.SearchResult(
+        total=2, candidate_ids=["z", "a"],
+        candidate_fields={"z": {"content_with_weight": "正文甲"},
+                          "a": {"content_with_weight": "正文乙"}},
+        recall_fusion_scores=recall_scores,
+    )
+    monkeypatch.setattr(search_v2, "rerank_similarity", lambda *_: ([0.8, 0.8], None))
+    indexes, _ = object.__new__(search_v2.Dealer)._rerank_results(
+        result, "查询", search_v2.Dealer.RetrievalOptions(page_size=2, final_reranker_weight=0),
+    )
+    assert indexes == [0, 1]
+    assert result.candidate_ids == ["z", "a"]
+    assert result.final_fusion_scores == pytest.approx({"z": 1 / 11, "a": 1 / 12})

@@ -8,8 +8,11 @@ import re
 import unicodedata
 from typing import Any, Callable
 
+from service.core.evidence.metadata import primary_table_row, without_entity_annotations
 from service.core.rag.utils import num_tokens_from_string, truncate
 from domain.tables import build_table_markdown
+from domain.table_retrieval import IndexedTableRow, TableCandidate, TableContext
+from service.core.evidence.table_retrieval_adapter import context_record
 
 
 logger = logging.getLogger(__name__)
@@ -77,7 +80,7 @@ def _matched_row_position(
                 return position
 
     expected_cells = [
-        _normalized(value) for value in chunk.get("table_cells_kwd") or []
+        _normalized(value) for value in primary_table_row(chunk).get("cells") or []
     ]
     if expected_cells:
         for position, row in enumerate(data_rows):
@@ -159,7 +162,8 @@ def _slice_rows(
         sliced.append({
             "row_index": row.get("row_index"),
             "column_indices": available,
-            "source_row": dict(row),
+            # 旧父表可能含有规则归属标签，扩展上下文只继承原始行数据。
+            "source_row": without_entity_annotations(row),
             "context": str(row.get("context") or ""),
             "preamble": str(row.get("preamble") or ""),
             "headers": [headers[index] for index in available],
@@ -189,14 +193,18 @@ def _fit_token_budget(
     matched_position: int,
     column_indices: list[int],
     max_tokens: int,
+    matched_positions: list[int] | None = None,
 ) -> tuple[str, list[int], bool]:
     selected = list(row_positions)
+    priorities = {position: rank for rank, position in enumerate(matched_positions or [matched_position])}
     truncated_rows = False
     content = _render_context(cells_json, data_rows, selected, column_indices)
     while len(selected) > 1 and num_tokens_from_string(content) > max_tokens:
         removable = max(
             (position for position in selected if position != matched_position),
-            key=lambda position: (abs(position - matched_position), position),
+            # 先移除补充邻行，再按召回顺序移除次要命中；最佳命中始终保留。
+            key=lambda position: (position not in priorities, priorities.get(position, 0),
+                                  abs(position - matched_position), position),
         )
         selected.remove(removable)
         truncated_rows = True
@@ -209,21 +217,22 @@ def _fit_token_budget(
     return content, sorted(selected), truncated_rows
 
 
-def expand_table_chunk_context(
-    chunk: dict[str, Any],
+def build_table_context(
+    candidate: TableCandidate | IndexedTableRow,
     question: str,
     *,
     table_object: dict[str, Any] | None = None,
     loader: Callable[[str], dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """返回带有界父表上下文的副本，供语言模型使用。"""
+) -> TableContext | None:
+    """扩展只创建独立上下文，不改写来源快照或候选命中集合。"""
+    chunk = candidate.source
     if chunk.get("evidence_type_kwd") != "table" or not _enabled():
-        return chunk
+        return None
 
     reference = str(chunk.get("table_object_ref_kwd") or "")
     if table_object is None:
         if not reference:
-            return chunk
+            return None
         table_object = (loader or _default_loader)(reference)
 
     if str(table_object.get("table_id") or "") != str(
@@ -231,27 +240,26 @@ def expand_table_chunk_context(
     ):
         raise ValueError("Retrieved table chunk references a different parent")
 
-    expanded = dict(chunk)
     cells_json = table_object.get("cells_json") or {}
     binding_status = str(cells_json.get("binding_status") or "unbound")
     if binding_status != "bound":
-        expanded["content_with_weight"] = str(
+        content = str(
             table_object.get("markdown")
             or chunk.get("content_with_weight")
             or ""
         )
-        expanded["table_context_obj"] = {
+        diagnostics = {
             "policy": "unbound_full_table",
             "reliable": False,
             "row_indices": [],
             "column_indices": [],
             "truncated": False,
         }
-        return expanded
+        return TableContext(candidate, content, (), diagnostics)
 
     data_rows = cells_json.get("data_rows") or []
     if not data_rows:
-        return chunk
+        return None
 
     small_table_rows = _positive_int_environment(
         "RAG_TABLE_SMALL_TABLE_ROWS",
@@ -271,13 +279,41 @@ def expand_table_chunk_context(
         DEFAULT_MAX_CONTEXT_COLUMNS,
         minimum=2,
     )
-    matched_position = _matched_row_position(data_rows, chunk)
+    if isinstance(candidate, TableCandidate):
+        primary = candidate.matched_row_indices[0]
+        # 父表版本不一致时不能把未找到的主行悄悄替换为第一行。
+        if not all(index in {int(row['row_index']) for row in data_rows}
+                   for index in candidate.matched_row_indices):
+            raise ValueError("Candidate rows are missing from parent table")
+        matched_position = next(i for i, row in enumerate(data_rows) if int(row['row_index']) == primary)
+    else:
+        matched_position = _matched_row_position(data_rows, chunk)
     row_positions, policy = _row_positions(
         data_rows,
         matched_position,
         small_table_rows=small_table_rows,
         neighbor_radius=neighbor_radius,
     )
+    legacy = chunk.get("table_candidate_obj") or {}
+    requested_rows = (candidate.matched_row_indices if isinstance(candidate, TableCandidate)
+                      else legacy.get("matched_row_indices") or [])
+    ranking_source = candidate.ranking_source if isinstance(candidate, TableCandidate) else legacy.get("row_ranking_source")
+    scored_indices = candidate.scored_row_indices if isinstance(candidate, TableCandidate) else legacy.get("scored_row_indices", ())
+    by_row = {int(row["row_index"]): position for position, row in enumerate(data_rows)}
+    matched_positions = list(dict.fromkeys(
+        by_row[index] for index in requested_rows if index in by_row
+    )) or [matched_position]
+    if requested_rows:
+        # 多个主行只展开一次；对邻行/分组取并集，不重复输出同一数据行。
+        row_positions = sorted({position for match in matched_positions for position in _row_positions(
+            data_rows, match, small_table_rows=small_table_rows, neighbor_radius=neighbor_radius,
+        )[0]})
+        policy = "grouped_matches"
+    if ranking_source == "model":
+        # 已评分但未入选的行不能通过邻域扩展重新占用上下文预算。
+        excluded = set(scored_indices) - set(requested_rows)
+        row_positions = [position for position in row_positions
+                         if int(data_rows[position]["row_index"]) not in excluded]
     column_indices, column_window = _column_indices(
         data_rows[matched_position],
         question,
@@ -290,6 +326,7 @@ def expand_table_chunk_context(
         matched_position,
         column_indices,
         max_tokens,
+        matched_positions,
     )
     selected_row_indices = [
         int(data_rows[position].get("row_index") or position + 1)
@@ -300,28 +337,37 @@ def expand_table_chunk_context(
         selected_positions,
         column_indices,
     )
-    # 按原始行号取回各行自己的归属，邻近行不能继承命中行的公司标签。
-    ownership = {item.get("row_index"): item for item in
-                 (table_object.get("entity_attribution") or {}).get("rows", [])}
-    for row in context_rows:
-        row["entity_attribution"] = ownership.get(row["row_index"], {})
-    expanded["content_with_weight"] = content
-    expanded["table_context_obj"] = {
+    # 保留公司列和表头原文，由核验模型判断归属，不给邻近行附加推断标签。
+    diagnostics = {
         "policy": policy,
         "reliable": True,
         "matched_row_index": int(
             data_rows[matched_position].get("row_index") or matched_position + 1
         ),
         "row_indices": selected_row_indices,
+        "matched_row_indices": [int(data_rows[position]["row_index"]) for position in matched_positions],
+        "omitted_matched_row_indices": [int(data_rows[position]["row_index"])
+                                        for position in matched_positions if position not in selected_positions],
         "column_indices": column_indices,
-        "rows": context_rows,
         "caption": str(cells_json.get("caption") or ""),
         "binding_source": cells_json.get("binding_source") or "deterministic",
         "column_window": column_window,
         "truncated": truncated_rows or column_window,
         "token_count": num_tokens_from_string(content),
     }
-    return expanded
+    # 保存容量裁剪掉的命中行原始快照；不含低分淘汰行或辅助邻行。
+    omitted = [position for position in matched_positions if position not in selected_positions]
+    recovery_rows = tuple(without_entity_annotations(data_rows[position]) for position in omitted)
+    return TableContext(candidate, content, tuple(context_rows), diagnostics, recovery_rows)
+
+
+def expand_table_chunk_context(
+    chunk: dict[str, Any], question: str, *, table_object=None, loader=None,
+) -> dict[str, Any]:
+    """旧字典调用入口：仅在边界适配，核心扩展返回不可变上下文。"""
+    snapshot = IndexedTableRow(str(chunk.get("chunk_id") or ""), chunk)
+    context = build_table_context(snapshot, question, table_object=table_object, loader=loader)
+    return context_record(context) if context is not None else chunk
 
 
 def expand_table_contexts(
@@ -329,6 +375,7 @@ def expand_table_contexts(
     question: str,
     *,
     loader: Callable[[str], dict[str, Any]] | None = None,
+    candidates: dict[str, TableCandidate] | None = None,
 ) -> list[dict[str, Any]]:
     """扩展表格片段，每个父表对象最多加载一次。"""
     if not _enabled():
@@ -347,11 +394,11 @@ def expand_table_contexts(
             #cache表示父表对象临时缓存
             if reference not in cache:
                 cache[reference] = resolved_loader(reference)
-            expanded_chunks.append(expand_table_chunk_context(
-                chunk,
-                question,
-                table_object=cache[reference],
-            ))
+            candidate = (candidates or {}).get(chunk.get("chunk_id"))
+            if candidate is None:
+                candidate = IndexedTableRow(str(chunk.get("chunk_id") or ""), chunk)
+            context = build_table_context(candidate, question, table_object=cache[reference])
+            expanded_chunks.append(context_record(context, chunk) if context is not None else chunk)
         except Exception as error:
             logger.warning(
                 "Table context expansion failed for %s: %s",

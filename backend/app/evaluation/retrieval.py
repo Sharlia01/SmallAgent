@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from domain.outcomes import NON_EVIDENCE_OUTCOMES
+
 import math
 import os
 import re
@@ -11,7 +13,7 @@ from html.parser import HTMLParser
 from collections import Counter, defaultdict
 from typing import Any, Iterable
 
-from service.core.evidence.metadata import evidence_metadata
+from service.core.evidence.metadata import evidence_metadata, primary_table_row
 from evaluation.sufficiency import (
     all_supported, any_supported, candidate_support, assess_expected_sufficiency,
     stored_sufficiency_reference, sufficiency_reference,
@@ -391,7 +393,7 @@ def table_row_chunk_match_score(evidence, chunk):
         )
 
     # 回答正文可能只采用表格的一部分；原始单元格及邻近行不能绕过正文给分。
-    structured_cells = None if answer_context else chunk.get("table_cells_kwd")
+    structured_cells = None if answer_context else primary_table_row(chunk).get("cells")
     if expected_cells and isinstance(structured_cells, (list, tuple)):
         if cells_match(structured_cells):
             return 1.0
@@ -405,6 +407,17 @@ def table_row_chunk_match_score(evidence, chunk):
             if isinstance(row, dict)
         ):
             return 1.0
+
+        # 同表候选在父表不可用/扩展关闭时仍携带多条实际展示的命中行。
+        # 若已有扩展上下文，则必须以裁剪后的上下文为准，不能用原候选补分。
+        if (not context and chunk.get("table_chunk_kind_kwd") == "matched_rows"
+                and chunk.get("table_binding_kwd") == "bound"):
+            sliced = chunk.get("table_cells_slice_obj") or {}
+            if isinstance(sliced, dict) and any(
+                cells_match(row.get("cells")) for row in sliced.get("rows", [])
+                if isinstance(row, dict)
+            ):
+                return 1.0
 
         # 新解析表格以结构化单元格为准；
         # 重复正文或 HTML 不能覆盖明确的单元格不匹配。
@@ -693,7 +706,7 @@ def serialize_retrieved_chunk(
         "rank": rank,
         **evidence_metadata(chunk),
         "chunk_id": str(chunk.get("chunk_id", "")),
-        "document_id": str(chunk.get("doc_id", "")),
+        "document_id": str(chunk.get("document_id") or chunk.get("doc_id") or ""),
         "document_name": normalize_document_name(_chunk_document_name(chunk)),
         "content_with_weight": str(_chunk_content(chunk) or ""),
         **({"evidence_view": chunk["evidence_view"]} if "evidence_view" in chunk else {}),
@@ -1050,6 +1063,10 @@ def _with_gate_attribution(
         if isinstance(pre_gate_evidence_sufficient, bool)
         else None
     )
+    if attributed.get("outcome") in NON_EVIDENCE_OUTCOMES:
+        attributed.update(rejected=None, rejection_attribution=attributed["outcome"],
+                          pre_gate_evidence_sufficient=evidence_sufficient)
+        return attributed
     rejection_attribution = None
     if attributed.get("rejected") is True:
         if evidence_sufficient is True:
@@ -1085,6 +1102,7 @@ def _gate_metrics(
     return _with_gate_attribution(
         {
             "rejected": not sufficient if available else None,
+            "outcome": decision.get("outcome"),
             "source": source,
             "fallback": source == "fallback" if available else None,
             "enabled": False if disabled else (True if available else None),
@@ -1178,8 +1196,6 @@ def evaluate_retrieval_case(
                 raw_result.get("query_intent") or {}
             ),
             "query_understanding": _json_safe(raw_result.get("query_understanding") or {}),
-            "financial_requirements": _json_safe(raw_result.get("financial_requirements")),
-            "financial_bindings": _json_safe(raw_result.get("financial_bindings") or []),
             "retrieval_task": _json_safe(raw_result.get("retrieval_task")),
             "query_contract": _json_safe(raw_result.get("query_contract") or {}),
             "query_runtime": _json_safe(raw_result.get("query_runtime") or {}),
@@ -1722,6 +1738,26 @@ def aggregate_agent_evidence(results: list[dict[str, Any]]) -> dict[str, Any]:
     return aggregated
 
 
+def _repair_status(retrieval: dict[str, Any]) -> tuple[bool, bool] | None:
+    """返回是否执行补查、是否补齐证据；缺失执行数据返回 None。
+
+    Agent steps 包含初始执行，规划出来但未执行的补查不计入。
+    旧版记录仅在没有 Agent 执行记录时读取 query_repair。
+    """
+    agent = retrieval.get("agent_execution")
+    if agent:
+        steps = agent.get("steps")
+        if type(steps) is not int or steps < 0:
+            return None
+        attempted = steps > 1
+        return attempted, attempted and agent.get("stop_reason") == "evidence_ready"
+    repair = retrieval.get("query_repair")
+    if repair:
+        attempted = bool(repair.get("attempted_goal_ids"))
+        return attempted, attempted and repair.get("stop_reason") == "goals_satisfied"
+    return None
+
+
 def aggregate_query_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     """使用明确分母计算运行指标，不推测调用费用。
 
@@ -1734,21 +1770,24 @@ def aggregate_query_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     analyses = [r["query_intent"] for r in retrievals if r.get("query_intent")]
     executions = [r["plan_execution"] for r in retrievals if r.get("plan_execution")]
     executed_requests = [item for item in executions if type(item.get("requested_plan_execution_success")) is bool]
+    repair_statuses = [_repair_status(retrieval) for retrieval in retrievals]
     repair_cohorts = {}
     for answerable in (True, False):
-        cohort = [(item.get("retrieval") or {}).get("query_repair") or {} for item in results
+        cohort = [status for item, status in zip(results, repair_statuses)
                   if item.get("answerable") is answerable]
-        attempts = [item for item in cohort if item.get("attempted_goal_ids")]
+        attempts = [status for status in cohort if status is not None and status[0]]
+        satisfied_count = sum(status[1] for status in attempts)
         repair_cohorts["answerable" if answerable else "unanswerable"] = {
-            "sample_count": len(cohort), "attempt_count": len(attempts),
-            "goals_satisfied_count": sum(item.get("stop_reason") == "goals_satisfied" for item in attempts),
-            "success_rate": _rate(sum(item.get("stop_reason") == "goals_satisfied" for item in attempts), len(attempts)),
+            "sample_count": len(cohort),
+            "unavailable_count": sum(status is None for status in cohort),
+            "attempt_count": len(attempts),
+            "goals_satisfied_count": satisfied_count,
+            "success_rate": _rate(satisfied_count, len(attempts)),
         }
     annotated = [r for r in retrievals if (r.get("expected_retrieval") or {}).get("mode")
                  and (r.get("retrieval_route") or {}).get("mode")]
-    repairs = [r["query_repair"] for r in retrievals if (r.get("query_repair") or {}).get("attempted_goal_ids")]
+    repairs = [status for status in repair_statuses if status is not None and status[0]]
     coverage = [goal for r in retrievals for goal in (r.get("evidence_sufficiency") or {}).get("goal_coverage", [])]
-    financial = [(r.get("evidence_sufficiency") or {}).get("financial_fact_bundle") or {} for r in retrievals]
     return {
         "runtime_sample_count": len(runtimes),
         "runtime_unavailable_count": len(results) - len(runtimes),
@@ -1769,14 +1808,11 @@ def aggregate_query_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         "evaluated_goal_count": len(coverage),
         "supported_goal_rate": _rate(sum(g.get("status") == "supported" for g in coverage), len(coverage)),
         "repair_count": len(repairs),
-        "repair_success_rate": _rate(sum(r.get("stop_reason") == "goals_satisfied" for r in repairs), len(repairs)),
+        "repair_success_rate": _rate(sum(status[1] for status in repairs), len(repairs)),
+        "repair_unavailable_count": sum(status is None for status in repair_statuses),
         "repair_cohorts": repair_cohorts,
         "verification_unavailable_count": sum((r.get("evidence_sufficiency") or {}).get("verification_status") == "unavailable" for r in retrievals),
-        "financial_requirement_statuses": dict(Counter(item["status"] for bundle in financial
-                                                       for item in bundle.get("requirement_results", []))),
-        "financial_relationship_statuses": dict(Counter(item["status"] for bundle in financial
-                                                        for item in bundle.get("relationship_results", []))),
-        "financial_verification_unavailable_count": sum(bundle.get("verification_status") == "unavailable" for bundle in financial),
+
     }
 
 

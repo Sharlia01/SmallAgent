@@ -310,10 +310,11 @@ def extract_organizations(text: str) -> set[str]:
     return {_normalize(value) for value in _extract_organizations(str(text or ""))}
 
 
-def _measurement_subject_text(text: str) -> str:
+def _measurement_subject_text(text: str, *, entity_names=None) -> str:
     """移除通用约束，保留问题中特有的主体文本。"""
     subject = _normalize(text)
-    for organization in extract_organizations(text):
+    organizations = extract_organizations(text) if entity_names is None else {_normalize(name) for name in entity_names}
+    for organization in organizations:
         subject = subject.replace(organization, "")
     return _MEASUREMENT_SUBJECT_NOISE_PATTERN.sub("", subject)
 
@@ -335,6 +336,7 @@ def _longest_common_measurement_subject(
 def _compare_measurement_subjects(
     question: str,
     candidate_text: str,
+    *, entity_names=None,
 ) -> ConstraintCategoryDecision | None:
     """对包含计量维度的问题返回软性主体字面匹配结果。
 
@@ -343,7 +345,7 @@ def _compare_measurement_subjects(
     """
     if not extract_measurement_dimensions(question):
         return None
-    required = _measurement_subject_text(question)
+    required = _measurement_subject_text(question, entity_names=entity_names)
     if len(required) < 2:
         return None
     observed = _measurement_subject_text(candidate_text)
@@ -436,6 +438,7 @@ def evaluate_constraint_compatibility(
     candidate_text: str,
     *,
     document_name: str = "",
+    entity_names=None,
 ) -> ConstraintCompatibilityDecision:
     """比较高置信度查询约束与单条候选片段。"""
     categories: dict[str, ConstraintCategoryDecision] = {}
@@ -460,6 +463,7 @@ def evaluate_constraint_compatibility(
         "measurement_subject": _compare_measurement_subjects(
             question,
             candidate_text,
+            entity_names=entity_names,
         ),
     }
     for category, decision in comparisons.items():
@@ -468,7 +472,7 @@ def evaluate_constraint_compatibility(
 
     # 正文片段可能从文档继承实体，缺少名称不构成明确冲突。
     # 文档元数据或正文中的实体匹配可作为诊断信息和排序同分时的依据。
-    required_entities = extract_organizations(question)
+    required_entities = extract_organizations(question) if entity_names is None else {_normalize(name) for name in entity_names}
     if required_entities:
         document_stem = Path(str(document_name or "")).stem
         candidate_entities = extract_organizations(candidate_text)

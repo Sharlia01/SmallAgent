@@ -23,9 +23,13 @@ from service.core.evidence.metadata import (
     EVIDENCE_FIELDS,
     evidence_metadata,
     ranking_text,
+    rerank_text,
 )
+from domain.table_retrieval import TableCandidate
+from service.core.evidence.table_retrieval_adapter import candidate_record
+from service.core.retrieval.table_candidates import group_table_candidates, select_candidate_ids
 from service.core.retrieval.entities import (
-    COMPANY_FILTER_KEY, CompanyConstraint, resolve_company_constraint,
+    CompanyHints, resolve_company_hints,
 )
 
 from service.core.rag.settings import TAG_FLD, PAGERANK_FLD
@@ -110,6 +114,19 @@ def reciprocal_rank_fusion(
     )
 
 
+@dataclass
+class SearchDiagnostics:
+    """召回分支诊断；候选级映射使用原始 chunk ID，保留每个入选表格行的数据。"""
+    branch_ranks: dict[str, dict[str, int]] = dataclass_field(  # 各召回分支中的名次，{chunk_id: {分支名: 名次}}，从 1 开始
+        default_factory=dict
+    )
+    branch_scores: dict[str, dict[str, float]] = dataclass_field(  # 各分支原始搜索得分，{chunk_id: {分支名: 得分}}，不同分支尺度可能不同
+        default_factory=dict
+    )
+    branch_hit_counts: dict[str, int] = dataclass_field(default_factory=dict)  # 各分支报告的命中总数，{分支名: 数量}，不等于实际取回数量
+    branch_weights: dict[str, float] = dataclass_field(default_factory=dict)  # 第一阶段融合的实际分支权重，已包含空分支权重重分配
+
+
 class Dealer:
     def __init__(self, dataStore: DocStoreConnection):
         self.qryr = query.FulltextQueryer()
@@ -117,31 +134,18 @@ class Dealer:
 
     @dataclass
     class SearchResult:
-        total: int
-        ids: list[str]
-        query_vector: list[float] | None = None
-        field: dict | None = None
-        highlight: dict | None = None
-        aggregation: list | dict | None = None
-        keywords: list[str] | None = None
-        group_docs: list[list] | None = None
-        rrf_scores: dict[str, float] = dataclass_field(default_factory=dict)
-        retrieval_ranks: dict[str, dict[str, int]] = dataclass_field(
+        """保存按候选身份截取后的行级召回结果，重排后才构建表格对象。"""
+        total: int  # 候选总数；混合检索为融合去重后的数量，普通搜索为底层命中总数
+        candidate_ids: list[str]  # 按召回顺序排列的原始 chunk ID（混合检索为 RRF 顺序）；同表行只在计数时合并
+        candidate_fields: dict | None = None  # 候选原始字段，{chunk_id: 字段字典}，包含正文、文档名等
+        table_candidates: dict[str, TableCandidate] = dataclass_field(default_factory=dict)
+        highlights: dict | None = None  # 高亮结果，{chunk_id: 高亮文本}
+        recall_fusion_scores: dict[str, float] = dataclass_field(default_factory=dict)  # 第一阶段 RRF 融合分数，{chunk_id: 分数}
+        diagnostics: SearchDiagnostics = dataclass_field(default_factory=SearchDiagnostics)
+        constraint_compatibility: dict[str, dict] = dataclass_field(  # 候选与查询条件的兼容检查结果，{chunk_id: 检查结果}，冲突数量影响排序
             default_factory=dict
         )
-        retrieval_scores: dict[str, dict[str, float]] = dataclass_field(
-            default_factory=dict
-        )
-        rrf_contributions: dict[str, dict[str, float]] = dataclass_field(
-            default_factory=dict
-        )
-        branch_totals: dict[str, int] = dataclass_field(default_factory=dict)
-        branch_weights: dict[str, float] = dataclass_field(default_factory=dict)
-        fused_candidate_count: int = 0
-        constraint_compatibility: dict[str, dict] = dataclass_field(
-            default_factory=dict
-        )
-        final_ranking: dict[str, dict] = dataclass_field(default_factory=dict)
+        final_fusion_scores: dict[str, float] = dataclass_field(default_factory=dict)  # 第二阶段 RRF 融合分数，{chunk_id: 分数}
 
     @dataclass
     class SearchContext:
@@ -160,8 +164,6 @@ class Dealer:
 
         response: object
         total: int
-        query_vector: list[float] = dataclass_field(default_factory=list)
-        keywords: set[str] = dataclass_field(default_factory=set)
 
     @dataclass
     class SearchBranchResult:
@@ -171,14 +173,13 @@ class Dealer:
         ids: list[str]
         fields: dict[str, dict]
         scores: dict[str, float]
-        keywords: set[str] = dataclass_field(default_factory=set)
         highlight: dict[str, str] = dataclass_field(default_factory=dict)
 
     @dataclass
     class RetrievalOptions:
         page: int = 1  # 搜索结果页码，默认获取搜索结果的第一页
         page_size: int = 5  # 表示每页最多5个chunk, 综合起来就是返回最相关的5个chunk
-        similarity_threshold: float = 0.1  # 最低相似度要求
+        similarity_threshold: float = 0.1  # 向量召回阈值；最终 Top K 不按语义分数过滤
         # 原问题向量分支在加权 RRF 中的权重。
         vector_similarity_weight: float = 0.3
         top: int = 1024  # 初步向量检索的最大候选数
@@ -196,7 +197,7 @@ class Dealer:
             default_factory=lambda: {PAGERANK_FLD: 10}
         )
         kb_ids: list[str] | None = None
-        company_constraint: CompanyConstraint | None = None
+        company_hints: CompanyHints | None = None
 
         def __post_init__(self):
             positive_fields = {
@@ -251,12 +252,7 @@ class Dealer:
             #如果请求中包含这些字段，并且不为None，则将其添加到过滤条件中
             if key in req and req[key] is not None:
                 condition[key] = req[key]
-        # 公司限制在两路召回之前生成；关键词放宽时也不会删除它。
-        scope = req.get("company_constraint")
-        if scope is None:
-            scope = resolve_company_constraint(req.get("question", ""))
-        if scope.enabled:
-            condition[COMPANY_FILTER_KEY] = list(scope.entity_ids)
+        # 公司线索仅参与相关性排序；关键词、向量及放宽召回均不按归属标签过滤。
         return condition
 
     def _build_search_context(self, req):
@@ -418,9 +414,9 @@ class Dealer:
             except (TypeError, ValueError):
                 scores[chunk_id] = 0.0
 
-        expanded_keywords = self._expand_keywords(keywords or [])
         highlights = {}
         if highlight:
+            expanded_keywords = self._expand_keywords(keywords or [])
             highlights = self.dataStore.getHighlight(
                 response,
                 list(expanded_keywords),
@@ -433,7 +429,6 @@ class Dealer:
             ids=ids,
             fields=fields,
             scores=scores,
-            keywords=expanded_keywords,
             highlight=highlights,
         )
 
@@ -507,18 +502,18 @@ class Dealer:
         branch = self._format_branch_response(
             name="vector_original",
             response=response,
-            source_fields=[*context.source_fields, EMBEDDING_VECTOR_FIELD],
+            source_fields=context.source_fields,
         )
-        return branch, list(match_dense.embedding_data)
+        return branch
 
     def _merge_search_branches(
         self,
         branches,
         branch_weights,
         *,
-        query_vector,
         rrf_k,
         rerank_candidate_size,
+        question="",
     ):
         rankings = {branch.name: branch.ids for branch in branches}
         fusion = reciprocal_rank_fusion(
@@ -527,17 +522,15 @@ class Dealer:
             k=rrf_k,
         )
         fused_candidate_count = len(fusion.ids)
-        selected_ids = fusion.ids[:rerank_candidate_size]
-        # 将列表转换成集合
+        selected_ids = fusion.ids  # 先保留完整融合池，按表格身份计数截取行级重排前缀。
+        # 将列表转换成集合2
         selected_id_set = set(selected_ids)
 
         fields = {}
         highlights = {}
-        keywords = set()
         retrieval_scores = defaultdict(dict)
 
         for branch in branches:
-            keywords.update(branch.keywords)
             # branch.fields表示文档的原始字段
             for chunk_id, source in branch.fields.items():
                 if chunk_id not in selected_id_set:
@@ -557,33 +550,29 @@ class Dealer:
         selected_ids = [
             chunk_id for chunk_id in selected_ids if chunk_id in fields
         ]
+        selected_ids = select_candidate_ids(selected_ids, fields, limit=rerank_candidate_size)
+        fields = {chunk_id: fields[chunk_id] for chunk_id in selected_ids}
         return self.SearchResult(
             total=fused_candidate_count,
-            ids=selected_ids,
-            query_vector=query_vector,
-            field=fields,
-            highlight=highlights,
-            aggregation=[],
-            keywords=sorted(keywords),
-            rrf_scores={
+            candidate_ids=selected_ids,
+            candidate_fields=fields,
+            highlights=highlights,
+            recall_fusion_scores={
                 chunk_id: fusion.scores[chunk_id]
                 for chunk_id in selected_ids
             },
-            retrieval_ranks={
-                chunk_id: fusion.ranks[chunk_id]
-                for chunk_id in selected_ids
-            },
-            retrieval_scores={
-                chunk_id: dict(retrieval_scores.get(chunk_id, {}))
-                for chunk_id in selected_ids
-            },
-            rrf_contributions={
-                chunk_id: fusion.contributions[chunk_id]
-                for chunk_id in selected_ids
-            },
-            branch_totals={branch.name: branch.total for branch in branches},
-            branch_weights=dict(branch_weights),
-            fused_candidate_count=fused_candidate_count,
+            diagnostics=SearchDiagnostics(
+                branch_ranks={
+                    chunk_id: fusion.ranks[chunk_id]
+                    for chunk_id in selected_ids
+                },
+                branch_scores={
+                    chunk_id: dict(retrieval_scores.get(chunk_id, {}))
+                    for chunk_id in selected_ids
+                },
+                branch_hit_counts={branch.name: branch.total for branch in branches},
+                branch_weights=dict(branch_weights),
+            ),
         )
 
     def _search_with_question(
@@ -632,9 +621,8 @@ class Dealer:
             )
 
         # 原始问题向量检索
-        query_vector = []
         if "vector_original" in branch_weights:
-            vector_branch, query_vector = self._search_vector_branch(
+            vector_branch = self._search_vector_branch(
                 question=question,
                 context=context,
                 idx_names=idx_names,
@@ -652,7 +640,7 @@ class Dealer:
         return self._merge_search_branches(
             branches,
             branch_weights,
-            query_vector=query_vector,
+            question=question,
             rrf_k=int(req.get("rrf_k", 60)),
             rerank_candidate_size=int(
                 req.get("rerank_candidate_size", 20)
@@ -661,19 +649,13 @@ class Dealer:
 
     def _format_search_result(self, execution, source_fields):
         """把 Elasticsearch 原始响应包装成统一的 SearchResult。"""
-        keywords = list(execution.keywords)
         response = execution.response
         return self.SearchResult(
             total=execution.total,
-            ids=self.dataStore.getChunkIds(response),
-            query_vector=execution.query_vector,
-            aggregation=self.dataStore.getAggregation(response, "docnm_kwd"),
-            highlight=self.dataStore.getHighlight(
-                response, keywords, "content_with_weight",
-            ),
-            #field是一个字典，键是chunk_id，值是该chunk的所有字段及其值
-            field=self.dataStore.getFields(response, source_fields),
-            keywords=keywords,
+            candidate_ids=self.dataStore.getChunkIds(response),
+            highlights={},
+            # candidate_fields 按候选编号保存原始记录，包含正文、文档名等字段。
+            candidate_fields=self.dataStore.getFields(response, source_fields),
         )
 
     def search(self, req, idx_names: str | list[str],
@@ -708,17 +690,17 @@ class Dealer:
         # 处理排名特征 tag_fea 的得分。
         rank_fea = []
         pageranks = []
-        for chunk_id in search_res.ids:
-            pageranks.append(search_res.field[chunk_id].get(PAGERANK_FLD, 0))
+        for chunk_id in search_res.candidate_ids:
+            pageranks.append(search_res.candidate_fields[chunk_id].get(PAGERANK_FLD, 0))
         pageranks = np.array(pageranks, dtype=float)
 
         if not query_rfea:
-            return np.array([0 for _ in range(len(search_res.ids))]) + pageranks
+            return np.array([0 for _ in range(len(search_res.candidate_ids))]) + pageranks
 
         q_denor = np.sqrt(np.sum([s*s for t,s in query_rfea.items() if t != PAGERANK_FLD]))
-        for i in search_res.ids:
+        for i in search_res.candidate_ids:
             nor, denor = 0, 0
-            for t, sc in eval(search_res.field[i].get(TAG_FLD, "{}")).items():
+            for t, sc in eval(search_res.candidate_fields[i].get(TAG_FLD, "{}")).items():
                 if t in query_rfea:
                     nor += query_rfea[t] * sc
                 denor += sc * sc
@@ -731,9 +713,9 @@ class Dealer:
     def rerank_by_model(self, search_result, query):
         """只使用用户原始问题，对排名融合后的候选进行语义重排。"""
         documents = []
-        for chunk_id in search_result.ids:
-            source = search_result.field[chunk_id]
-            documents.append(str(ranking_text(source)))
+        for chunk_id in search_result.candidate_ids:
+            source = search_result.candidate_fields[chunk_id]
+            documents.append(rerank_text(source))
 
         semantic_scores, _ = rerank_similarity(query, documents)
         return np.asarray(semantic_scores, dtype=float)
@@ -754,7 +736,7 @@ class Dealer:
         request = {
             "question": question,
             "keyword_question": keyword_question or question,
-            "company_constraint": options.company_constraint or resolve_company_constraint(question),
+            "company_hints": options.company_hints or resolve_company_hints(question),
             "kb_ids": options.kb_ids,
             "doc_ids": options.doc_ids,
             # 每一路先独立召回候选，再由 RRF 截断后进入语义重排。
@@ -799,114 +781,101 @@ class Dealer:
         options: RetrievalOptions,
     ):
         """融合语义排名与检索排名，并降低硬约束冲突候选的优先级。"""
-        if not search_result.ids:
+        if not search_result.candidate_ids:
             return [], np.array([], dtype=float)
 
         if question:
             semantic_scores = self.rerank_by_model(search_result, question)
         else:
-            semantic_scores = np.ones(len(search_result.ids), dtype=float)
+            semantic_scores = np.ones(len(search_result.candidate_ids), dtype=float)
 
         compatibility_by_id = {}
-        for chunk_id in search_result.ids:
-            source = search_result.field[chunk_id]
+        company_hints = options.company_hints
+        entity_names = (
+            company_hints.entity_names
+            if company_hints is not None and company_hints.source == "model_understanding"
+            else None
+        )
+        for chunk_id in search_result.candidate_ids:
+            source = search_result.candidate_fields[chunk_id]
             content = ranking_text(source)
             # 计算约束兼容性
             decision = evaluate_constraint_compatibility(
                 question,
                 str(content),
                 document_name=str(source.get("docnm_kwd", "")),
+                entity_names=entity_names,
             )
             compatibility_by_id[chunk_id] = decision.to_dict()
         search_result.constraint_compatibility = compatibility_by_id
 
+        # 语义排名
         semantic_order = sorted(
-            range(len(search_result.ids)),
+            range(len(search_result.candidate_ids)), # candidate_ids的索引
             key=lambda index: (
                 -float(semantic_scores[index]),
                 -float(
-                    search_result.rrf_scores.get(
-                        search_result.ids[index],
+                    search_result.recall_fusion_scores.get(
+                        search_result.candidate_ids[index],
                         0.0,
                     )
                 ),
-                search_result.ids[index],
+                search_result.candidate_ids[index],
             ),
         )
-        semantic_ids = [search_result.ids[index] for index in semantic_order]
-        semantic_rank_by_id = {
-            chunk_id: rank
-            for rank, chunk_id in enumerate(semantic_ids, start=1)
-        }
-        retrieval_rrf_ids = sorted(
-            search_result.ids,
-            key=lambda chunk_id: (
-                -float(search_result.rrf_scores.get(chunk_id, 0.0)),
-                chunk_id,
-            ),
-        )
-        retrieval_rrf_rank_by_id = {
-            chunk_id: rank
-            for rank, chunk_id in enumerate(retrieval_rrf_ids, start=1)
-        }
+        semantic_ids = [search_result.candidate_ids[index] for index in semantic_order]
         reranker_weight = float(options.final_reranker_weight)
         final_weights = {
             "semantic_reranker": reranker_weight,
             "retrieval_rrf": 1.0 - reranker_weight,
         }
+
         # 这里使用了二阶段融合的方式，将语义重排的结果和第一阶段 RRF 的结果进行融合，得到最终的排序结果。
         final_fusion = reciprocal_rank_fusion(
             {
-                "semantic_reranker": semantic_ids,
-                "retrieval_rrf": retrieval_rrf_ids,
+                "semantic_reranker": semantic_ids, #重排名次
+                # candidate_ids 保留第一阶段召回顺序，包括 RRF 同分规则。
+                "retrieval_rrf": search_result.candidate_ids,
             },
             final_weights,
             k=options.final_rrf_k,
         )
-        final_ranking = {}
-        for chunk_id in search_result.ids:
-            final_ranking[chunk_id] = {
-                "semantic_reranker_rank": semantic_rank_by_id[chunk_id],
-                "retrieval_rrf_rank": retrieval_rrf_rank_by_id[chunk_id],
-                "final_fusion_score": final_fusion.scores[chunk_id],
-                "final_fusion_contributions": (
-                    final_fusion.contributions.get(chunk_id, {})
-                ),
-            }
-        search_result.final_ranking = final_ranking
+        search_result.final_fusion_scores = final_fusion.scores # {"chunk-A": 0.089}
 
         # 明确冲突优先降级；其余候选由重排名次与第一阶段 RRF 名次共同决定。
         ordered_indexes = sorted(
-            range(len(search_result.ids)),
+            range(len(search_result.candidate_ids)),
             key=lambda index: (
                 int(
                     compatibility_by_id[
-                        search_result.ids[index]
+                        search_result.candidate_ids[index]
                     ]["conflict_count"]
                 ),
                 -float(
-                    final_ranking[
-                        search_result.ids[index]
-                    ]["final_fusion_score"]
+                    search_result.final_fusion_scores[
+                        search_result.candidate_ids[index]
+                    ]
                 ),
                 -float(semantic_scores[index]),
                 -float(
-                    search_result.rrf_scores.get(
-                        search_result.ids[index],
+                    search_result.recall_fusion_scores.get(
+                        search_result.candidate_ids[index],
                         0.0,
                     )
                 ),
-                search_result.ids[index],
+                search_result.candidate_ids[index],
             ),
         )
-        ordered_indexes = [
-            index
-            for index in ordered_indexes
-            if semantic_scores[index] >= options.similarity_threshold
-        ]
-        start = (options.page - 1) * options.page_size
-        end = options.page * options.page_size
-        return ordered_indexes[start:end], semantic_scores
+
+        # 按topK截取最终结果
+        selected_ids = select_candidate_ids(
+            [search_result.candidate_ids[index] for index in ordered_indexes],
+            search_result.candidate_fields,
+            limit=options.page_size,
+            offset=(options.page - 1) * options.page_size,
+        )
+        index_by_id = {chunk_id: index for index, chunk_id in enumerate(search_result.candidate_ids)}
+        return [index_by_id[chunk_id] for chunk_id in selected_ids], semantic_scores
 
     @staticmethod
     def _build_chunk(
@@ -916,11 +885,8 @@ class Dealer:
         rrf_score,
         retrieval_ranks,
         retrieval_scores,
-        rrf_contributions,
         constraint_compatibility,
         final_ranking,
-        vector_column,
-        zero_vector,
     ):
         """把一个底层搜索结果转换成对外返回的文本片段。"""
         keyword_scores = [
@@ -929,7 +895,7 @@ class Dealer:
             if branch.startswith("keyword_")
         ]
         return {
-            "chunk_id": chunk_id,
+            "chunk_id": (source.get("table_candidate_obj") or {}).get("candidate_id") or chunk_id,
             **evidence_metadata(source),
             "content_ltks": source["content_ltks"],
             "content_with_weight": source["content_with_weight"],
@@ -948,10 +914,8 @@ class Dealer:
             "term_similarity": max(keyword_scores, default=0.0),
             "retrieval_ranks": retrieval_ranks,
             "retrieval_scores": retrieval_scores,
-            "rrf_contributions": rrf_contributions,
             "constraint_compatibility": constraint_compatibility,
             "final_ranking": final_ranking,
-            "vector": source.get(vector_column, zero_vector),
             "positions": source.get("position_int", []),
         }
 
@@ -988,46 +952,49 @@ class Dealer:
         ranked_results,
         options: RetrievalOptions,
     ):
-        """过滤并组装最终的检索结果。"""
+        """将最终入选行合表，组装检索结果。"""
+        # rerank_scores 按下标与search_result.candidate_ids一一对应，indexes是重排后的下标且已经完成了截取
         indexes, rerank_scores = ranked_results
-        query_vector = search_result.query_vector or []
-        zero_vector = [0.0] * len(query_vector)
+        scores_by_id = {
+            chunk_id: float(rerank_scores[index])
+            for index, chunk_id in enumerate(search_result.candidate_ids)
+        }
+        grouped = group_table_candidates(
+            [search_result.candidate_ids[index] for index in indexes], # 得到最终重排后的顺序
+            search_result.candidate_fields,
+            rerank_scores=scores_by_id,
+        )
+        search_result.table_candidates = grouped.tables
         chunks = []
-
-        for result_index in indexes:
-            # 兼容性排序后语义分不再严格单调，低分项不能阻断后续结果。
-            if rerank_scores[result_index] < options.similarity_threshold:
-                continue
-            if len(chunks) >= options.page_size:
-                break
-
-            chunk_id = search_result.ids[result_index]
-            source = search_result.field[chunk_id]
+        for chunk_id in grouped.ids:
+            source = search_result.candidate_fields[chunk_id]
+            candidate = search_result.table_candidates.get(chunk_id)
+            if candidate is not None:
+                source = candidate_record(candidate)
+            # Dealer 对外兼容记录仅在此生成，重排期间不改写索引字段。
             #组装chunk字典
             chunk = self._build_chunk(
                 chunk_id,
                 source,
-                float(rerank_scores[result_index]),
-                float(search_result.rrf_scores.get(chunk_id, 0.0)),
-                dict(search_result.retrieval_ranks.get(chunk_id, {})),
-                dict(search_result.retrieval_scores.get(chunk_id, {})),
-                dict(search_result.rrf_contributions.get(chunk_id, {})),
+                scores_by_id[chunk_id],
+                float(search_result.recall_fusion_scores.get(chunk_id, 0.0)),
+                dict(search_result.diagnostics.branch_ranks.get(chunk_id, {})),
+                dict(search_result.diagnostics.branch_scores.get(chunk_id, {})),
                 dict(
                     search_result.constraint_compatibility.get(
                         chunk_id,
                         {},
                     )
-                ),
-                dict(search_result.final_ranking.get(chunk_id, {})),
-                EMBEDDING_VECTOR_FIELD,
-                zero_vector,
+                ), # 最终输出字典里的 chunk_id 会换成表格的 candidate_id
+                ({"final_fusion_score": search_result.final_fusion_scores[chunk_id]}
+                 if chunk_id in search_result.final_fusion_scores else {}),
             )
 
             # 开了高亮且有高亮片段时，把高亮文本挂到chunk上
-            if options.highlight and search_result.highlight:
+            if options.highlight and search_result.highlights:
                 #rmSpace函数用于去掉高亮内容中的多余空格
                 chunk["highlight"] = rmSpace(
-                    search_result.highlight.get(
+                    search_result.highlights.get(
                         chunk_id,
                         chunk["content_with_weight"],
                     )
@@ -1041,16 +1008,20 @@ class Dealer:
         return {
             "total": search_result.total,
             "chunks": chunks,
+            "table_candidates": {candidate.candidate_id: candidate
+                                 for candidate in search_result.table_candidates.values()
+                                 if any(chunk["chunk_id"] == candidate.candidate_id for chunk in chunks)},
             "doc_aggs": document_aggregations,
             "retrieval_fusion": {
                 "method": "weighted_rrf",
                 "rrf_k": options.rrf_k,
-                "branch_weights": search_result.branch_weights,
-                "branch_totals": search_result.branch_totals,
+                "branch_weights": search_result.diagnostics.branch_weights,
+                "branch_totals": search_result.diagnostics.branch_hit_counts,
                 "fused_candidate_count": (
-                    search_result.fused_candidate_count
+                    # 普通搜索的 total 是底层命中数，不是融合候选数。
+                    search_result.total if search_result.diagnostics.branch_hit_counts else 0
                 ),
-                "rerank_candidate_count": len(search_result.ids),
+                "rerank_candidate_count": len(search_result.candidate_ids),
                 "rerank_query": "original_question",
                 "final_fusion": {
                     "method": "weighted_rrf",
@@ -1113,9 +1084,9 @@ class Dealer:
             "initial_retrieval": round(initial_retrieval_ms, 3),
             "rerank": round(rerank_ms, 3),
         }
-        scope = request.get("company_constraint")
+        scope = request.get("company_hints")
         if scope is not None:
-            result["company_constraint"] = scope.to_dict()
+            result["company_hints"] = scope.to_dict()
         return result
 
     def sql_retrieval(self, sql, fetch_size=128, format="json"):

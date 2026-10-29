@@ -1,4 +1,4 @@
-"""文档解析入库入口：组织切片、实体标注、证据保存、向量生成和索引写入。"""
+"""文档解析入库入口：组织切片、原始证据保存、向量生成和索引写入。"""
 
 import datetime
 import hashlib
@@ -11,12 +11,8 @@ import xxhash
 from service.core.rag.app.naive import chunk
 from service.core.rag.nlp.model import EMBEDDING_VECTOR_FIELD, generate_embedding
 from service.core.rag.utils.es_conn import ESConnection
-from service.core.evidence.metadata import evidence_metadata
+from service.core.evidence.metadata import index_evidence_metadata
 from domain.tables import TABLE_PARSER_VERSION
-from service.core.entities.attribution import (
-    annotate_chunk, annotate_document, annotate_table_object, get_entity_registry,
-)
-
 from service.core.persistence.evidence_store import save_evidence_image, save_table_object
 
 PARSER_VERSION = TABLE_PARSER_VERSION
@@ -67,9 +63,8 @@ def process_items(
         处理后的数据项列表。
     """
 
-    # 获取实体注册表并对文档进行注释
-    registry = get_entity_registry()
-    document_annotation = annotate_document(items, file_name, registry)
+    # 入库只保存原文与结构，不从文件名或公司提及推断数据归属。
+    # 同行、母子公司或省略主语的关系交给后续统一证据核验判断。
     # 准备批量处理的数据
     texts = [
         item.get("table_semantic_text_with_weight")
@@ -93,10 +88,8 @@ def process_items(
                     or item["content_with_weight"]]
         chunck_id = hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode()).hexdigest()
 
-        # annotate_chunk表示给每个chunk进行实体标注
         d = {
-            **evidence_metadata(item),
-            **annotate_chunk(item, document_annotation, registry),
+            **index_evidence_metadata(item),
             "parser_version_kwd": PARSER_VERSION,
             "id": chunck_id,
             "content_ltks": item["content_ltks"],
@@ -135,7 +128,6 @@ def process_items(
                     doc_id,
                     file_name,
                     image_ref,
-                    annotate_table_object(table_object, document_annotation, registry),
                 )
             d["table_object_ref_kwd"] = table_object_refs[table_id]
 

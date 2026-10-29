@@ -85,6 +85,14 @@ def get_table_html(img, tb_cpns, ocr):
     clmns = LayoutRecognizer.layouts_cleanup(boxes, clmns, 5, 0.5)
 
     for b in boxes:
+        b["table_structure"] = [
+            {"label": region["label"], "score": float(region["score"]),
+             "page_number": 1, "coordinate_space": "image",
+             "bbox": [float(region["x0"]), float(region["top"]),
+                      float(region["x1"]), float(region["bottom"])]}
+            for region in [*headers, *spans]
+            if LayoutRecognizer.find_overlapped_with_threashold(b, [region], thr=0.3) is not None
+        ]
         ii = LayoutRecognizer.find_overlapped_with_threashold(b, rows, thr=0.3)
         if ii is not None:
             b["R"] = ii
@@ -107,10 +115,10 @@ def get_table_html(img, tb_cpns, ocr):
 
         ii = LayoutRecognizer.find_overlapped_with_threashold(b, spans, thr=0.3)
         if ii is not None:
-            b["H_top"] = spans[ii]["top"]
-            b["H_bott"] = spans[ii]["bottom"]
-            b["H_left"] = spans[ii]["x0"]
-            b["H_right"] = spans[ii]["x1"]
+            b["SP_top"] = spans[ii]["top"]
+            b["SP_bott"] = spans[ii]["bottom"]
+            b["SP_left"] = spans[ii]["x0"]
+            b["SP_right"] = spans[ii]["x1"]
             b["SP"] = ii
 
     html = """

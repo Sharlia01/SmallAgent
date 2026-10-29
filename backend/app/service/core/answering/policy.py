@@ -38,6 +38,16 @@ def render_refusal(missing_requirements: Any = None) -> str:
 
 
 def render_evidence_refusal(decision: dict[str, Any]) -> str:
+    if decision.get("failure_kind") == "input_limit":
+        return "本次输入超过证据核验容量，尚未完成全部材料核验。请缩小问题范围后重试。"
+    messages = {
+        "invalid_plan": "本次查询计划未能通过结构或关键约束校验，请调整问题后重试。",
+        "unsupported_capability": "已尝试检索，但当前无法可靠执行所需的计算或口径核验，暂不能提供确定性结果。",
+        "calculation_error": "计算执行或校验未通过，暂不能提供可靠的数值结果。",
+        "execution_error": "本次模型服务或工具执行未能完成，请稍后重试。",
+    }
+    if decision.get("outcome") in messages:
+        return messages[decision["outcome"]]
     if decision.get("verification_status") == "unavailable":
         return "本次未能完成证据核验，请稍后重试。"
     return render_refusal(decision.get("missing_requirements"))

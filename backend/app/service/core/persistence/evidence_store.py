@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from domain.tables import TABLE_PARSER_VERSION
+from service.core.evidence.metadata import without_entity_annotations
 from service.core.resources.paths import get_project_base_directory
 
 PARSER_VERSION = TABLE_PARSER_VERSION
@@ -39,17 +40,14 @@ def save_table_object(
     doc_id: str,
     file_name: str,
     image_ref: str | None,
-    entity_annotation: dict[str, Any] | None = None,
 ) -> str:
     """将按内容寻址的父表对象保存到片段索引之外。"""
     table_id = str(table_object.get("table_id") or "")
     if not re.fullmatch(r"[0-9a-f]{64}", table_id):
         raise ValueError("Table object requires a SHA-256 table_id")
 
-    payload = json.loads(json.dumps(table_object, ensure_ascii=False))
-    if entity_annotation is not None:
-        # 将实体标注信息添加到payload中
-        payload["entity_attribution"] = entity_annotation
+    # 父表保留原始表头、单元格和出处，不再保存规则推断的公司归属。
+    payload = without_entity_annotations(json.loads(json.dumps(table_object, ensure_ascii=False)))
     provenance = payload.setdefault("provenance", {})
     provenance.update({
         "doc_id": doc_id,

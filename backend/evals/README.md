@@ -352,6 +352,14 @@ Hit、Recall、MRR、空结果率、旧拒答率和旧 fallback 率。新结果�
 
 ## 端到端 RAG 评估
 
+评测分为两个阶段：先完成所有题目的 Agent 问答，再统一执行忠实性、引用支持度和
+答案质量评分。问答中的证据充分性核验仍正常执行；评分使用 `--judge-model` 配置。
+每完成一道题，答案、证据及执行结果即写入 `<run-name>_answers.jsonl`，其中评分状态
+为 `pending`（执行异常的题为 `skipped`）。该文件保留未评分快照，不被后续评分覆盖。
+全部评分结束后生成原有 JSONL、汇总和 HTML 报告；最终记录的 `scoring_status` 区分
+`completed`、`failed` 和 `skipped`，评分异常不会覆盖原问答结果。`--no-judge` 仍不调用
+评分模型。`--fail-fast` 遇到抛出的异常仍提前停止，此前完成的问答快照保留。
+
 `run_e2e_eval.py` 在不读写聊天数据库、Redis、会话标题和推荐问题的情况下，执行与
 线上相同的知识库检索、证据充分性检查、回答提示词和流式模型响应。该 runner 固定为
 `knowledge_base_only`，不会让 Web 搜索补答知识库不可回答题。统一通过真实 Agent 和 KB 工具执行，支持 `--planner-model`。已移除 `--execution-mode` 参数，旧命令需删去该选项及其值；报告中的 `execution_mode` 固定记录为 `agent`。Web/KB 混合工具路由仍需独立数据集评估。
@@ -455,6 +463,62 @@ python evals/html_report.py evals/results/agent_test_smoke_20261008.jsonl
 默认读取同名 `_summary.json`，输出同名 `.html`。已有 HTML 需显式添加 `--overwrite` 才会替换。
 
 
+### 评测终端日志与轮转
+
+通过命令行启动 `run_e2e_eval.py` 或 `run_retrieval_eval.py` 时，自动将完整的
+stdout/stderr 双写到终端和固定文件 `backend/logs/evaluation.log`。无需新增参数，
+不受 `--run-name`、`--output-dir` 或 `--overwrite` 影响；目录自动创建，后续运行追加。
+Docker 中路径为 `/app/logs/evaluation.log`，Compose 已配置 `./logs:/app/logs` 挂载。
+已有容器需要按更新后的 Compose 配置重新创建，挂载才会生效。
+
+使用标准库 `RotatingFileHandler` 的备份管理机制，按实际字节数限制文件大小：
+
+- 每个文件最大 `50 * 1024 * 1024` 字节（50 MiB）；文件已满后，下一次写入先轮转。
+- 保留 `evaluation.log.1`、`.2`、`.3`，其中 `.1` 最新；下一次轮转自动删除最旧备份。
+- 超长单次输出会分段写入，四个日志文件总计最多约 200 MiB。
+- `evaluation.log.lock` 是用于跨进程协调的小型锁文件，不是日志备份；运行时不要删除。
+
+每次运行有唯一 Run ID，文件中的 START/END 分隔行记录入口、命令参数、UTC 时间、
+耗时和退出状态。`SUCCESS` 表示脚本退出码为 0，`FAILED` 表示非零退出或启动异常；
+这不是评测分数，Agent 内部转为拒答的故障仍按原有评测逻辑处理。评测异常堆栈会
+随 stderr 保存；逐题异常即使没有开启 `--fail-fast` 也会打印完整堆栈。
+轮转可能把一次运行分散到不同备份，排查时应搜索当前文件及所有备份中的 Run ID。
+
+端到端评测还按样本记录各阶段的 `status=start/completed/error` 和耗时，格式为
+`EVAL sample_id=dev-gd-002 stage=citation_support status=start`。
+阶段包括 `agent_answer`（含回答流读取）、`retrieval_metrics`、`faithfulness`、
+`citation_support` 和 `answer_quality`。`completed` 表示阶段函数已返回；评分是否可用仍以
+结果中的 `judge_source`、`judge_error` 为准，不能把单条 HTTP 200 日志当作整题完成。
+
+回答流遇到结束事件、读取异常或前端中途断开时会显式关闭响应，归还连接；只关闭响应流，
+不关闭后续评分仍需复用的客户端。避免把未读完的响应推迟到垃圾回收，在下一次请求持有
+连接池锁时清理旧流而发生重入死锁。已经卡死的旧评测进程不会因文件更新自动恢复，需要
+停止旧进程后重新启动评测，无需重新上传文件或重建索引。
+
+实现采用一个轻量父进程监督原评测脚本，在应用依赖导入之前建立捕获。父进程通过
+管道实时转发两个输出流，不修改现有 `print()`、应用 logger 或全局输出流，不注册
+额外的应用 logging handler。因此独立 handler、模块导入日志、`os.write`、二进制
+stdout 和继承这些输出流的子进程也会被记录。子进程使用 Python 无缓冲输出。
+文件写入和轮转使用线程锁及 POSIX 文件锁；多个独立评测不会竞争重命名备份。
+同时运行的评测内容仍可能交错，若需仅凭开始/结束边界区分完整内容，应串行运行。
+
+覆盖范围与限制：
+
+- 支持当前 Linux/Docker、macOS 环境；不支持原生 Windows（使用 `fcntl`）。
+- 命令行运行自动捕获；仅导入模块或直接调用其 `main()` 不会重定向宿主程序输出。
+- stdout/stderr 各自的字节顺序保留，跨两个流无法保证严格的时间先后顺序。
+- 直接写其他文件、独立终端、浏览器控制台或远端服务的内容不在捕获范围内。
+- Ctrl+C/SIGTERM 会转发给评测进程，已输出内容会排空并记录 FAILED；SIGKILL、断电
+  或存储故障无法保证 END 标记及尚在管道中的数据保存。
+- 原始字节原样保存，轮转边界可能切开一条长日志或 UTF-8 字符；需要时按旧到新拼接
+  备份再读取。进程内部被吞掉且没有打印的异常细节，不会由输出捕获自动补全。
+
+日志测试不需要数据库或模型调用：
+
+```bash
+python3 -m unittest discover -s backend/evals -p 'test_evaluation_logging.py' -v
+```
+
 ### 查询规划与 Agent 回归
 
 先用 `python /app/evals/run_e2e_eval.py --validate-only` 检查端到端样本结构，不需要索引或真实模型调用。
@@ -465,16 +529,17 @@ docker compose exec LS_api python /app/evals/run_e2e_eval.py \
   --index-name <用户ID> --split dev --run-name agent_dev_v3
 ```
 
-逐题 `agent_execution` 记录任务、工具查询、依赖绑定和停止原因。`query_metrics` 保留历史规划字段供旧记录读取；新 Agent 不再生成旧 RAG 的路由与补查报告，缺失字段不能当成成功率。请求 runtime 记录规划、证据核验、桥接及工具搜索预算；最终回答流和 judge 成本另行统计。样本数、失败率和各切片应与成本、P95/P99 一起审阅。
+逐题 `agent_execution` 记录任务、工具查询、依赖绑定和停止原因。`query_metrics` 保留历史规划字段供旧记录读取；新 Agent 不再生成旧 RAG 的路由与补查报告，缺失字段不能当成成功率。补查统计优先读取 `agent_execution`：`steps > 1` 表示实际执行过补查（初始执行不计入），只生成计划但未执行不算；补查后 `stop_reason == evidence_ready` 计为补齐证据成功，与最终回答或 judge 是否成功无关。`repair_count` 按样本计数而非轮数，`repair_success_rate` 的分母为执行过补查的样本数；`repair_unavailable_count` 及分组内的 `unavailable_count` 标记缺失执行数据的样本。没有 Agent 执行记录时兼容旧 `query_repair`。请求 runtime 记录规划、证据核验、桥接及工具搜索预算；最终回答流和 judge 成本另行统计。样本数、失败率和各切片应与成本、P95/P99 一起审阅。
 
-### 结构化财务需求回归
+### 统一证据核验回归
 
-首次 Agent 理解响应包含 `financial`，其中事实、计算、未解决要求均关联目标和原文。端到端逐题检索诊断保留 `query_understanding.financial`（固定需求）、`financial_requirements`（当前绑定结果）和 `financial_bindings`（绑定来源）。纯检索不生成这些对象。
+规划只输出通用目标、限定条件、实体和工具任务，不再生成 `financial`。每轮检索后对累计原文进行一次模型核验；
+补查新证据时重新核验，同版本报告直接复用，网络故障仍受有限重试与请求预算约束。
 
-重点检查公司与期间的对应、实际/预测口径、未知指标是否遗漏、计算基期与操作数方向、补查变量绑定以及缓存版本。财务证据单元测试使用固定需求夹具，理解协议由独立测试覆盖，避免在核验测试中继续调用已删除的问句解析器。
+数值问题检查输入、公司、期间、单位、口径和计算关系是否明确，最终回答模型直接计算，不要求资料列出最终结果。
+测试覆盖原文及带数字原因保留、未知指标、表格、计算输入不足后的补查、核验故障停止、引用和缓存隔离。
+`test_unified_evidence.py` 使用固定模型响应，不联网；这些测试不代表实际模型语义和计算准确率。
 
-### 财务关系核验回归
-
-`financial_fact_bundle` 新增 `requirement_results`、`relationship_results`、`verification_status` 和诊断信息。测试应分别统计支持、缺失、歧义、冲突、能力限制与核验失败，不能把服务故障统计为无答案。对有标注的真实样本另行衡量误放行率与误拒绝率；模拟模型响应的单元测试不代表实际模型准确率。
-
-覆盖跨句主体/期间、表头与原始坐标、脚注口径、近似值、伪造引文、数字截取、规则与模型配对分歧、不同需求缓存隔离、补查新增来源、模型超时和预算耗尽。`test_financial_relationships.py` 使用固定候选与判断响应，不联网。完整离线单元回归可设置 `RAG_FINANCIAL_FACT_MODEL_ENABLED=false`，混合核验测试会显式开启 hybrid 并注入模拟客户端。
+新记录不再输出财务需求快照、`financial_fact_bundle`、逐事实/关系状态或服务端计算结果。
+历史字段可继续读取为旧数据，但不再汇总旧财务专项指标，也不能把已停用的检查统计成通过。
+评测重点比较充分性误放行与误拒、最终答案正确性与完整性、计算正确性、引用、成本和延迟，并区分服务故障与资料缺失。

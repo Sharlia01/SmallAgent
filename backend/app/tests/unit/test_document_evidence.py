@@ -45,10 +45,10 @@ def test_multilevel_headers_rowspans_units_blank_and_zero():
     assert "业务：发电；地区：境外" in rows[1]["content"]
     assert "收入 / 2023年：（空白）" in rows[1]["content"]
     assert all("单位：亿元" in row["content"] for row in rows)
-    assert rows[0]["table_headers_kwd"] == [
+    assert rows[0]["table_cells_slice_obj"]["rows"][0]["headers"] == [
         "业务", "地区", "收入 / 2023年", "收入 / 2024年",
     ]
-    assert rows[0]["table_cells_kwd"] == ["发电", "境内", "0", "-12.5"]
+    assert rows[0]["table_cells_slice_obj"]["rows"][0]["cells"] == ["发电", "境内", "0", "-12.5"]
     assert rows[1]["table_row_int"] == 5
 
 
@@ -201,8 +201,8 @@ def test_visual_table_extracts_self_contained_rows(monkeypatch):
     assert "<caption>表1 收入（亿元）</caption>" in rows[0]["content"]
     assert "<tr><th>指标</th><th>2024年</th></tr>" in rows[0]["content"]
     assert "<tr><td>营业收入</td><td>100</td></tr>" in rows[0]["content"]
-    assert rows[0]["table_headers_kwd"] == ["指标", "2024年"]
-    assert rows[0]["table_cells_kwd"] == ["营业收入", "100"]
+    assert rows[0]["table_cells_slice_obj"]["rows"][0]["headers"] == ["指标", "2024年"]
+    assert rows[0]["table_cells_slice_obj"]["rows"][0]["cells"] == ["营业收入", "100"]
     assert "表1 收入（亿元）；境内业务" in rows[1]["content"]
     assert rows[0]["table_binding_source_kwd"] == "vision"
     assert rows[0]["table_model_kwd"] == "test-vision"
@@ -409,6 +409,10 @@ def test_process_items_persists_parent_and_embeds_semantic_text(monkeypatch, tmp
 
     assert captured == [item["table_semantic_text_with_weight"]]
     assert processed[0]["content_with_weight"] == item["table_markdown_excerpt_with_weight"]
+    assert "table_markdown_excerpt_with_weight" not in processed[0]
+    assert "table_headers_kwd" not in processed[0]
+    assert "table_cells_kwd" not in processed[0]
+    assert processed[0]["table_cells_slice_obj"]["rows"][0]["cells"] == ["龙源电力", "19.6"]
     reference = processed[0]["table_object_ref_kwd"]
     parent = evidence_store.load_table_object(reference)
     assert parent["table_id"] == processed[0]["table_id_kwd"]
@@ -484,8 +488,6 @@ def test_retrieval_keeps_structured_table_metadata():
         "content_with_weight": "<table></table>",
         "evidence_type_kwd": "table",
         "table_binding_kwd": "bound",
-        "table_headers_kwd": ["公司", "PE / 25E"],
-        "table_cells_kwd": ["龙源电力", "19.6"],
         "table_id_kwd": "table-parent",
         "table_chunk_kind_kwd": "row",
         "table_row_start_int": 2,
@@ -495,8 +497,8 @@ def test_retrieval_keeps_structured_table_metadata():
         },
     }, 1)
 
-    assert formatted["table_headers_kwd"] == ["公司", "PE / 25E"]
-    assert formatted["table_cells_kwd"] == ["龙源电力", "19.6"]
+    assert "table_headers_kwd" not in formatted
+    assert "table_cells_kwd" not in formatted
     assert formatted["table_id_kwd"] == "table-parent"
     assert formatted["table_row_start_int"] == 2
     assert formatted["table_cells_slice_obj"]["rows"][0]["cells"] == ["龙源电力"]

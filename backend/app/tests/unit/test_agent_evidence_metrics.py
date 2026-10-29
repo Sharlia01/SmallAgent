@@ -76,7 +76,7 @@ def test_call_rankings_keep_independent_cutoffs_errors_and_no_vectors():
 def test_projected_answer_cannot_match_hidden_source_table_cells():
     table_sample = {"id": "table", "answerable": True, "relevant_evidence": [
         {"document_name": "报告.pdf", "evidence_type": "table", "row_cells": ["收入", "100"], "text": "收入100"}]}
-    source = {**chunk("table", "收入100"), "table_cells_kwd": ["收入", "100"]}
+    source = {**chunk("table", "收入100"), "table_cells_slice_obj": {"rows": [{"cells": ["收入", "100"]}]}}
     projected = {**source, "content_with_weight": "仅允许回答培训要求", "source_content_with_weight": "收入100",
                  "evidence_view": "answer_context"}
     case = evaluate_retrieval_case(table_sample, {

@@ -106,7 +106,16 @@ def _unique_matches(pattern: re.Pattern, query: str) -> set[str]:
         if match.group(0).strip()
     }
 
-def _extract_organizations(query: str) -> set[str]:
+def _extract_organizations(query: str, entity_names=None) -> set[str]:
+    # Agent 传入模型确认的名称后，只定位这些完整名称；绝不按后缀重新识别。
+    # None 仅兼容未运行理解模型的旧调用方，空元组表示明确没有已知实体。
+    if entity_names is not None:
+        if not entity_names:
+            return set()
+        # 完整名称优先，不能把明确声明的子公司名称再次拆成母公司。
+        pattern = "|".join(re.escape(name) for name in sorted(set(entity_names), key=lambda name: (-len(name), name)))
+        return {match.group() for match in re.finditer(pattern, query)}
+
     # “归属于母公司股东的净利润”等财务字段不是新的公司实体。
     # 使用组织后缀识别前，先遮蔽已知字段名称。
     field_names = [name for canonical, aliases in domain_policy()["aliases"].items()
@@ -133,7 +142,7 @@ def _extract_organizations(query: str) -> set[str]:
             organizations.add(candidate)
     return organizations
 
-def extract_query_anchors(query: str) -> list[str]:
+def extract_query_anchors(query: str, *, entity_names=None) -> list[str]:
     """提取查询变换必须保留的高置信度锚点词。"""
     if not isinstance(query, str) or not query.strip():
         return []
@@ -151,7 +160,7 @@ def extract_query_anchors(query: str) -> list[str]:
     ):
         anchors.update(_unique_matches(pattern, query))
 
-    anchors.update(_extract_organizations(query))
+    anchors.update(_extract_organizations(query, entity_names))
     anchors.update(explicit_named_terms(query))
     anchors.update(metric_terms(query))
     anchors.update(
@@ -161,7 +170,7 @@ def extract_query_anchors(query: str) -> list[str]:
     )
     return sorted(anchors, key=lambda value: (_normalize_for_match(value), value))
 
-def _extract_risky_additions(query: str) -> set[str]:
+def _extract_risky_additions(query: str, *, entity_names=None) -> set[str]:
     query = unicodedata.normalize("NFKC", query).replace("−", "-").replace("—", "-")
     risky_terms = set()
     for pattern in (
@@ -173,7 +182,7 @@ def _extract_risky_additions(query: str) -> set[str]:
         NEGATION_PATTERN,
     ):
         risky_terms.update(_unique_matches(pattern, query))
-    risky_terms.update(_extract_organizations(query))
+    risky_terms.update(_extract_organizations(query, entity_names))
     risky_terms.update(explicit_named_terms(query))
     risky_terms.update(scope for scope in domain_policy().get("business_scopes", []) if scope in query)
     return risky_terms
@@ -189,9 +198,10 @@ def _normalized_difference(left: set[str], right: set[str]) -> list[str]:
 def validate_query_preservation(
     original: str,
     candidate: str,
+    *, entity_names=None,
 ) -> QueryValidationResult:
     """拒绝丢失锚点或无依据增加精确条件的候选查询。"""
-    required_anchors = extract_query_anchors(original)
+    required_anchors = extract_query_anchors(original, entity_names=entity_names)
     normalized_candidate = _normalize_for_match(candidate)
     missing_anchors = [
         anchor
@@ -199,8 +209,8 @@ def validate_query_preservation(
         if _normalize_for_match(anchor) not in normalized_candidate
     ]
 
-    original_risky_terms = _extract_risky_additions(original)
-    candidate_risky_terms = _extract_risky_additions(candidate)
+    original_risky_terms = _extract_risky_additions(original, entity_names=entity_names)
+    candidate_risky_terms = _extract_risky_additions(candidate, entity_names=entity_names)
     added_risky_terms = _normalized_difference(
         candidate_risky_terms,
         original_risky_terms,
@@ -211,7 +221,7 @@ def validate_query_preservation(
         YEAR_OR_DATE_PATTERN.fullmatch(term.strip()) and not re.search(r"月|日", term)
         and reporting_periods(term) and reporting_periods(term) <= source_periods
     )]
-    conflicts = semantic_conflicts(original, candidate)
+    conflicts = semantic_conflicts(original, candidate, entity_names=entity_names)
 
     return QueryValidationResult(
         valid=bool(candidate.strip()) and not missing_anchors and not added_risky_terms and not conflicts,

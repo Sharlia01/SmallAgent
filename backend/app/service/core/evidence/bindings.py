@@ -22,8 +22,8 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BRIDGE_EXTRACTION_MODEL = "qwen3.7-flash-2026-07-15"
-DEFAULT_BRIDGE_EXTRACTION_TIMEOUT_SECONDS = 6.0
+DEFAULT_BRIDGE_EXTRACTION_MODEL = "qwen3.7-flash"
+DEFAULT_BRIDGE_EXTRACTION_TIMEOUT_SECONDS = 15.0
 MAX_BRIDGE_VALUE_CHARS = 80
 MAX_BRIDGE_EVIDENCE_CHARS = 8000
 MAX_BRIDGE_QUERY_CHARS = 400
@@ -161,10 +161,11 @@ def _extract_rating_by_rule(
     slot: str,
     chunks: list[dict[str, Any]],
     question: str = "",
+    *, entity_names=None,
 ) -> BridgeExtraction | None:
     if slot != "rating":
         return None
-    subjects = _extract_organizations(question)
+    subjects = _extract_organizations(question, entity_names)
     candidates = []
     for index, chunk in enumerate(chunks, start=1):
         content = _chunk_content(chunk)
@@ -220,12 +221,13 @@ def extract_bridge_value(
     first_query: str,
     chunks: list[dict[str, Any]],
     client: Any | None = None,
+    entity_names=None,
 ) -> BridgeExtraction | None:
     """提取一个槽位值，仅接受原始片段中有依据的文本。"""
     if not chunks:
         return None
 
-    rule_result = _extract_rating_by_rule(slot, chunks, first_query)
+    rule_result = _extract_rating_by_rule(slot, chunks, first_query, entity_names=entity_names)
     if rule_result is not None:
         return rule_result
 
@@ -273,7 +275,7 @@ def extract_bridge_value(
             or isinstance(source_chunk_index, bool)
         ):
             raise ValueError("bridge extraction response is invalid")
-        subjects = _extract_organizations(first_query)
+        subjects = _extract_organizations(first_query, entity_names)
         subject = payload.get("subject", "")
         quote = payload.get("source_quote", "")
         if not isinstance(subject, str) or not isinstance(quote, str):

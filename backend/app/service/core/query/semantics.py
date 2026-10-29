@@ -118,7 +118,7 @@ _OPERATORS = {
 _OP_PATTERN = re.compile("|".join(map(re.escape, sorted(_OPERATORS, key=len, reverse=True))))
 
 
-def semantic_conflicts(original: str, candidate: str) -> list[str]:
+def semantic_conflicts(original: str, candidate: str, *, entity_names=None) -> list[str]:
     conflicts = []
     original_ops = [_OPERATORS[m.group()] for m in _OP_PATTERN.finditer(original)]
     candidate_ops = [_OPERATORS[m.group()] for m in _OP_PATTERN.finditer(candidate)]
@@ -141,7 +141,7 @@ def semantic_conflicts(original: str, candidate: str) -> list[str]:
         left = operands(original)[0]
         # 保留比较两侧各自的明确主体。
         from service.core.query.preservation import _extract_organizations
-        subjects = _extract_organizations(original)
+        subjects = _extract_organizations(original, entity_names)
         first = [s for s in subjects if canonical_text(s) in left]
         second = [s for s in subjects if canonical_text(s) not in left]
         if len(first) == len(second) == 1:

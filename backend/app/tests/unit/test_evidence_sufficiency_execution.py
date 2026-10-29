@@ -1,12 +1,10 @@
 """充分性评估的规则顺序、重试预算和模型边界行为。"""
 
 import json
-from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 
-from domain.facts import FinancialFactAssessment
 from service.core.evidence import sufficiency as sufficiency
 from service.core.evidence.adapter import collection_from_records
 from service.core.runtime.context import QueryRuntime, query_runtime
@@ -62,7 +60,7 @@ def test_transport_retry_preserves_attempts_and_logs_failure(recovered, caplog):
                                      completion() if recovered else TimeoutError("second request failed"))
     with query_runtime(QueryRuntime(max_model_calls=2)) as runtime:
         result = sufficiency.assess_evidence_sufficiency(
-            "差旅如何审批？", sources(), facts=FinancialFactAssessment(), client=client(completions),
+            "差旅如何审批？", sources(), client=client(completions),
         )
     assert len(completions.calls) == runtime.counts["model"] == 2
     assert result.diagnostics["attempts"] == 2
@@ -83,7 +81,7 @@ def test_request_retry_respects_runtime_and_policy(monkeypatch, constraint, capl
     completions = ScriptedCompletions(TimeoutError("request failed"), completion())
     with query_runtime(runtime):
         result = sufficiency.assess_evidence_sufficiency(
-            "差旅如何审批？", sources(), facts=FinancialFactAssessment(), client=client(completions),
+            "差旅如何审批？", sources(), client=client(completions),
         )
     assert len(completions.calls) == runtime.counts["model"] == 1
     assert result.diagnostics["attempts"] == 1
@@ -96,7 +94,7 @@ def test_exhausted_budget_does_not_start_provider_request(caplog):
     completions = ScriptedCompletions(completion())
     with query_runtime(QueryRuntime(max_model_calls=0)) as runtime:
         result = sufficiency.assess_evidence_sufficiency(
-            "差旅如何审批？", sources(), facts=FinancialFactAssessment(), client=client(completions),
+            "差旅如何审批？", sources(), client=client(completions),
         )
     assert completions.calls == []
     assert result.diagnostics["failure_kind"] == "budget_exhausted"
@@ -116,7 +114,7 @@ def test_invalid_responses_fail_without_transport_retry(response, rejected_phase
     completions = ScriptedCompletions(response, completion())
     with query_runtime(QueryRuntime(max_model_calls=2)) as runtime:
         result = sufficiency.assess_evidence_sufficiency(
-            "差旅如何审批？", sources(), facts=FinancialFactAssessment(), client=client(completions),
+            "差旅如何审批？", sources(), client=client(completions),
         )
     assert len(completions.calls) == 1
     assert result.diagnostics["attempts"] == 1
@@ -131,7 +129,7 @@ def test_client_configuration_failure_has_no_request_attempt(monkeypatch):
 
     monkeypatch.setattr(sufficiency, "get_verification_client", unavailable_client)
     with query_runtime() as runtime:
-        result = sufficiency.assess_evidence_sufficiency("差旅如何审批？", sources(), facts=FinancialFactAssessment())
+        result = sufficiency.assess_evidence_sufficiency("差旅如何审批？", sources())
     assert result.diagnostics["attempts"] == 0
     assert result.diagnostics["failure_kind"] == "configuration_or_request_error"
     assert runtime.counts.get("model", 0) == 0
@@ -146,8 +144,7 @@ def test_visual_rule_precedes_semantic_execution_policy(monkeypatch, require_sem
         "evidence_type_kwd": "figure", "visual_status_kwd": "disabled",
     }])
     result = sufficiency.assess_evidence_sufficiency(
-        "图中哪一年的柱为负？", evidence, facts=FinancialFactAssessment(),
-        client=client(completions), require_semantic=require_semantic,
+        "图中哪一年的柱为负？", evidence, client=client(completions), require_semantic=require_semantic,
     )
     assert result.sufficient is False and result.source == "rule"
     assert result.missing_requirements == ["图表视觉事实或明确描述该事实的正文证据"]
@@ -155,36 +152,12 @@ def test_visual_rule_precedes_semantic_execution_policy(monkeypatch, require_sem
     assert completions.calls == []
 
 
-def test_question_limit_does_not_start_model_or_derived_calculation(monkeypatch):
+def test_question_limit_does_not_start_model(monkeypatch):
     completions = ScriptedCompletions(AssertionError("must not call provider"))
     result = sufficiency.assess_evidence_sufficiency(
         "问题" * sufficiency.MAX_EVIDENCE_QUESTION_CHARS, sources(),
-        facts=FinancialFactAssessment(), client=client(completions),
+        client=client(completions),
     )
     assert result.diagnostics["failure_kind"] == "input_limit"
     assert result.diagnostics["attempts"] == 0
     assert completions.calls == []
-
-
-def test_calculation_losing_model_context_keeps_original_source_proof(monkeypatch):
-    evidence = sources()
-    derived = [{"id": "calculation", "status": "supported", "supporting_chunk_ids": ["first", "second"],
-                "supporting_chunk_indices": [1, 2], "inputs": [
-                    {"chunk_id": "first", "chunk_index": 1}, {"chunk_id": "second", "chunk_index": 2},
-                ]}]
-    original = deepcopy(derived)
-    monkeypatch.setattr(sufficiency, "MAX_EVIDENCE_CHUNKS", 1)
-    completions = ScriptedCompletions(completion())
-    with query_runtime() as runtime:
-        result = sufficiency.assess_evidence_sufficiency(
-            "差旅如何审批？", evidence, facts=FinancialFactAssessment(derived_evidence=derived), client=client(completions),
-        )
-    payload = json.loads(completions.calls[0]["messages"][1]["content"])
-    projected = payload["derived_evidence"][0]
-    assert projected["status"] == "unresolved"
-    assert projected["reason"] == "input_not_in_model_context"
-    assert projected["supporting_chunk_indices"] == [1]
-    assert [item["chunk_index"] for item in projected["inputs"]] == [1, None]
-    assert result.facts.derived_evidence == original == derived
-    assert result.evaluated_chunk_ids == ["first"]
-    assert "events" not in runtime.snapshot()

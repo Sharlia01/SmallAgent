@@ -1,28 +1,23 @@
 """覆盖证据身份、核验快照及模型输入与引用之间的架构约束。"""
 
-import json
 from dataclasses import FrozenInstanceError, replace
+import json
+import re
 from types import SimpleNamespace
 
 import pytest
 
-from agent.orchestrator import AgentOrchestrator, AgentRun
 from agent.schemas import ToolResult
 from domain.assessment import EvidenceAssessment
-from domain.evidence import (Evidence, EvidenceCollection, EvidenceLocation, EvidenceSource, EvidenceStructure,
-                             EvidenceTable, EvidenceTableRow, RetrievalTrace)
+from domain.evidence import Evidence, EvidenceLocation, EvidenceSource, RetrievalTrace
 from service.core.answering import answer_context as pipeline
 from service.core.evidence import verification as verification, sufficiency as evidence_sufficiency
-from service.core.finance import facts as financial_facts
-from service.core.retrieval import pipeline as retrieval
 from service.core.evidence.adapter import collection_from_records, evidence_from_record, source_record
-from service.core.entities.attribution import EntityRegistry
+from service.core.entities.registry import EntityRegistry
 from service.core.query.contract import QueryGoal
-from service.core.retrieval.result import adapt_retrieval_records, retrieval_record
 from tests.evidence_helpers import make_query, bind_assessment
 from service.core.evidence.adapter import assessment_from_record
 from service.core.evidence import assessment as evidence_assessment
-from service.core.evidence import adapter as evidence_adapter
 
 
 pytestmark = pytest.mark.unit
@@ -41,15 +36,22 @@ def decision(evidence, *, supporting=(1,)):
     })
 
 
+def answer_references(messages):
+    """读取实际模型消息中的编号和 JSON，检查上下文与前端引用的一致性。"""
+    lines = messages[-1]["content"].splitlines()
+    return [(int(match.group(1)), json.loads(lines[index + 1]))
+            for index, line in enumerate(lines)
+            if (match := re.fullmatch(r"\[(\d+)\]", line))]
+
+
 @pytest.fixture
 def companies(monkeypatch):
     registry = EntityRegistry({"version": "architecture-test", "entities": [
         {"entity_id": "A", "canonical_name": "A公司", "kind": "company"},
         {"entity_id": "B", "canonical_name": "B公司", "kind": "company"},
     ]})
-    monkeypatch.setattr(financial_facts, "get_entity_registry", lambda: registry)
     monkeypatch.setattr(evidence_assessment, "get_entity_registry", lambda: registry)
-    monkeypatch.setattr("service.core.entities.attribution.get_entity_registry", lambda: registry)
+    monkeypatch.setattr("service.core.entities.registry.get_entity_registry", lambda: registry)
     return registry
 
 
@@ -68,94 +70,11 @@ def test_original_evidence_is_an_independent_readonly_snapshot():
         evidence.structure.table.metadata["table_cells_slice_obj"]["rows"][0]["cells"][1] = "120"
 
 
-def test_typed_table_is_verified_once_without_source_dictionary_roundtrips(companies, monkeypatch):
-    headers, cells = ("公司", "2023年营业收入（亿元）"), ("B公司", "80")
-    row = EvidenceTableRow(headers, cells, 0, (0, 1), headers, cells)
-    item = Evidence("table", "原始表格", EvidenceSource("knowledge_base", "report", "报表.pdf"),
-                    structure=EvidenceStructure("table", EvidenceTable(binding="bound", rows=(row,))))
-    evidence = EvidenceCollection([item])
-    evidence.add(item, RetrievalTrace("营业收入", {"similarity": 0.8}))
-    query = make_query("B公司2023年营业收入是多少？")
-    real_assess = verification.assess_financial_facts
-    calls = []
-
-    def facts(question, sources, *args, **kwargs):
-        assert sources is evidence
-        calls.append("facts")
-        return real_assess(question, sources, *args, **kwargs)
-
-    def semantic(question, sources, *, facts, **kwargs):
-        assert sources is evidence and sources.get("table") is item
-        assert facts.sufficient and facts.facts[0].value == "80"
-        calls.append("semantic")
-        return replace(decision(sources), facts=facts)
-
-    def no_conversion(*args, **kwargs):
-        pytest.fail("核验阶段不能导出或重建来源字典")
-
-    monkeypatch.setattr(verification, "assess_financial_facts", facts)
-    monkeypatch.setattr(verification, "assess_evidence_sufficiency", semantic)
-    monkeypatch.setattr(evidence_adapter, "source_record", no_conversion)
-    monkeypatch.setattr(evidence_adapter, "source_records", no_conversion)
-    monkeypatch.setattr(evidence_adapter, "collection_from_records", no_conversion)
-    assessment = verification.verify_evidence(query,
-        evidence)
-    assert verification.verify_evidence(query, evidence, previous=assessment) is assessment
-    answer = pipeline.build_answer_context(query, evidence, assessment)
-    assert calls == ["facts", "semantic"]
-    assert answer.citations[0].evidence is item
-    assert "80亿元" in answer.blocks[0].text
-    assert evidence.traces("table")[0].scores["similarity"] == 0.8
-
-
-@pytest.mark.parametrize("malformed", [{"column_indices": []}, {"source_row": "bad"}, {"headers": "bad"}])
-def test_malformed_table_mapping_cannot_supply_verified_facts(companies, malformed):
-    row = {"headers": ["公司", "2023年营业收入（亿元）"], "cells": ["B公司", "80"], **malformed}
-    evidence = collection_from_records([record(evidence_type_kwd="table", table_binding_kwd="bound",
-                                               table_cells_slice_obj={"rows": [row]})])
-    table = next(iter(evidence)).structure.table
-    assert not table.rows[0].grounded
-    assert not financial_facts.assess_financial_facts(make_query("B公司2023年营业收入是多少？").financial_requirements, evidence).sufficient
-
-
-def test_model_projection_skips_empty_sources_before_applying_input_limit():
+def test_assessment_filters_empty_sources_before_basic_checks():
     evidence = collection_from_records([record(str(index), "") for index in range(25)] + [record("valid")])
-    inputs = evidence_sufficiency._prepare_evidence(evidence)
-    assert [item.evidence.id for item in inputs] == ["valid"]
-
-
-def test_calculation_indices_follow_actual_model_inputs_and_keep_stable_source_ids(monkeypatch, companies):
-    monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_ENABLED", "true")
-    table = record("values", "每股收益和每股红利", evidence_type_kwd="table", table_binding_kwd="bound",
-                   table_id_kwd="t1", table_cells_slice_obj={"rows": [
-                       {"headers": ["指标", "B公司2023年"], "cells": ["每股红利", "0.24"], "row_index": 0},
-                       {"headers": ["指标", "B公司2023年"], "cells": ["每股收益", "0.40"], "row_index": 1},
-                   ]})
-    evidence = collection_from_records([record("blank", ""), table])
-    requests = []
-
-    def create(**kwargs):
-        requests.append(json.loads(kwargs["messages"][1]["content"]))
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
-            "sufficient": True, "reason": "已核验输入足以计算", "missing_requirements": [],
-            "supporting_chunk_indices": [1], "derived_evidence_ids": ["payout_ratio"],
-        })))])
-
-    query = make_query("B公司2023年派息率是多少？")
-    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
-    assessment = verification.verify_evidence(query, evidence, client=client)
-    assert assessment.sufficient and assessment.evaluated_chunk_ids == ["values"]
-    calculation = requests[0]["derived_evidence"][0]
-    assert calculation["supporting_chunk_ids"] == ["values"]
-    assert calculation["supporting_chunk_indices"] == [1]
-    assert [item["chunk_index"] for item in calculation["inputs"]] == [1, 1]
-    assert assessment.facts.derived_evidence[0]["supporting_chunk_indices"] == [2]
-    context = pipeline.build_answer_context(query, evidence, assessment)
-    assert context.citations[0].evidence is evidence.get("values")
-
-
-
-
+    assessment = evidence_sufficiency.assess_evidence_sufficiency(
+        "差旅如何审批？", evidence, require_semantic=False)
+    assert assessment.evaluated_chunk_ids == ["valid"]
 
 
 def test_domain_location_can_be_exported_without_parser_specific_fields():
@@ -238,9 +157,8 @@ def test_report_changes_cannot_reuse_a_verified_snapshot(monkeypatch):
 
 
 def test_query_context_preserves_all_goal_provenance():
-    goal = QueryGoal("g1", "图2和图3中的利润关系", ("2021年",), (), ("图2和图3",),
-                     ({"kind": "time", "value": "2021年", "source_quote": "2021年", "start": 8, "end": 13},),
-                     ("图2", "图3"))
+    goal = QueryGoal("g1", "图2和图3中的利润关系", constraints=("2021年",),
+                     source_spans=("图2和图3",), candidate_locators=("图2", "图3"))
     query = make_query("图2和图3中的2021年利润关系？", (goal,))
     assert query.goals[0] is goal
     version = query.version
@@ -253,36 +171,207 @@ def test_answer_selection_and_citations_share_one_mapping_without_reverification
     query = make_query("差旅如何审批？")
     evidence = collection_from_records([record("irrelevant", "无关材料"), record("supported")])
     assessment = bind_assessment(query, evidence, decision(evidence, supporting=(2,)))
-    monkeypatch.setattr(verification, "assess_financial_facts", lambda *_args, **_kwargs: pytest.fail("格式化不能再次抽取事实"))
+    monkeypatch.setattr(verification, "assess_evidence_sufficiency", lambda *_args, **_kwargs: pytest.fail("格式化不能再次抽取事实"))
     context = pipeline.build_answer_context(query, evidence, assessment)
     messages = pipeline.build_answer_messages(context, [])
     documents = pipeline.answer_documents(context, evidence, assessment)
-    assert "[1] 差旅申请需要审批。" in messages[-1]["content"]
+    assert answer_references(messages)[0][1]["content"] == "差旅申请需要审批。"
     assert "无关材料" not in messages[-1]["content"]
     assert [(item["id"], item["chunk_id"]) for item in documents] == [(1, "supported")]
     assert len(evidence) == 2
 
 
-def test_financial_answer_uses_b_fact_while_citation_preserves_full_original(companies):
-    raw = record("mixed", "A公司2023年营业收入为120亿元，B公司2023年营业收入为80亿元。",
-                 answer_context="B公司2023年营业收入为120亿元。",
-                 financial_facts=[{"entity_id": "B", "value": "120", "attribution_status": "verified"}])
-    evidence = collection_from_records([record("only-a", "A公司2023年营业收入为120亿元。"), raw])
-    query = make_query("B公司2023年营业收入是多少？")
-    assessment = verification.verify_evidence(query, evidence, require_semantic=False)
-    assert not hasattr(assessment, "financial_fact_bundle")
-    assert assessment.to_dict()["supporting_fact_ids"] == assessment.facts.selected_fact_ids
+def test_implicit_subjects_keep_their_distinct_documents_and_locations():
+    query = make_query("国电电力和华能国际2025年营业收入分别是多少？")
+    evidence = collection_from_records([
+        record("gd", "报告期内，公司实现营业收入100亿元。", document_id="gd-report",
+               document_name="国电电力2025年年度报告.pdf", page_num_int=[12], locator_kwd="经营情况",
+               similarity=0.9, subject_entity_ids=["legacy-wrong-company"]),
+        record("hn", "报告期内，公司实现营业收入200亿元。", document_id="hn-report",
+               document_name="华能国际2025年年度报告.pdf", page_num_int=15),
+    ])
+    assessment = bind_assessment(query, evidence, decision(evidence, supporting=(1, 2)))
+
     context = pipeline.build_answer_context(query, evidence, assessment)
-    messages = pipeline.build_answer_messages(context, [{"role": "assistant", "content": "旧答案120亿元。"}])
+    references = answer_references(pipeline.build_answer_messages(context, []))
     documents = pipeline.answer_documents(context, evidence, assessment)
-    assert "80亿元" in messages[-1]["content"] and "120亿元" not in messages[-1]["content"]
-    assert len(messages) == 2 and len(documents) == 1
-    assert context.blocks[0].fact_ids == tuple(assessment.facts.selected_fact_ids)
-    assert documents[0]["id"] == 1 and documents[0]["chunk_id"] == "mixed"
-    assert documents[0]["content_with_weight"] == raw["content_with_weight"]
-    assert "financial_facts" not in evidence.get("mixed").structure.attribution.metadata
-    documents[0]["financial_facts"][0]["source"]["quote"] = "修改展示数据"
-    assert pipeline.build_answer_context(query, evidence, assessment) == context
+
+    assert [item["document_name"] for _, item in references] == [
+        "国电电力2025年年度报告.pdf", "华能国际2025年年度报告.pdf",
+    ]
+    assert references[0][1]["location"] == {"page": [12], "locator": "经营情况"}
+    assert references[1][1]["location"] == {"page": 15}
+    for (number, reference), document, block in zip(references, documents, context.blocks):
+        assert number == document["id"]
+        assert reference["document_id"] == document["document_id"]
+        assert reference["content"] == document["content_with_weight"] == block.text
+        assert "similarity" not in reference and "subject_entity_ids" not in reference
+
+
+def test_table_keeps_company_column_and_units_even_outside_column_window():
+    query = make_query("华能国际2025年收入是多少？")
+    evidence = collection_from_records([record(
+        "peer-table", "2025年收入：200", document_name="国电电力投资价值分析.pdf",
+        evidence_type_kwd="table", table_binding_kwd="bound", table_id_kwd="t1",
+        table_row_start_int=3, table_row_end_int=3,
+        table_context_obj={"reliable": True, "caption": "可比公司营业收入", "rows": [{
+            "row_index": 3, "column_indices": [1], "headers": ["2025年收入"], "cells": ["200"],
+            "context": "电力企业对比", "preamble": "单位：亿元",
+            "source_row": {"headers": ["公司", "2025年收入"], "cells": ["华能国际", "200"],
+                           "entity_attribution": {"subject_entity_ids": ["wrong-company"]}},
+        }]},
+    )])
+    assessment = bind_assessment(query, evidence, decision(evidence))
+
+    context = pipeline.build_answer_context(query, evidence, assessment)
+    _, reference = answer_references(pipeline.build_answer_messages(context, []))[0]
+
+    assert reference["document_name"] == "国电电力投资价值分析.pdf"
+    assert "content" not in reference
+    table = reference["table"]
+    assert table["caption"] == "可比公司营业收入"
+    assert table["binding"] == "bound" and table["reliable"] is True
+    row = table["matched_rows"][0]
+    assert row["context"] == "电力企业对比" and row["preamble"] == "单位：亿元"
+    assert row["row_index"] == 3
+    assert [cell["in_selected_window"] for cell in row["values"]] == [False, True]
+    assert [(cell["header"], cell["value"]) for cell in row["values"]] == [("公司", "华能国际"), ("2025年收入", "200")]
+    assert "entity_attribution" not in str(reference)
+
+
+def test_table_without_parent_expansion_keeps_original_caption():
+    query = make_query("报告中的收入是多少？")
+    evidence = collection_from_records([record(
+        text="收入：200",
+        evidence_type_kwd="table", table_binding_kwd="bound",
+        table_semantic_text_with_weight="公司经营数据\n单位：亿元\n公司：华能国际；收入：200",
+        table_cells_slice_obj={"caption": "公司经营数据", "rows": [
+            {"headers": ["公司", "收入"], "cells": ["华能国际", "200"]},
+        ]},
+    )])
+    assessment = bind_assessment(query, evidence, decision(evidence))
+    context = pipeline.build_answer_context(query, evidence, assessment)
+    reference = answer_references(pipeline.build_answer_messages(context, []))[0][1]
+    assert reference["table"]["caption"] == "公司经营数据"
+    assert "content" not in reference
+    assert "单位：亿元" in reference["table"]["source_notes"]
+
+
+def test_goal_support_keeps_context_without_adding_unreviewed_or_unrelated_chunks():
+    query = make_query("该公司的收入是多少？", (QueryGoal("g1", "公司收入"),))
+    evidence = collection_from_records([
+        record("subject-context", "本节分析国电电力，以下金额单位均为亿元。"),
+        record("revenue", "报告期内，公司实现营业收入100。"),
+        record("unrelated", "同一报告中的其他内容。"),
+        record("not-reviewed", "预算不足，未送审的内容。"),
+    ])
+    verdict = replace(decision(evidence, supporting=(2,)),
+        evaluated_chunk_ids=["subject-context", "revenue", "unrelated"], evaluated_chunk_count=3,
+        goal_coverage=[{"goal_id": "g1", "status": "supported",
+                        "supporting_chunk_ids": ["subject-context", "revenue", "not-reviewed"]}])
+    assessment = bind_assessment(query, evidence, verdict)
+
+    context = pipeline.build_answer_context(query, evidence, assessment)
+    references = answer_references(pipeline.build_answer_messages(context, []))
+    assert [block.evidence_id for block in context.blocks] == ["subject-context", "revenue"]
+    assert context.goal_support[0].supporting_reference_ids == (1, 2)
+    assert [item["content"] for _, item in references] == [
+        "本节分析国电电力，以下金额单位均为亿元。", "报告期内，公司实现营业收入100。",
+    ]
+    assert [item["chunk_id"] for item in pipeline.answer_documents(context, evidence, assessment)] == [
+        "subject-context", "revenue",
+    ]
+
+
+def test_goal_navigation_uses_final_references_and_preserves_shared_sources():
+    question = "比较甲公司和乙公司的收入，并说明统计口径"
+    goals = (QueryGoal("a", "甲公司收入", constraints=("2025年",)),
+             QueryGoal("b", "乙公司收入"))
+    query = make_query(question, goals)
+    evidence = collection_from_records([
+        record("irrelevant", "无关内容"), record("a", "甲公司收入100"),
+        record("shared", "两家公司使用相同口径"), record("b", "乙公司收入200"),
+    ])
+    # 核验顺序、原始证据顺序和筛选后的引用顺序均可能不同。
+    verdict = replace(decision(evidence, supporting=(1,)),
+        evaluated_chunk_ids=["b", "irrelevant", "shared", "a"],
+        goal_coverage=[
+            {"goal_id": "b", "status": "supported", "supporting_chunk_ids": ["b", "shared"]},
+            {"goal_id": "a", "status": "supported", "supporting_chunk_ids": ["shared", "a", "a"]},
+        ])
+    context = pipeline.build_answer_context(query, evidence, bind_assessment(query, evidence, verdict))
+    messages = pipeline.build_answer_messages(context, [])
+    navigation = json.loads(messages[-1]["content"].splitlines()[1])
+    assert navigation == [
+        {"goal_id": "a", "text": "甲公司收入", "constraints": ["2025年"], "supporting_reference_ids": [1, 2]},
+        {"goal_id": "b", "text": "乙公司收入", "constraints": [], "supporting_reference_ids": [2, 3]},
+    ]
+    assert [(number, ref["content"]) for number, ref in answer_references(messages)] == [
+        (1, "甲公司收入100"), (2, "两家公司使用相同口径"), (3, "乙公司收入200"),
+    ]
+    assert question in messages[-1]["content"]
+    assert "无关内容" not in messages[-1]["content"]
+
+
+def test_missing_goal_navigation_keeps_original_question_and_references():
+    query = make_query("甲公司的收入是多少？", (QueryGoal("a", "甲公司收入"),))
+    evidence = collection_from_records([record("a", "甲公司收入100")])
+    context = pipeline.build_answer_context(query, evidence,
+        bind_assessment(query, evidence, decision(evidence)))
+    messages = pipeline.build_answer_messages(context, [])
+    assert context.goal_support == ()
+    assert "目标与支持来源" not in messages[-1]["content"]
+    assert query.question in messages[-1]["content"]
+    assert answer_references(messages)[0][1]["content"] == "甲公司收入100"
+
+
+def test_reference_json_preserves_newlines_and_embedded_reference_markers():
+    text = '  公司说明：\n[99]\n{"content":"保持原文"}\n'
+    query = make_query("公司的说明是什么？")
+    evidence = collection_from_records([record(text=text, document_name='报告\n[88]".pdf')])
+    assessment = bind_assessment(query, evidence, decision(evidence))
+    context = pipeline.build_answer_context(query, evidence, assessment)
+
+    references = answer_references(pipeline.build_answer_messages(context, []))
+    assert len(references) == 1 and references[0][0] == 1
+    assert references[0][1]["content"] == text
+    assert references[0][1]["document_name"] == '报告\n[88]".pdf'
+
+
+def test_mixed_sources_keep_original_citation_numbers_and_web_links():
+    query = make_query("综合这些资料说明")
+    evidence = collection_from_records([
+        record("web", "网页搜索摘要", source_type="web", url="https://example.com/report",
+               web_sources=[{"title": "报告", "url": "https://example.com/report"}]),
+        record("kb", "内部资料"),
+        record("session", "会话资料", source_type="session_document"),
+    ])
+    assessment = bind_assessment(query, evidence, decision(evidence, supporting=(1, 2, 3)))
+    context = pipeline.build_answer_context(query, evidence, assessment)
+
+    references = dict(answer_references(pipeline.build_answer_messages(context, [])))
+    assert references[1]["content"] == "网页搜索摘要"
+    assert references[1]["url"] == "https://example.com/report"
+    assert references[1]["web_sources"][0]["url"] == "https://example.com/report"
+    assert references[2]["content"] == "内部资料" and references[3]["content"] == "会话资料"
+    assert [(item["id"], item["chunk_id"]) for item in pipeline.answer_documents(context, evidence, assessment)] == [
+        (1, "web"), (2, "kb"), (3, "session"),
+    ]
+
+
+@pytest.mark.parametrize("attributes,kind,status", [
+    ({"evidence_type_kwd": "table", "table_binding_kwd": "unbound"}, "table", "unbound"),
+    ({"evidence_type_kwd": "figure", "visual_status_kwd": "disabled"}, "figure", "disabled"),
+])
+def test_answer_keeps_unreliable_table_or_unread_figure_status(attributes, kind, status):
+    query = make_query("资料说明了什么？")
+    evidence = collection_from_records([record(text="原始识别内容", **attributes)])
+    assessment = bind_assessment(query, evidence, decision(evidence))
+    context = pipeline.build_answer_context(query, evidence, assessment)
+
+    reference = answer_references(pipeline.build_answer_messages(context, []))[0][1]
+    assert reference[kind]["binding" if kind == "table" else "status"] == status
+    assert reference["content"] == "原始识别内容"
 
 
 def test_tool_diagnostics_do_not_restore_or_replace_query_context():
@@ -294,10 +383,6 @@ def test_tool_diagnostics_do_not_restore_or_replace_query_context():
     assessment = verification.verify_evidence(query, evidence, require_semantic=False)
     context = pipeline.build_answer_context(query, evidence, assessment)
     assert context.question == "差旅如何审批？" and query.goals == ()
-
-
-
-
 
 
 def test_session_evidence_preserves_short_original_and_respects_existing_limits():
@@ -341,8 +426,6 @@ def test_sufficiency_routes_return_a_report_bound_to_the_actual_query(monkeypatc
         assert assessment.to_dict()["failure_kind"] == assessment.diagnostics["failure_kind"]
 
 
-
-
 @pytest.mark.parametrize("change", ["query", "evidence", "policy", "report"])
 def test_bound_report_cannot_be_relabelled_as_a_new_verification(monkeypatch, change):
     query = make_query("差旅如何审批？")
@@ -360,31 +443,78 @@ def test_bound_report_cannot_be_relabelled_as_a_new_verification(monkeypatch, ch
         bind_assessment(query, evidence, assessment)
 
 
-def test_partial_financial_report_keeps_supported_goal_proof_for_repair(companies):
-    goals = (QueryGoal("a", "A公司2023年营业收入"), QueryGoal("b", "B公司2023年营业收入"))
-    query = make_query("比较A公司和B公司2023年营业收入", goals)
-    assessment = verification.verify_evidence(query,
-        collection_from_records([record("a", "A公司2023年营业收入为120亿元。")]))
-    assert not assessment.sufficient
-    assert assessment.supporting_chunk_indices == [1]
-    assert [entry["status"] for entry in assessment.goal_coverage] == ["supported", "missing"]
-    assert assessment.goal_coverage[0]["supporting_fact_ids"] == assessment.supporting_fact_ids
+@pytest.mark.parametrize(('markers', 'expected'), [
+    ({'table_candidate_obj': {'matched_row_indices': [4, 6]}}, ['context', 'matched', 'matched']),
+    ({'table_context_obj': {'matched_row_indices': ['4', '6'], 'matched_row_index': 4}},
+     ['context', 'matched', 'matched']),
+    ({'table_context_obj': {'matched_row_index': '4'}}, ['context', 'matched', 'context']),
+    ({'table_row_int': '4'}, ['context', 'matched', 'context']),
+    ({}, ['unknown', 'unknown', 'unknown']),
+    ({'table_candidate_obj': {'matched_row_indices': []}, 'table_row_int': 4},
+     ['unknown', 'unknown', 'unknown']),
+    ({'table_candidate_obj': {'matched_row_indices': [True, 4.5, 'broken']}},
+     ['unknown', 'unknown', 'unknown']),
+    ({'table_binding_kwd': 'unbound', 'table_row_int': 4}, ['unknown', 'unknown', 'unknown']),
+])
+def test_answer_messages_preserve_table_retrieval_roles(markers, expected):
+    """检查最终模型消息，覆盖多主行、旧索引与无可靠角色的证据。"""
+    rows = [
+        {'row_index': index, 'headers': ['指标', '2025E'], 'cells': [label, value]}
+        for index, label, value in [(3, '应收账款', '15'), (4, '预付账款', '14'), (6, '存货', '140')]
+    ]
+    attributes = {'evidence_type_kwd': 'table', 'table_binding_kwd': 'bound', **markers}
+    attributes['table_context_obj'] = {
+        'reliable': True, 'rows': rows, **attributes.get('table_context_obj', {}),
+    }
+    evidence = collection_from_records([record(text='原始表格', **attributes)])
+    query = make_query('2025E预付账款是多少？')
+    assessment = bind_assessment(query, evidence, decision(evidence))
+    context = pipeline.build_answer_context(query, evidence, assessment)
+    messages = pipeline.build_answer_messages(context, [])
+    reference = answer_references(messages)[0][1]
+    table = reference['table']
+    if attributes['table_binding_kwd'] == 'unbound':
+        assert table['reliable'] is False
+        assert reference['content'] == '原始表格'
+        assert 'matched_rows' not in table
+        return
+    actual = {}
+    for role in ('matched', 'context', 'unknown'):
+        for output in table[f'{role}_rows']:
+            actual[output['row_index']] = role
+            original = next(row for row in rows if row['row_index'] == output['row_index'])
+            assert [cell['value'] for cell in output['values']] == original['cells']
+    assert [actual[row['row_index']] for row in rows] == expected
+    assert '角色仅说明检索来源' in messages[0]['content']
+    assert 'content' not in reference
+    assert pipeline.answer_documents(context, evidence, assessment)[0]['content_with_weight'] == '原始表格'
 
 
-def test_calculation_and_fact_proof_survive_legacy_json_without_polluting_the_report(companies):
-    from tests.unit.test_financial_facts import expand
+def test_paired_table_preserves_duplicate_headers_empty_and_zero_without_markdown():
+    raw_rows = [{'row_index': 4, 'headers': ['指标', '2025E', '2025E'],
+                 'cells': ['预付账款', '0', ''], 'preamble': '单位：百万元'}]
+    evidence = collection_from_records([record(
+        text='| 指标 | 2025E | 2025E |', evidence_type_kwd='table', table_binding_kwd='bound',
+        table_row_int=4, table_cells_slice_obj={'caption': '预测表', 'rows': raw_rows},
+        table_semantic_text_with_weight='预测表\n单位：百万元\n指标：预付账款；2025E：0；2025E：（空白）',
+    )])
+    reference = pipeline._reference_context(evidence.get('one'), evidence.get('one').text)
+    assert 'content' not in reference
+    table = reference['table']
+    assert 'semantic_text' not in table and 'source_notes' not in table
+    values = table['matched_rows'][0]['values']
+    assert [(cell['header'], cell['value']) for cell in values] == [
+        ('指标', '预付账款'), ('2025E', '0'), ('2025E', ''),
+    ]
+    assert table['matched_rows'][0]['preamble'] == '单位：百万元'
 
-    query = make_query("B公司2022年和2023年营业收入相差多少？")
-    raw = expand([{"row_index": 3, "context": "B公司合并利润表；单位：亿元",
-                   "headers": ["指标", "B公司 / 2022A", "B公司 / 2023A"], "cells": ["营业收入", "0.1", "0.3"]}])
-    evidence = collection_from_records([raw])
-    original = verification.verify_evidence(query, evidence, require_semantic=False)
-    serialized = original.to_dict()
-    restored = bind_assessment(query, evidence, assessment_from_record(serialized))
-    serialized["derived_evidence"][0]["result"] = "999"
-    serialized["financial_fact_bundle"]["facts"][0]["value"] = "999"
-    assert restored.derived_evidence[0]["result"] == "0.2"
-    assert original.derived_evidence[0]["result"] == "0.2"
-    assert len(restored.derived_evidence[0]["input_fact_ids"]) == 2
-    assert restored.matches(query.version, evidence.version, pipeline.verification_policy_version())
-    assert pipeline.build_answer_context(query, evidence, restored) == pipeline.build_answer_context(query, evidence, original)
+
+def test_malformed_bound_table_falls_back_without_truncating_cells():
+    item = evidence_from_record(record(
+        text='保留原始表格', evidence_type_kwd='table', table_binding_kwd='bound',
+        table_cells_slice_obj={'rows': [{'headers': ['指标', '2025E'], 'cells': ['预付账款']}]},
+    ))
+    reference = pipeline._reference_context(item, item.text)
+    assert reference['content'] == '保留原始表格'
+    assert reference['table']['reliable'] is False
+    assert 'matched_rows' not in reference['table']

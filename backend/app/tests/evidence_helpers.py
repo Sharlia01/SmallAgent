@@ -1,7 +1,5 @@
 """用来源记录构造测试业务对象，避免测试依赖生产序列化的内部实现。"""
 
-from dataclasses import replace
-from tests.financial_helpers import financial_spec
 from domain.evidence import EvidenceCollection
 from agent.schemas import ToolResult
 from service.core.evidence.adapter import collection_from_records
@@ -11,21 +9,15 @@ from service.core.answering.answer_context import (
 from service.core.evidence.verification import verify_evidence
 from service.core.evidence.adapter import assessment_from_record
 from service.core.evidence.assessment import finalize_assessment
-from service.core.finance.facts import assess_financial_facts, financial_rejection
 from service.core.query.context import QueryContext
 from service.core.query.contract import QueryRequest, QueryGoal, QueryUnderstanding
 
 
 def make_query(question, goals=()):
-    return QueryContext(QueryRequest.from_user(question), QueryUnderstanding(tuple(goals), requires_evidence=False, source="rule", financial=financial_spec(question, goals)))
+    return QueryContext(QueryRequest.from_user(question), QueryUnderstanding(tuple(goals), requires_evidence=False, source="rule"))
 
 
 def bind_assessment(query, evidence, assessment, *, require_semantic=None):
-    if not assessment.query_version and not assessment.facts.applicable:
-        fact_assessment = assess_financial_facts(query.financial_requirements, evidence)
-        assessment = (financial_rejection(evidence, fact_assessment, query.goals)
-                      if fact_assessment.applicable and not fact_assessment.sufficient and assessment.sufficient
-                      else replace(assessment, facts=fact_assessment))
     if require_semantic is None:
         require_semantic = assessment.require_semantic if assessment.require_semantic is not None else True
     return finalize_assessment(query, evidence, assessment, require_semantic=require_semantic)
@@ -58,5 +50,5 @@ def messages_for_records(question, records, history, *, goals=()):
     evidence = collection_from_records(records)
     assessment = verify_evidence(query, evidence, require_semantic=False)
     if not assessment.sufficient:
-        raise ValueError("；".join(assessment.facts.missing_requirements))
+        raise ValueError("；".join(assessment.missing_requirements))
     return format_messages(build_answer_context(query, evidence, assessment), history)

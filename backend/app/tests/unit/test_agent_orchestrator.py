@@ -1,9 +1,10 @@
 """回答入口只消费循环内已核验的证据，并保留引用与原文的一致性。"""
+import json
 from types import SimpleNamespace
 import pytest
 from agent import loop
 from agent.orchestrator import AgentOrchestrator
-from tests.agent_helpers import ModelClient, SearchTool, initial, goal, records, coverage_verifier
+from tests.agent_helpers import ModelClient, SearchTool, initial, goal, task, records, coverage_verifier
 
 pytestmark = pytest.mark.unit
 
@@ -36,6 +37,31 @@ def test_final_answer_reuses_loop_assessment_without_reverification(monkeypatch)
     assert result.response_documents
     assert "每年培训一次" in result.answer_messages[-1]["content"]
     assert "events" not in result.query_runtime
+
+
+def test_answer_client_receives_document_context_for_implicit_company_subjects(monkeypatch):
+    checked = []
+    monkeypatch.setattr(loop, "verify_evidence", coverage_verifier(calls=checked))
+    question = "国电电力和华能国际2025年营业收入分别是多少？"
+    planner = ModelClient([initial(goals=[goal(question)], tasks=[task(query=question)])])
+    answer = AnswerClient()
+    sources = [
+        {"chunk_id": "gd", "doc_id": "gd-report", "docnm_kwd": "国电电力2025年年度报告.pdf",
+         "content_with_weight": "公司实现营业收入100亿元。", "page_num_int": 12},
+        {"chunk_id": "hn", "doc_id": "hn-report", "docnm_kwd": "华能国际2025年年度报告.pdf",
+         "content_with_weight": "公司实现营业收入200亿元。", "page_num_int": 15},
+    ]
+
+    result = orchestrator(planner, answer, [SearchTool([sources])]).run(session_id="s1", question=question)
+
+    assert result.response_mode == "answer" and len(checked) == len(answer.calls) == 1
+    sent = answer.calls[0]["messages"][-1]["content"]
+    references = [json.loads(line) for line in sent.splitlines() if line.startswith('{"document_id":')]
+    assert [item["document_name"] for item in references] == [source["docnm_kwd"] for source in sources]
+    assert [item["location"]["page"] for item in references] == [12, 15]
+    assert [item["content"] for item in references] == [doc["content_with_weight"] for doc in result.response_documents]
+    assert [doc["id"] for doc in result.response_documents] == [1, 2]
+    assert question in sent
 
 
 def test_missing_evidence_refuses_without_answer_generation(monkeypatch):

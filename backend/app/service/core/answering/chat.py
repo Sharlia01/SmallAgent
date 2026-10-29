@@ -13,14 +13,15 @@ from dotenv import load_dotenv
 from agent.orchestrator import AgentOrchestrator
 from agent.tools.rag_search import RagSearchTool
 from agent.tools.web_search import WebSearchTool
-from service.core.answering.streaming import read_stream_chunk as _read_stream_chunk
+from service.core.answering.streaming import close_answer_stream, read_stream_chunk as _read_stream_chunk
+from service.core.runtime.clients import agent_model
 
 load_dotenv()
 
 # 聊天回答使用的模型，以及快速解析文档的长度限制。
 # 把这些“可调整的数字”集中放在这里，后面修改时不必进入业务代码里寻找。
-CHAT_MODEL = os.getenv("CHAT_MODEL", "deepseek-v4-pro")
-AGENT_MODEL = os.getenv("AGENT_MODEL", "qwen3.7-flash-2026-07-15")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "qwen3.8-max")
+AGENT_MODEL = agent_model()
 SESSION_NAME_MAX_LENGTH = 30
 
 
@@ -33,7 +34,7 @@ def _positive_int_env(name: str, default: int, maximum: int) -> int:
     return min(value, maximum) if value > 0 else default
 
 
-AGENT_MAX_STEPS = _positive_int_env("AGENT_MAX_STEPS", 3, 10)
+AGENT_MAX_STEPS = _positive_int_env("AGENT_MAX_STEPS", 2, 10)
 CHAT_HISTORY_MAX_TURNS = _positive_int_env("CHAT_HISTORY_MAX_TURNS", 8, 20)
 CHAT_HISTORY_MAX_CHARS = _positive_int_env(
     "CHAT_HISTORY_MAX_CHARS",
@@ -226,7 +227,7 @@ def generate_recommended_questions(user_question, retrieved_content=None, sessio
                 base_url=os.getenv("DASHSCOPE_BASE_URL")
             )
         completion = client.chat.completions.create(
-            model="qwen3.7-flash-2026-07-15",
+            model=os.getenv("RECOMMENDED_QUESTIONS_MODEL", "qwen3.7-flash"),
             messages=[{"role": "user", "content": prompt}],
             response_format={"type": "json_object"},
             stream=False,
@@ -425,6 +426,7 @@ def get_chat_completion(
     :return: 逐个产生 SSE 格式字符串的生成器
     """
     request_started_at = time.perf_counter()
+    completion = None
     try:
         if user_id is None:
             raise ValueError("运行 Agent 必须提供 user_id。")
@@ -442,9 +444,9 @@ def get_chat_completion(
             session_context=quick_parse_content,
             conversation_history=conversation_history,
         )
+        completion = execution.answer_stream
         retrieved_content = execution.retrieved_content
         all_documents = execution.response_documents
-        completion = execution.answer_stream
 
         # 第二步：先把引用资料发给前端，前端可以据此展示“答案来源”。
         yield _make_sse_event("message", {"documents": all_documents})
@@ -474,10 +476,6 @@ def get_chat_completion(
             for chunk in completion:
                 stream_chunk_count += 1
                 finish_reason, answer_text, thinking_text = _read_stream_chunk(chunk)
-
-                # finish_reason 不是 None，表示模型已经停止生成。
-                if finish_reason is not None:
-                    break
 
                 if not first_output_logged and (answer_text or thinking_text):
                     first_output_logged = True
@@ -509,6 +507,13 @@ def get_chat_completion(
                             "thinking": True,
                         },
                     )
+                # 结束事件也可能携带正文，先转发内容再结束读取。
+                if finish_reason is not None:
+                    break
+
+        # 后续推荐问题可能继续调用模型，先归还当前响应占用的连接。
+        close_answer_stream(completion)
+        completion = None
 
         # 第四步：流式回答结束后，拼出完整正文和完整思考过程。
         model_answer = "".join(answer_parts)
@@ -585,3 +590,6 @@ def get_chat_completion(
                 "content": str(error),
             },
         )
+    finally:
+        # 前端可能在收到资料、部分正文或错误事件后断开，也必须释放已经打开的流。
+        close_answer_stream(completion)

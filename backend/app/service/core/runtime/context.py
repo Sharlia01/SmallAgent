@@ -30,7 +30,7 @@ class QueryBudgetExceeded(RuntimeError):
 class QueryRuntime:
     trace_id: str = field(default_factory=lambda: uuid4().hex, init=False)
     timeout_seconds: float = field(default_factory=lambda: positive_setting(
-        "RAG_QUERY_DEADLINE_SECONDS", 45,
+        "RAG_QUERY_DEADLINE_SECONDS", 120,
     ))
     max_model_calls: int = field(default_factory=lambda: int(positive_setting(
         "RAG_QUERY_MAX_MODEL_CALLS", 16, maximum=64,

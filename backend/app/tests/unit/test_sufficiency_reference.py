@@ -22,7 +22,7 @@ def table_sample(*, requirement=False):
 
 def table_chunk(identifier, binding):
     return {"chunk_id": identifier, "document_name": "报告.pdf", "content_with_weight": "收入100",
-            "evidence_type_kwd": "table", "table_cells_kwd": ["收入", "100"],
+            "evidence_type_kwd": "table", "table_cells_slice_obj": {"rows": [{"cells": ["收入", "100"]}]},
             **({"table_binding_kwd": binding} if binding is not None else {})}
 
 

@@ -14,6 +14,9 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
+from html import escape
+from domain.table_structure import STRUCTURE_VERSION, structure_attributes
+
 import logging
 import os
 import re
@@ -324,9 +327,10 @@ class TableStructureRecognizer(Recognizer):
                     tbl.pop(i)
                 rows.pop(i)
 
-        # 确定哪些行属于表头。
+        # 新 PDF 路径以检测类别为准，不再用非数字比例重判标题。
+        structured = html and any("table_structure" in box for box in boxes)
         hdset = set([])
-        for i in range(len(tbl)):
+        for i in range(len(tbl)) if not structured else []:
             cnt, h = 0, 0
             for j, arr in enumerate(tbl[i]):
                 if not arr:
@@ -343,8 +347,8 @@ class TableStructureRecognizer(Recognizer):
         if html:
             return TableStructureRecognizer.__html_table(cap, hdset,
                                                          TableStructureRecognizer.__cal_spans(boxes, rows,
-                                                                                              cols, tbl, True)
-                                                         )
+                                                                                              cols, tbl, True),
+                                                         structured=structured)
 
         return TableStructureRecognizer.__desc_table(cap, hdset,
                                                      TableStructureRecognizer.__cal_spans(boxes, rows, cols, tbl,
@@ -352,11 +356,11 @@ class TableStructureRecognizer(Recognizer):
                                                      is_english)
 
     @staticmethod
-    def __html_table(cap, hdset, tbl):
+    def __html_table(cap, hdset, tbl, structured=False):
         # 构建表格的 HTML 表示。
-        html = "<table>"
+        html = f'<table data-table-structure="{STRUCTURE_VERSION}">' if structured else "<table>"
         if cap:
-            html += f"<caption>{cap}</caption>"
+            html += f"<caption>{escape(cap)}</caption>"
         for i in range(len(tbl)):
             row = "<tr>"
             txts = []
@@ -364,7 +368,7 @@ class TableStructureRecognizer(Recognizer):
                 if arr is None:
                     continue
                 if not arr:
-                    row += "<td></td>" if i not in hdset else "<th></th>"
+                    row += '<td data-table-role="data"></td>' if structured else ("<td></td>" if i not in hdset else "<th></th>")
                     continue
                 txt = ""
                 if arr:
@@ -378,10 +382,15 @@ class TableStructureRecognizer(Recognizer):
                     sp = "colspan={}".format(arr[0]["colspan"])
                 if arr[0].get("rowspan"):
                     sp += " rowspan={}".format(arr[0]["rowspan"])
-                if i in hdset:
-                    row += f"<th {sp} >" + txt + "</th>"
+                if structured:
+                    role, attrs = structure_attributes(arr)
+                    tag = "th" if role in {"column_header", "row_group"} else "td"
+                    scope = ' scope="col"' if role == "column_header" else (' scope="rowgroup"' if role == "row_group" else "")
+                    row += f"<{tag} {sp}{attrs}{scope}>" + escape(txt) + f"</{tag}>"
+                elif i in hdset:
+                    row += f"<th {sp} >" + escape(txt) + "</th>"
                 else:
-                    row += f"<td {sp} >" + txt + "</td>"
+                    row += f"<td {sp} >" + escape(txt) + "</td>"
 
             if i in hdset:
                 if all([t in hdset for t in txts]):
@@ -521,18 +530,18 @@ class TableStructureRecognizer(Recognizer):
             for j in range(0, len(clft)):
                 if j == b["cn"]:
                     continue
-                if clft[j] + (crgt[j] - clft[j]) / 2 < b["H_left"]:
+                if clft[j] + (crgt[j] - clft[j]) / 2 < b["SP_left"]:
                     continue
-                if crgt[j] - (crgt[j] - clft[j]) / 2 > b["H_right"]:
+                if crgt[j] - (crgt[j] - clft[j]) / 2 > b["SP_right"]:
                     continue
                 b["colspan"].append(j)
             # 计算跨行数量。
             for j in range(0, len(rtop)):
                 if j == b["rn"]:
                     continue
-                if rtop[j] + (rbtm[j] - rtop[j]) / 2 < b["H_top"]:
+                if rtop[j] + (rbtm[j] - rtop[j]) / 2 < b["SP_top"]:
                     continue
-                if rbtm[j] - (rbtm[j] - rtop[j]) / 2 > b["H_bott"]:
+                if rbtm[j] - (rbtm[j] - rtop[j]) / 2 > b["SP_bott"]:
                     continue
                 b["rowspan"].append(j)
 

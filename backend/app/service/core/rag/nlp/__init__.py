@@ -256,8 +256,6 @@ def tokenize_table(tbls, doc, eng, batch_size=10):
                 slice_rows = table_chunk.cells_slice.get("rows") or []
                 if len(slice_rows) == 1:
                     row = slice_rows[0]
-                    d["table_headers_kwd"] = row.get("headers") or []
-                    d["table_cells_kwd"] = row.get("cells") or []
                     d["table_row_int"] = row.get("row_index")
                 # 同一张表的子片段共享一个内存中的父表对象；
                 # 持久化层按 table_id 只写入一次。

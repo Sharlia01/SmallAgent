@@ -10,10 +10,18 @@ import os
 import re
 import sys
 import time
+import traceback
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+
+if __name__ == "__main__":
+    from evaluation_logging import is_logging_child, run_logged_script
+
+    if not is_logging_child(__file__):
+        raise SystemExit(run_logged_script(__file__))
 
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
@@ -647,6 +655,7 @@ def main() -> int:
             latency_ms = (time.perf_counter() - query_started) * 1000
             if args.fail_fast:
                 raise
+            traceback.print_exc()
             result = build_error_case(
                 sample,
                 error=error,
