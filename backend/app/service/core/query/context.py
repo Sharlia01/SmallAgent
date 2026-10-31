@@ -49,16 +49,12 @@ class QueryContext:
             return self
         return QueryContext(self.request, self.understanding, self._resolved, tuple(sorted(goal_ids)))
 
-    def company_names(self, goal_ids=None, *, subject_refs=None) -> tuple[str, ...] | None:
-        if not self.understanding or self.understanding.entity_names is None:
-            return None
+    def subject_names(self, goal_ids=None, *, subjects=None) -> tuple[str, ...]:
+        """从query_context中取出这个任务对应的目标，然后再从目标里取出这个任务对应的主体名字"""
+        if subjects is not None:
+            return tuple(subjects)
         goals = self.goals if goal_ids is None else tuple(g for g in self.goals if g.id in goal_ids)
-        refs = {ref for g in goals for ref in g.subject_refs}
-        if subject_refs is not None:
-            if not set(subject_refs) <= refs or (refs and not subject_refs):
-                raise ValueError("任务主体必须属于目标")
-            refs = set(subject_refs)
-        return tuple(dict.fromkeys(e.mention for e in self.understanding.entities if e.ref in refs))
+        return tuple(dict.fromkeys(name for goal in goals for name in goal.subjects))
 
     @property
     def clarification(self) -> str | None:

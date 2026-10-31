@@ -1,4 +1,5 @@
 """Agent 全量集合、每次检索排名和真实回答正文不能混用。"""
+from tests.evidence_helpers import requirements_for_atoms
 import pytest
 
 from evaluation.retrieval import evaluate_retrieval_case, aggregate_agent_evidence
@@ -14,7 +15,7 @@ def chunk(identifier, text):
 
 def sample():
     return {"id": "complete", "answerable": True,
-            "relevant_evidence": [{"document_name": "报告.pdf", "text": "培训每年一次"}]}
+            "evidence_requirements": requirements_for_atoms([{"document_name": "报告.pdf", "text": "培训每年一次"}])}
 
 
 def score(raw):
@@ -74,8 +75,8 @@ def test_call_rankings_keep_independent_cutoffs_errors_and_no_vectors():
 
 
 def test_projected_answer_cannot_match_hidden_source_table_cells():
-    table_sample = {"id": "table", "answerable": True, "relevant_evidence": [
-        {"document_name": "报告.pdf", "evidence_type": "table", "row_cells": ["收入", "100"], "text": "收入100"}]}
+    table_sample = {"id": "table", "answerable": True, "evidence_requirements": requirements_for_atoms([
+        {"document_name": "报告.pdf", "type": "table_row", "row_cells": ["收入", "100"], "text": "收入100"}])}
     source = {**chunk("table", "收入100"), "table_cells_slice_obj": {"rows": [{"cells": ["收入", "100"]}]}}
     projected = {**source, "content_with_weight": "仅允许回答培训要求", "source_content_with_weight": "收入100",
                  "evidence_view": "answer_context"}
@@ -85,3 +86,25 @@ def test_projected_answer_cannot_match_hidden_source_table_cells():
     assert case["verification_evidence_metrics"]["recall"] == 1
     assert case["answer_evidence_metrics"]["recall"] == 0
     assert case["retrieval"]["chunks"][0]["source_content_with_weight"] == "收入100"
+
+
+def test_goal_support_denominator_distinguishes_unverified_and_unknown_plans():
+    from evaluation.retrieval import aggregate_query_metrics
+    def record(goals, coverage, status='completed'):
+        return {'retrieval': {'query_understanding': {'goals': [{'id': g} for g in goals]},
+                'evidence_sufficiency': {'verification_status': status, 'goal_coverage': coverage}}}
+    supported = {'goal_id': 'g1', 'status': 'supported'}
+    metrics = aggregate_query_metrics([
+        record(['g1', 'g2'], [supported]),
+        record(['g1'], [supported], 'unavailable'),
+        record(['g1'], [{'goal_id': 'g1', 'status': 'conflict'}]),
+        record(['g1'], [supported, supported]),
+        {'retrieval': {}},
+    ])
+    assert metrics['planned_goal_count'] == 5
+    assert metrics['evaluated_goal_count'] == 2
+    assert metrics['unevaluated_goal_count'] == 3
+    assert metrics['supported_goal_count'] == 1
+    assert metrics['supported_goal_rate'] == 0.5
+    assert metrics['goal_plan_unavailable_sample_count'] == 1
+    assert aggregate_query_metrics([record(['g1'], [])])['supported_goal_rate'] is None

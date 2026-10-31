@@ -123,8 +123,6 @@ def test_keyword_and_knn_use_same_prefilter_with_existing_scopes(registry, monke
 
 
 def test_company_diagnostics_survive_chat_result_format(registry):
-    diagnostic = resolve_company_hints("甲公司2023营收").to_dict()
-    _, diagnostics = retrieval.format_retrieval_results({"company_hints": diagnostic, "chunks": []})
-    assert diagnostics["company_hints"] == diagnostic
-    assert diagnostic["usage"] == "ranking_hint"
-    assert "untagged_policy" not in diagnostic
+    _, diagnostics = retrieval.format_retrieval_results({"subject_names": ["甲公司的煤电板块"], "chunks": []})
+    assert diagnostics["subject_names"] == ["甲公司的煤电板块"]
+    assert "company_hints" not in diagnostics

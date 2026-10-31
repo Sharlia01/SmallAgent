@@ -23,7 +23,9 @@ def test_runtime_metrics_use_budget_counts_and_include_failed_samples():
     assert "model_event_count" not in result
     assert "reported_total_tokens" not in result
     assert result["plan_fallback_rate"] == 1
-    assert result["repair_success_rate"] == result["route_agreement"] == 1
+    assert result["route_agreement"] == 1
+    assert result["repair_answerability_unavailable_count"] == 1
+    assert "repair_success_rate" not in result
     assert "phase_metrics" not in result
     assert "stage_metrics" not in result
 
@@ -32,7 +34,7 @@ def test_missing_runtime_metrics_are_not_reported_as_zero_cost():
     result = aggregate_query_metrics([{"retrieval": {}}])
     assert result["average_model_calls"] is None
     assert "reported_total_tokens" not in result
-    assert result["repair_success_rate"] is None
+    assert result["repair_cohorts"]["answerable"]["evidence_completion_rate"] is None
 
 
 def test_agent_repairs_count_executed_samples_and_evidence_success():
@@ -59,15 +61,17 @@ def test_agent_repairs_count_executed_samples_and_evidence_success():
     }
     result = aggregate_query_metrics(records)
     assert result["repair_count"] == 3
-    assert result["repair_success_rate"] == pytest.approx(1 / 3)
+    assert result["repair_metrics_version"] == "2.0"
+    assert "repair_success_rate" not in result
     assert result["repair_unavailable_count"] == 0
     assert result["repair_cohorts"]["answerable"] == {
         "sample_count": 4, "unavailable_count": 0, "attempt_count": 1,
-        "goals_satisfied_count": 1, "success_rate": 1,
+        "goals_satisfied_count": 1, "evidence_completion_rate": 1,
     }
     assert result["repair_cohorts"]["unanswerable"] == {
         "sample_count": 2, "unavailable_count": 0, "attempt_count": 2,
-        "goals_satisfied_count": 0, "success_rate": 0,
+        "correct_refusal_count": 0, "refusal_evaluated_count": 1,
+        "refusal_unavailable_count": 1, "correct_refusal_rate": 0,
     }
 
 
@@ -78,7 +82,7 @@ def test_invalid_agent_steps_are_unavailable_and_do_not_use_legacy(steps):
         "query_repair": {"attempted_goal_ids": ["old"], "stop_reason": "goals_satisfied"},
     }}])
     assert result["repair_count"] == 0
-    assert result["repair_success_rate"] is None
+    assert result["repair_cohorts"]["answerable"]["evidence_completion_rate"] is None
     assert result["repair_unavailable_count"] == 1
     assert result["repair_cohorts"]["answerable"]["unavailable_count"] == 1
 
@@ -90,5 +94,46 @@ def test_missing_repair_data_is_distinct_from_initial_execution_only():
         {"retrieval": {"agent_execution": {"steps": 1, "stop_reason": "evidence_ready"}}},
     ])
     assert result["repair_count"] == 0
-    assert result["repair_success_rate"] is None
+    assert result["repair_cohorts"]["answerable"]["evidence_completion_rate"] is None
     assert result["repair_unavailable_count"] == 1
+
+
+def test_unanswerable_repairs_are_successful_refusals_not_failed_completions():
+    records = [{
+        "answerable": False, "response_mode": "refuse", "outcome": "insufficient_evidence",
+        "refusal_metrics": {"correct": True, "expected_behavior": "refuse"},
+        "retrieval": {
+            "agent_execution": {"steps": 2, "stop_reason": "max_steps"},
+            "evidence_sufficiency": {"verification_status": "completed", "sufficient": False},
+        },
+    } for _ in range(2)]
+    result = aggregate_query_metrics(records)
+    assert result["repair_count"] == 2
+    assert result["repair_cohorts"]["answerable"]["evidence_completion_rate"] is None
+    refusal = result["repair_cohorts"]["unanswerable"]
+    assert refusal["correct_refusal_count"] == refusal["refusal_evaluated_count"] == 2
+    assert refusal["correct_refusal_rate"] == 1
+
+
+@pytest.mark.parametrize("failure", ["execution_error", "invalid_plan", "budget_exhausted",
+                                     "verification_failed", "fallback", "answer", "clarify"])
+def test_repair_failure_cannot_be_counted_as_correct_refusal(failure):
+    record = {
+        "answerable": False, "response_mode": "refuse", "outcome": "insufficient_evidence",
+        "refusal_metrics": {"correct": True, "expected_behavior": "refuse"},
+        "retrieval": {
+            "agent_execution": {"steps": 2, "stop_reason": "max_steps"},
+            "evidence_sufficiency": {"verification_status": "completed", "sufficient": False},
+        },
+    }
+    if failure in {"execution_error", "invalid_plan"}:
+        record["outcome"] = failure
+    elif failure in {"budget_exhausted", "verification_failed"}:
+        record["retrieval"]["agent_execution"]["stop_reason"] = failure
+    elif failure == "fallback":
+        record["retrieval"]["evidence_sufficiency"]["source"] = failure
+    else:
+        record["response_mode"] = failure
+    refusal = aggregate_query_metrics([record])["repair_cohorts"]["unanswerable"]
+    assert refusal["refusal_evaluated_count"] == 1
+    assert refusal["correct_refusal_rate"] == 0

@@ -52,3 +52,9 @@ def messages_for_records(question, records, history, *, goals=()):
     if not assessment.sufficient:
         raise ValueError("；".join(assessment.missing_requirements))
     return format_messages(build_answer_context(query, evidence, assessment), history)
+
+
+def requirements_for_atoms(atoms):
+    """测试中将独立必需证据写成统一要求；替代来源应显式使用 alternatives。"""
+    return [{"id": f"requirement_{index}", "alternatives": [[{"type": "text", **atom}]]}
+            for index, atom in enumerate(atoms, start=1)]

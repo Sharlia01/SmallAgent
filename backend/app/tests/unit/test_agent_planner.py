@@ -11,6 +11,18 @@ from tests.agent_helpers import ModelClient, SearchTool, initial, task, goal
 pytestmark = pytest.mark.unit
 
 
+@pytest.mark.parametrize("value", [0, 21, True, "10", 1.5])
+def test_task_top_k_rejects_invalid_explicit_values(value):
+    with pytest.raises(QueryValidationError):
+        decode_plan({"tasks": [task(top_k=value)]})
+
+
+def test_missing_and_null_top_k_preserve_default_intent():
+    assert decode_plan({"tasks": [task()]}).tasks[0].top_k is None
+    assert decode_plan({"tasks": [task(top_k=None)]}).tasks[0].top_k is None
+    assert decode_plan({"tasks": [task(top_k=5)]}).tasks[0].top_k == 5
+
+
 def planner(client):
     return AgentPlanner(client=client, model="test", tool_definitions=[{
         "function": {"name": "search_knowledge_base", "description": "知识库"}}])
@@ -177,7 +189,8 @@ def test_replan_query_does_not_have_to_repeat_goal_constraints():
     context.understanding = QueryUnderstanding((QueryGoal("g1", context.question, constraints=("A公司", "2023年")),))
     previous = (AgentTask("s1", query=context.question, goal_ids=("g1",)),)
     plan = decode_plan({"tasks": [task(id="s2", query="2023年员工培训要求")]})
-    assert validate_plan(plan, context, {"search_knowledge_base"}, previous=previous) is plan
+    plan = validate_plan(plan, context, {"search_knowledge_base"}, previous=previous)
+    assert all(node.subjects is not None for node in plan.tasks)
 
 
 def test_model_cannot_supply_tenant_or_server_context():
@@ -189,8 +202,7 @@ def test_model_cannot_supply_tenant_or_server_context():
 def test_colloquial_goal_keeps_original_provenance():
     question = "国电电力未来三年能赚多少？"
     payload = initial(goals=[{"id": "g1", "text": "国电电力未来三年盈利预测", "constraints": ["国电电力", "未来三年"],
-                              "source_spans": [question], "subject_refs": ["e1"]}], tasks=[task(query="国电电力未来三年盈利预测")],
-                      entities=[dict(ref="e1", mention="国电电力", source_quote=question)])
+                              "source_spans": [question], "subjects": ["国电电力"]}], tasks=[task(query="国电电力未来三年盈利预测")])
     context = prepare_query_context(question)
     decision = planner(ModelClient([payload])).analyze_and_plan(context)
     assert decision.understanding.goals[0].text == "国电电力未来三年盈利预测"
@@ -234,7 +246,8 @@ def test_document_scope_is_not_inferred_from_goal_keywords(inherit, constraint):
         task(id="s2", query="", query_template="{company}评级", goal_ids=("g2",),
              depends_on=["s1"], required_slots=["company"], inherit_document_scope=inherit),
     ]})
-    assert validate_plan(plan, context, {"search_knowledge_base"}, initial=True) is plan
+    plan = validate_plan(plan, context, {"search_knowledge_base"}, initial=True)
+    assert all(node.subjects is not None for node in plan.tasks)
     assert plan.tasks[1].inherit_document_scope is inherit
 
 
@@ -254,19 +267,21 @@ def test_source_choice_is_not_rejected_by_constraint_keywords(constraint):
     context = prepare_query_context("研报观点")
     context.understanding = QueryUnderstanding((QueryGoal("g1", "研报观点", constraints=(constraint,)),))
     plan = decode_plan({"tasks": [task(tool="search_web", query="公开研报观点")]})
-    assert validate_plan(plan, context, {"search_web"}, initial=True) is plan
+    plan = validate_plan(plan, context, {"search_web"}, initial=True)
+    assert all(node.subjects is not None for node in plan.tasks)
 
 
 @pytest.mark.parametrize("separate_subjects", [False, True])
 def test_same_query_tasks_are_diagnostic_only(caplog, separate_subjects):
     context = prepare_query_context("比较两家公司营业收入")
-    context.understanding = QueryUnderstanding((QueryGoal("g1", context.question, subject_refs=("e1", "e2")),))
+    context.understanding = QueryUnderstanding((QueryGoal("g1", context.question, subjects=("甲公司", "乙公司")),))
     plan = decode_plan({"tasks": [
-        task(query="营业收入", subject_refs=["e1"]),
-        task(id="s2", query="营业收入", subject_refs=["e2"] if separate_subjects else ["e1"]),
+        task(query="营业收入", subjects=["甲公司"]),
+        task(id="s2", query="营业收入", subjects=["乙公司"] if separate_subjects else ["甲公司"]),
     ]})
     with caplog.at_level("INFO", logger="agent.plans"):
-        assert validate_plan(plan, context, {"search_knowledge_base"}, initial=True) is plan
+        plan = validate_plan(plan, context, {"search_knowledge_base"}, initial=True)
+        assert all(node.subjects is not None for node in plan.tasks)
     assert len(plan.tasks) == 2
     assert "duplicate_task: task_id=s2 similar_task_id=s1" in caplog.text
 
@@ -278,7 +293,8 @@ def test_goal_without_search_task_is_diagnostic_only(caplog, empty):
                                                QueryGoal("g2", "计算差额", depends_on=("g1",))))
     plan = decode_plan({"tasks": [] if empty else [task(query="收入")]})
     with caplog.at_level("INFO", logger="agent.plans"):
-        assert validate_plan(plan, context, {"search_knowledge_base"}, initial=True) is plan
+        plan = validate_plan(plan, context, {"search_knowledge_base"}, initial=True)
+        assert all(node.subjects is not None for node in plan.tasks)
     assert "goal_coverage_mismatch" in caplog.text and "g2" in caplog.text
     assert len(context.goals) == 2
 
@@ -312,3 +328,45 @@ def test_unused_answer_slots_are_removed_without_model_retry():
     assert result.tasks[0].output_slot is None
     assert result.tasks[0].query == "员工培训要求 完整内容"
     assert len(client.calls) == 2
+
+
+def test_subject_output_must_use_goal_slot_name():
+    context = prepare_query_context("查推荐公司")
+    context.understanding = QueryUnderstanding((QueryGoal("g1", context.question, subject_slot="company"),))
+    plan = decode_plan({"tasks": [task(query="推荐公司", output_slot="selected_company")]})
+    with pytest.raises(QueryValidationError, match="subject_without_producer"):
+        validate_plan(plan, context, {"search_knowledge_base"})
+
+
+def test_consumer_cannot_use_two_same_named_parent_outputs():
+    from agent.plans import validate_dependency_graph
+    plan = decode_plan({"tasks": [
+        task(id="first", query="推荐公司", output_slot="company"),
+        task(id="retry", query="推荐公司完整报告", output_slot="company"),
+        task(id="use", query="", query_template="{company}收入", required_slots=["company"],
+             depends_on=["first", "retry"]),
+    ]})
+    with pytest.raises(QueryValidationError, match="ambiguous_slot_producer"):
+        validate_dependency_graph(list(plan.tasks))
+
+
+def test_non_subject_bridge_output_is_preserved_when_consumed():
+    context = prepare_query_context("查甲公司评级及该评级定义")
+    context.understanding = QueryUnderstanding((QueryGoal("g1", context.question, subjects=("甲公司",)),))
+    plan = decode_plan({"tasks": [task(query="甲公司评级", output_slot="rating"),
+        task(id="definition", query="", query_template="{rating}评级定义", required_slots=["rating"], depends_on=["s1"])]})
+    result = validate_plan(plan, context, {"search_knowledge_base"})
+    assert result.tasks[0].output_slot == "rating"
+    assert context.goals[0].subject_slot is None
+
+
+def test_same_named_outputs_are_resolved_by_each_consumers_dependencies():
+    from agent.plans import validate_dependency_graph
+    plan = decode_plan({"tasks": [
+        task(id="first", query="推荐公司", output_slot="company"),
+        task(id="old_use", query="", query_template="{company}公告", required_slots=["company"], depends_on=["first"]),
+        task(id="retry", query="推荐公司完整报告", output_slot="company"),
+        task(id="new_use", query="", query_template="{company}收入", required_slots=["company"], depends_on=["retry"]),
+    ]})
+    waves = validate_dependency_graph(list(plan.tasks))
+    assert [[node.id for node in wave] for wave in waves] == [["first", "retry"], ["old_use", "new_use"]]

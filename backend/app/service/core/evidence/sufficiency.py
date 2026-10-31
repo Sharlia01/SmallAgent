@@ -63,7 +63,7 @@ EVIDENCE_SUFFICIENCY_SYSTEM_PROMPT = """
   "missing_requirements": ["证据中缺失的具体要求"]
 }
 
-sufficient 为 true 时，missing_requirements 必须为空数组。索引从 1 开始，只列出真正支持回答的片段。确认主体、期间、单位或桥接关系所依赖的上下文片段也属于支持证据；有目标时必须归入相应目标的 supporting_chunk_indices，无目标时列入顶层 supporting_chunk_indices，以便回答模型完整理解依据。
+sufficient 为 true 时，missing_requirements 必须为空数组。索引从 1 开始，只列出真正支持回答的片段。确认主体、期间、单位或桥接关系所依赖的上下文片段也属于支持证据；同时列入顶层 supporting_chunk_indices；若支持原目标，也归入相应目标的 supporting_chunk_indices，以便回答模型完整理解依据。
 输出简洁要求：
 - reason 只用一句话，尽量不超过60字符；不复述问题、不抄录证据原文或已支持的数值，不逐项重述 missing_requirements 或 goal_coverage。充分时简述覆盖情况；不充分时点明关键缺口类型；存在冲突或口径歧义时保留关键区别，不使用掩盖差异的固定套话。
 - missing_requirements 每项尽量控制在160字符以内，直接描述缺少什么，省略“候选证据未提供”等套话；同一缺口不要重复列出。保留主体、期间、指标、口径和否定条件。完整性优先，不要为缩短文字省略必要限定，也不要用 reason 代替具体缺口。
@@ -183,8 +183,6 @@ def _parse_goal_coverage(
                 for item in raw_coverage]
     if {item["goal_id"] for item in coverage} != expected:
         raise ValueError("duplicate or missing evidence goal id")
-    if sufficient and any(item["status"] != "supported" for item in coverage):
-        raise ValueError("sufficiency disagrees with goal coverage")
     return coverage
 
 
@@ -206,7 +204,31 @@ def _parse_assessment(
     missing = _parse_missing_requirements(payload.get("missing_requirements"), sufficient=sufficient)
     coverage = _parse_goal_coverage(payload.get("goal_coverage"), goals=goals, sufficient=sufficient,
                                     chunk_count=chunk_count, chunk_ids=chunk_ids)
-    if goals:
+    scope = payload.get("answer_scope", "")
+    notes = payload.get("answer_notes", [])
+    corrections = payload.get("planning_corrections", [])
+    if not isinstance(scope, str) or not isinstance(notes, list) or not all(isinstance(n, str) and n.strip() for n in notes):
+        raise ValueError("invalid answer scope or notes")
+    if not isinstance(corrections, list):
+        raise ValueError("invalid planning corrections")
+    corrected = set()
+    expected = {goal.id for goal in goals}
+    for correction in corrections:
+        if (not isinstance(correction, dict) or correction.get("goal_id") not in expected
+                or correction["goal_id"] in corrected
+                or not isinstance(correction.get("reason"), str) or not correction["reason"].strip()):
+            raise ValueError("invalid planning correction goal or reason")
+        corrected.add(correction["goal_id"])
+    if corrections and (not scope.strip() or not notes):
+        raise ValueError("planning corrections require answer scope and notes")
+    if sufficient:
+        for item in coverage:
+            if item["status"] != "supported" and not (scope.strip() and item["status"] == "missing" and item["goal_id"] in corrected):
+                raise ValueError("sufficiency disagrees with goal coverage")
+    if scope.strip():
+        # 整题引用独立于原目标诊断；明确支持原问题的证据不能因错误目标而丢失。
+        indices = _parse_supporting_indices(payload.get("supporting_chunk_indices"), chunk_count=chunk_count)
+    elif goals:
         # 逐目标引用是唯一来源；包括缺失/冲突目标的部分证据，按送审顺序汇总。
         # 兼容旧响应携带的顶层字段，但不让它覆盖或扩充逐目标判定。
         supported_ids = {identifier for item in coverage for identifier in item["supporting_chunk_ids"]}
@@ -219,6 +241,7 @@ def _parse_assessment(
         sufficient=sufficient, reason=reason, missing_requirements=missing,
         supporting_chunk_indices=indices, source="model", evaluated_chunk_count=chunk_count,
         evaluated_chunk_ids=chunk_ids, goal_coverage=coverage,
+        answer_scope=scope.strip(), answer_notes=notes, planning_corrections=corrections,
     )
 
 
@@ -265,7 +288,7 @@ def _goal_order(candidates, evidence, goals):
     ) for item in candidates}
     queues = []
     for goal in goals:
-        terms = _selection_terms(" ".join((goal.text, *goal.constraints, *goal.candidate_locators)))
+        terms = _selection_terms(" ".join((goal.text, *goal.constraints)))
         queues.append(iter(sorted(candidates, key=lambda item: -len(terms & texts[item.evidence.id]))))
     ordered, seen = [], set()
     while len(seen) < len(candidates):
@@ -462,12 +485,26 @@ def _build_model_messages(
         system_prompt += (
             '\n必须逐个评估goals，并返回goal_coverage数组，每项为'
             '{"goal_id":"目标id","status":"supported|missing|conflict","supporting_chunk_indices":[1]}。'
-            '不要输出顶层 supporting_chunk_indices，整体支持索引由程序汇总。'
+            '同时返回顶层 supporting_chunk_indices，指出直接支持原问题回答范围的证据。'
             'missing 或 conflict 目标已有的部分证据也应列入该目标的支持索引。'
-            '只有全部目标均supported且各有证据才能sufficient=true。'
+            '目标状态必须忠于原目标，不得把合并数据说成支持各分项。'
         )
     else:
         system_prompt += '\n无目标模式：必须额外返回顶层 supporting_chunk_indices 数组，如 [1,2]；不返回 goal_coverage。'
+    system_prompt += (
+        '\n原问题 question 是需求依据，goals 是可能遗漏、过度拆分或改变口径的规划草案。'
+        '先结合原问题和证据确认需求，再判断能否完整回答；不得为了放行删掉用户明确要求。'
+        '新增必填字段：answer_scope（本次可支持的回答范围，字符串），answer_notes（回答必须说明的口径或限制，字符串数组），'
+        'planning_corrections（数组，每项为 {"goal_id":"原目标ID","reason":"该目标如何偏离原问题及纠正依据"}）。无修正时返回空数组。'
+        'answer_scope、answer_notes和planning_corrections仅描述需求、口径、限制和解释偏差，不抄录证据金额、不计算结果；具体取数由回答模型从原始证据完成。'
+        'sufficient 表示原问题是否可完整回答，不是原目标是否全部被满足；missing_requirements 只列用户原问题真正缺少的依据。'
+        '若因规划过度拆分导致目标missing，但原问题可按证据中同名合并指标完整回答，允许sufficient=true；'
+        '必须逐个说明这些missing目标的规划偏差，给出answer_scope、answer_notes及顶层支持引用。证据本身的conflict不能靠改目标绕过。'
+        '例如问题问两个年份的“长期借款及应付债券”，原表为同名合并行且用户未要求拆分，'
+        '可按两个年份的合并金额回答，并要求说明该表未分别列示两科目金额；不得将合计冒充任一分项。'
+        '若用户明确要求两个科目各自金额或不要合计，则合并数据不足，仍须sufficient=false；部分相关信息不能冒充完整回答。'
+        '合并行表述仅是示例，不得套用于其他明确并列需求。只有无需纠正的原目标才按原意核验。'
+    )
     payload = {
         "question": question,
         **build_verification_evidence((item.evidence, item.text) for item in evidence),
@@ -478,10 +515,8 @@ def _build_model_messages(
             '\n本次为补查缺口核验：question 是完整原问题，goals 仅是本次待核验目标。'
             'retained_goals 是上一轮已支持的关联目标及证据引用；关联原文仍在 candidate_evidence 中。'
             '保留全部主体、期间、口径及依赖约束，只对 goals 输出 goal_coverage；'
-            'sufficient 仅表示本次 goals 是否全部满足，不表示完整问题已满足。'
-            '不得盲信旧结论：若新材料与 retained_goals 矛盾、使其依据失效或无法确认继承，'
-            '在 recheck_goal_ids 列出对应旧目标 ID，交由完整核验重新判断。'
-            '必须返回 recheck_goal_ids 数组，无需重审时返回 []。'
+            '结合retained_goals及其原文判断完整question是否满足；sufficient仍表示整题可回答。'
+
         )
         indices = {item.evidence.id: index for index, item in enumerate(evidence, 1)}
         payload["retained_goals"] = [
@@ -523,12 +558,6 @@ def _parse_model_completion(
             payload, chunk_count=len(evidence),
             chunk_ids=[item.evidence.id for item in evidence], goals=goals,
         )
-        if gap_context is not None:
-            recheck = payload.get("recheck_goal_ids")
-            allowed = {item["goal_id"] for item in gap_context["retained_goals"]}
-            if not isinstance(recheck, list) or any(not isinstance(item, str) or item not in allowed for item in recheck):
-                raise ValueError("invalid recheck_goal_ids")
-            assessment = replace(assessment, diagnostics={"recheck_goal_ids": list(dict.fromkeys(recheck))})
         return assessment
     return parse_and_validate(
         content, parse=lambda _: json.loads(_response_content(completion)), validate=validate,

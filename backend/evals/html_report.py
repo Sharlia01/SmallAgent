@@ -14,9 +14,7 @@ SCORES = (
     ("正确性", "answer_metrics", "correctness_score"),
     ("完整性", "answer_metrics", "completeness_score"),
     ("忠实度", "faithfulness_metrics", "faithfulness_score"),
-    ("引用有效性", "citation_metrics", "citation_validity"),
-    ("引用精确率", "citation_metrics", "citation_precision"),
-    ("引用召回率", "citation_metrics", "citation_recall"),
+    ("有效引用覆盖率", "citation_metrics", "citation_recall"),
 )
 
 
@@ -36,10 +34,15 @@ def _issues(result: dict[str, Any]) -> list[str]:
     issues = []
     if result.get("error"):
         issues.append(f"执行失败：{result['error']}")
+    if result.get("outcome") in {"execution_error", "invalid_plan", "unsupported_capability", "calculation_error"}:
+        issues.append(f"执行未完成：{result['outcome']}")
     for label, section in (("答案", "answer_metrics"), ("忠实度", "faithfulness_metrics"), ("引用", "citation_metrics")):
         metrics = result.get(section) or {}
         if metrics.get("judge_error"):
             issues.append(f"{label}评分失败：{metrics['judge_error']}")
+    assessment = (result.get("retrieval") or {}).get("evidence_sufficiency") or {}
+    if assessment.get("failure_kind"):
+        issues.append(f"核验异常：{assessment['failure_kind']}；{assessment.get('failure') or assessment.get('reason') or ''}")
     answer = result.get("answer_metrics") or {}
     if any(_number(answer.get(key)) and answer[key] < 1 for key in ("correctness_score", "completeness_score")):
         issues.append("答案未获满分：" + str(answer.get("judge_reason") or "未记录评分理由"))
@@ -52,7 +55,7 @@ def _issues(result: dict[str, Any]) -> list[str]:
     if citation.get("invalid_citation_ids"):
         issues.append(f"引用编号无效：{citation['invalid_citation_ids']}")
     for claim in citation.get("claims") or []:
-        if claim.get("requires_citation") and (not claim.get("valid_citation_ids") or claim.get("supported") is False):
+        if claim.get("requires_citation") and (not claim.get("effective_citation_ids", claim.get("valid_citation_ids")) or claim.get("supported") is False):
             issues.append(f"引用缺失或不支持主张：{claim.get('text', '')}；{claim.get('judge_reason') or '未记录理由'}")
     if any(_number(citation.get(key)) and citation[key] < 1 for key in ("citation_validity", "citation_precision", "citation_recall")) and not any(item.startswith("引用编号") or item.startswith("引用缺失") for item in issues):
         issues.append("引用评分未获满分，未记录具体理由。")
@@ -73,15 +76,20 @@ def render_html_report(results: list[dict[str, Any]], summary: dict[str, Any]) -
         issues = _issues(result)
         attention_count += bool(issues)
         scores = []
+        not_applicable = result.get("response_mode") in {"refuse", "clarify"}
         for label, section, key in SCORES:
             value = (result.get(section) or {}).get(key)
             tone = "missing" if not _number(value) else "good" if value == 1 else "bad"
-            scores.append(f'<span class="score {tone}">{label} <b>{_percent(value)}</b></span>')
+            display = "不适用" if not_applicable and not _number(value) and not (result.get(section) or {}).get("judge_error") else _percent(value)
+            scores.append(f'<span class="score {tone}">{label} <b>{display}</b></span>')
         behavior = (result.get("refusal_metrics") or {}).get("correct")
         if isinstance(behavior, bool):
             scores.append(f'<span class="score {"good" if behavior else "bad"}">回答行为 <b>{"符合预期" if behavior else "不符合预期"}</b></span>')
-        missing = any(not _number((result.get(section) or {}).get(key)) for _, section, key in SCORES)
-        status = "需关注" if issues else "部分指标未评分" if missing else "已评分，未发现异常"
+        missing = not not_applicable and any(not _number((result.get(section) or {}).get(key)) for _, section, key in SCORES)
+        status = ("需关注" if issues else "拒答符合预期；答案质量指标不适用"
+                  if result.get("response_mode") == "refuse" and behavior is True
+                  else "澄清符合预期；答案质量指标不适用" if result.get("response_mode") == "clarify" and behavior is True
+                  else "回答行为未评分" if not_applicable else "部分指标未评分" if missing else "已评分，未发现异常")
         reason = '<ul>' + ''.join(f'<li>{_text(item)}</li>' for item in issues) + '</ul>' if issues else '<p>未记录失败原因。未评分指标不代表通过。</p>'
         latency = (result.get("latency_ms") or {}).get("total")
         timing = f" · {latency / 1000:.2f} 秒" if _number(latency) else ""
@@ -91,15 +99,41 @@ def render_html_report(results: list[dict[str, Any]], summary: dict[str, Any]) -
 <div class="answers"><section><h3>参考答案</h3><div class="answer">{_text(result.get('reference_answer')) or '未提供'}</div></section><section><h3>实际答案</h3><div class="answer">{_text(result.get('answer')) or '未生成答案'}</div></section></div>
 <section class="reasons"><h3>失败原因 / 需关注项</h3>{reason}</section></article>''')
     overall = (summary.get("metrics") or {}).get("overall") or {}
-    overview = [('题目数', str(len(results))), ('需关注', str(attention_count)), ('答案正确性', _percent(overall.get('answer_correctness'))), ('答案完整性', _percent(overall.get('answer_completeness'))), ('忠实度', _percent(overall.get('faithfulness'))), ('忠实度评分覆盖率', _percent(overall.get('faithfulness_coverage')))]
+    def scored(key):
+        counts = (overall.get("scoring") or {}).get(key)
+        suffix = f"（{counts['evaluated_count']}/{counts['applicable_count']}）" if counts else ""
+        return _percent(overall.get(key)) + suffix
+    refusal = overall.get("refusal_metrics") or {}
+    failures = overall.get("execution_failure_count")
+    if failures is None:
+        failures = sum(bool(row.get("error")) or row.get("outcome") in {
+            "execution_error", "invalid_plan", "unsupported_capability", "calculation_error"} for row in results)
+    latency = overall.get("average_total_latency_ms")
+    overview = [('题目数', str(len(results))), ('需关注', str(attention_count)),
+                ('答案正确性', scored('answer_correctness')), ('答案完整性', scored('answer_completeness')),
+                ('忠实度', scored('faithfulness')), ('有效引用覆盖率', scored('citation_recall')),
+                ('不当作答率', _percent(refusal.get('unsafe_answer_rate'))),
+                ('过度拒答率', _percent(refusal.get('over_refusal_rate'))),
+                ('执行故障数', str(failures)), ('平均耗时', f'{latency / 1000:.2f} 秒' if _number(latency) else '未记录')]
+    diagnostics = overall.get("diagnostics") or {key: overall[key] for key in (
+        "query_metrics", "verification_evidence_metrics", "answer_evidence_metrics",
+        "retrieval_call_metrics", "gate_metrics", "sufficiency_metrics") if key in overall}
+    diagnostic_html = ('<details class="case"><summary>过程诊断（按需展开）</summary><p>单次搜索按整题标准评分，不代表子任务成功率。调用次数仅为已记录的运行计数。目标支持率仅表示已核验的规划目标中获得支持的比例，不代表原问题需求全部覆盖；请同时查看规划目标数、已核验数和未核验数。</p><pre style="white-space:pre-wrap;overflow-wrap:anywhere">'
+                       + _text(json.dumps(diagnostics, ensure_ascii=False, indent=2)) + '</pre></details>') if diagnostics else ''
     tiles = ''.join(f'<div class="tile"><span>{label}</span><strong>{value}</strong></div>' for label, value in overview)
     name = _text(summary.get('run_name') or '端到端评测')
+    status = summary.get("status")
+    run_notice = ""
+    if status and status != "completed":
+        expected = (summary.get("dataset") or {}).get("selected_sample_count", "未知")
+        run_notice = (f'<p class="note">未完成评测快照：阶段 {_text(status)}；已保存 {len(results)}/{_text(expected)} 题。'
+                      '指标仅覆盖当前已保存记录，不能视为完整评测结果。</p>')
     return '''<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>''' + name + ''' · 评测报告</title><style>
 :root{color-scheme:light;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif;color:#203047;background:#f3f5f9}*{box-sizing:border-box}body{margin:0}main{max-width:1180px;margin:auto;padding:40px 24px}header{margin-bottom:28px}h1{font-size:30px;margin:10px 0;overflow-wrap:anywhere}.eyebrow{color:#4263a1;font-weight:650;font-size:13px;letter-spacing:.12em}.subtitle,.note{color:#657388;line-height:1.7;font-size:14px}.overview{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin:24px 0}.tile{background:white;border:1px solid #e1e6ef;border-radius:12px;padding:18px}.tile span{display:block;color:#657388;font-size:12px}.tile strong{display:block;font-size:25px;margin-top:10px}.toolbar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:24px 0}input,select{font:inherit;border:1px solid #ccd5e2;border-radius:8px;padding:11px;background:white}input{flex:1;min-width:220px}#count{font-size:13px;color:#657388}.case{background:white;border:1px solid #e1e6ef;border-radius:14px;padding:24px;margin-bottom:20px;box-shadow:0 3px 12px #20304704}.case-meta{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;font-size:12px;color:#657388}h2{font-size:19px;line-height:1.6;margin:16px 0}h3{font-size:13px;color:#657388;margin:0 0 12px}.scores{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0}.score,.status{border-radius:6px;padding:6px 9px;font-size:12px}.score b{margin-left:5px}.good{color:#14674b;background:#eaf7f0}.bad{color:#a33c34;background:#fff0eb}.missing{color:#677080;background:#eef1f5}.answers{display:grid;grid-template-columns:1fr 1fr;gap:16px}.answers section{background:#f7f9fc;border-radius:10px;padding:18px}.answer{white-space:pre-wrap;overflow-wrap:anywhere;font-size:14px;line-height:1.85}.reasons{border-top:1px solid #e7ebf2;margin-top:20px;padding-top:18px;font-size:13px;line-height:1.8;overflow-wrap:anywhere}.reasons p{color:#657388;margin:0}.reasons ul{margin:0;padding-left:20px;color:#a33c34}[hidden]{display:none!important}#empty{padding:30px;text-align:center;color:#657388}@media(max-width:850px){.overview{grid-template-columns:repeat(3,1fr)}}@media(max-width:600px){main{padding:24px 14px}.overview{grid-template-columns:repeat(2,1fr)}.answers{grid-template-columns:1fr}.case{padding:18px}h1{font-size:24px}}@media print{.toolbar{display:none}.case{break-inside:avoid;box-shadow:none}body{background:white}main{padding:0}}
-</style></head><body><main><header><div class="eyebrow">AGENTIC RAG · 评测报告</div><h1>''' + name + '''</h1><p class="subtitle">问题、答案与主要评分。详细检索记录保存在同名 JSONL 原始文件中。</p></header>
-<div class="overview">''' + tiles + '''</div><p class="note">分数按百分比展示；低于满分列为需关注。未评分表示未执行、不适用或评分失败，不计作零分。答案中的引用标记保留原样。</p>
+</style></head><body><main><header><div class="eyebrow">AGENTIC RAG · 评测报告</div><h1>''' + name + '''</h1><p class="subtitle">问题、答案与主要评分。完整证据和执行轨迹保存在对应评测数据文件中。</p></header>
+''' + run_notice + '''<div class="overview">''' + tiles + '''</div><p class="note">分数后的计数为有效评分题数/适用题数。未评分不计作零分；纯拒答和澄清的答案质量指标不适用。错误引用及编号仍在逐题问题中显示。</p>''' + diagnostic_html + '''
 <div class="toolbar"><input id="search" type="search" aria-label="搜索题目、答案或失败原因" placeholder="搜索题目、答案或失败原因"><select id="filter" aria-label="筛选题目"><option value="all">全部题目</option><option value="attention">只看需关注</option></select><span id="count" aria-live="polite"></span></div>
 <div id="cases">''' + ''.join(cards) + '''</div><p id="empty" hidden>没有匹配的题目。</p>
 </main><script>
@@ -109,9 +143,21 @@ search.addEventListener('input',update);filter.addEventListener('change',update)
 </script></body></html>'''
 
 
+def load_report_data(path: Path, summary_path: Path | None = None) -> tuple[list, dict]:
+    """读取完整 JSON；旧 JSONL + summary 格式继续可用于生成历史报告。"""
+    if path.suffix.lower() == ".json":
+        artifact = json.loads(path.read_text(encoding="utf-8"))
+        if artifact.get("artifact_schema_version") != "1.0":
+            raise ValueError("不支持的完整评测文件版本")
+        return artifact["results"], {**artifact["run"], "config": artifact["config"], "metrics": artifact["summary"]}
+    results = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    summary_path = summary_path or path.with_name(path.stem + "_summary.json")
+    return results, json.loads(summary_path.read_text(encoding="utf-8"))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("results", type=Path, help="Saved E2E JSONL file")
+    parser.add_argument("results", type=Path, help="完整评测 JSON，或旧版 JSONL")
     parser.add_argument("--summary", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--overwrite", action="store_true")
@@ -122,8 +168,7 @@ def main() -> None:
         parser.error("HTML output must not overwrite the source results or summary")
     if output_path.exists() and not args.overwrite:
         parser.error("HTML report already exists; use --overwrite to replace it")
-    results = [json.loads(line) for line in args.results.read_text(encoding="utf-8").splitlines() if line.strip()]
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    results, summary = load_report_data(args.results, args.summary)
     output_path.write_text(render_html_report(results, summary), encoding="utf-8")
     print(f"HTML report: {output_path.resolve()}")
 

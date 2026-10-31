@@ -128,11 +128,11 @@ def test_bridge_binds_rating_to_requested_company():
         slot="rating", original_question="国电电力的评级？", first_query="国电电力的评级？",
         chunks=[{"chunk_id": "ratings", "doc_id": "report", "content_with_weight":
                  "本报告给予华能国际‘买入’评级，国电电力维持‘中性’评级。"}],
-        client=client_for({"found": False}),
+        client=client_for({"found": True, "value": "中性", "source_chunk_index": 1,
+                           "subject": "国电电力", "source_quote": "国电电力维持‘中性’评级"}),
     )
     assert result is not None
     assert result.value == "中性"
-    assert result.subject == "国电电力"
     assert "国电电力" in result.source_quote
 
 

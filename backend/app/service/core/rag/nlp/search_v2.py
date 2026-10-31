@@ -28,9 +28,6 @@ from service.core.evidence.metadata import (
 from domain.table_retrieval import TableCandidate
 from service.core.evidence.table_retrieval_adapter import candidate_record
 from service.core.retrieval.table_candidates import group_table_candidates, select_candidate_ids
-from service.core.retrieval.entities import (
-    CompanyHints, resolve_company_hints,
-)
 
 from service.core.rag.settings import TAG_FLD, PAGERANK_FLD
 from service.core.rag.utils import rmSpace
@@ -197,7 +194,7 @@ class Dealer:
             default_factory=lambda: {PAGERANK_FLD: 10}
         )
         kb_ids: list[str] | None = None
-        company_hints: CompanyHints | None = None
+        subject_names: tuple[str, ...] | None = None
 
         def __post_init__(self):
             positive_fields = {
@@ -736,7 +733,7 @@ class Dealer:
         request = {
             "question": question,
             "keyword_question": keyword_question or question,
-            "company_hints": options.company_hints or resolve_company_hints(question),
+            "subject_names": options.subject_names,
             "kb_ids": options.kb_ids,
             "doc_ids": options.doc_ids,
             # 每一路先独立召回候选，再由 RRF 截断后进入语义重排。
@@ -790,12 +787,6 @@ class Dealer:
             semantic_scores = np.ones(len(search_result.candidate_ids), dtype=float)
 
         compatibility_by_id = {}
-        company_hints = options.company_hints
-        entity_names = (
-            company_hints.entity_names
-            if company_hints is not None and company_hints.source == "model_understanding"
-            else None
-        )
         for chunk_id in search_result.candidate_ids:
             source = search_result.candidate_fields[chunk_id]
             content = ranking_text(source)
@@ -804,7 +795,7 @@ class Dealer:
                 question,
                 str(content),
                 document_name=str(source.get("docnm_kwd", "")),
-                entity_names=entity_names,
+                entity_names=(),  # 主体语义交给重排与核验模型，不用名称规则裁决。
             )
             compatibility_by_id[chunk_id] = decision.to_dict()
         search_result.constraint_compatibility = compatibility_by_id
@@ -1047,6 +1038,13 @@ class Dealer:
         keyword_question: str | None = None,
     ):
 
+        # 主体作为自然语言上下文进入召回和重排，不作身份过滤。
+        if options.subject_names:
+            subjects = "；".join(options.subject_names)
+            question = f"{question}\n查询主体：{subjects}"
+            if keyword_question:
+                keyword_question = f"{keyword_question}\n查询主体：{subjects}"
+
         #根据用户问题和检索配置，生成一份搜索请求参数
         request = self._build_search_request(
             question,
@@ -1084,9 +1082,9 @@ class Dealer:
             "initial_retrieval": round(initial_retrieval_ms, 3),
             "rerank": round(rerank_ms, 3),
         }
-        scope = request.get("company_hints")
+        scope = request.get("subject_names")
         if scope is not None:
-            result["company_hints"] = scope.to_dict()
+            result["subject_names"] = list(scope)
         return result
 
     def sql_retrieval(self, sql, fetch_size=128, format="json"):

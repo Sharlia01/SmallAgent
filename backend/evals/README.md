@@ -8,7 +8,7 @@
 
 多报告评测集现拆为两个独立 JSONL 文件，基于 `backend/pdf/国电电力.pdf` 和
 `backend/pdf/润本股份.pdf` 制作，`dataset_version` 为 `power-reports-v2.1-split-50`，
-结构版本仍为 `2.0`。检索和端到端评测入口均默认使用 dev 文件：
+结构版本为 `2.1`。检索和端到端评测入口均默认使用 dev 文件：
 
 | 文件 | 用途 | 题数 | 可回答 / 不可回答 |
 | --- | --- | --- | --- |
@@ -54,7 +54,7 @@ v1 全部样本都标为 `test`，历史上若已用它调过参数，就不应�
 泛化结果。新实验优先使用 v2，并只在 `dev` 上调参。
 
 `data/guodian_power_eval_v2.jsonl` 是国电电力单文档专项集，共 50 条，用于在保留
-v1 历史基线的同时加强召回回归：
+v1 原有题目的同时加强召回回归：
 
 - `dev` 28 条：由 v1 完整迁移并标记 `legacy_v1`，不得当作未见测试集。
 - `test` 12 条：重点覆盖实际值/预测值、累计值/单季度、费用率/费用金额、累计装机/
@@ -64,7 +64,7 @@ v1 历史基线的同时加强召回回归：
 
 该专项集包括 45 条可回答题和 5 条不可回答题，题型分布为 25 条单事实题、14 条
 并行多证据题、3 条递进式多跳题、3 条口语改写题和 5 条不可回答题。标准证据覆盖
-正文、表格和图表；多证据题使用 `evidence_requirements` 表示必须覆盖的独立信息，
+正文、表格和图表；所有题目使用 `evidence_requirements` 表示必须覆盖的独立信息，
 同一事实存在正文与表格两种合法来源时使用 `alternatives` 表示任一来源均可命中。
 
 该文件由 `build_guodian_power_eval_v2.py` 从冻结的 v1 基线和人工编写的新增题确定性
@@ -93,14 +93,14 @@ python evals/run_retrieval_eval.py \
   `required_evidence_ids` 绑定标准证据。
 - `expected_retrieval`：期望的 `single`、`parallel` 或 `sequential` 检索模式及跳数；
   当前用于诊断和后续路由评测，不参与检索相关性分数。
-- `relevant_evidence`：标准证据数组；每项包含文件名、PDF 页码和证据内容。若同一段原文在摘要和正文中重复出现，`page` 记录它首次出现的物理页码，页码从 PDF 首页按 1 开始计算。表格和图表证据还包含 `evidence_type` 与 `locator`，分别记录证据模态和具体表格/图号位置。
-- `evidence_requirements`：多证据题的强约束；只有所有要求都命中时，Hit 才算成功。每个 `alternatives` 分支内的 atom 必须全部满足，分支之间任选其一；atom 类型支持 `text`、`table_row` 和 `figure`，其中图表须提供 `locator` 或 `text`。
+- `evidence_requirements`：唯一的标准证据结构。每个要求有 `id` 和 `alternatives`；要求之间全部满足，方案之间任选其一，方案内的证据单元必须全部满足。简单题也使用一个要求、一个方案、一条证据。
+- 证据单元的 `type` 支持 `text`、`table_row`、`figure`，保存 `id`、`document_name`、`page` 和原文 `text`；表格可使用 `row_cells`，图表保留 `locator` 和人工核对的视觉事实。同一证据 ID 可在不同要求中复用，但内容必须一致；`reference_claims.required_evidence_ids` 引用这些单元的 ID。页码是从 PDF 首页按 1 开始的物理页码。
 - `metadata`：难度、标签、`dev/test/challenge` 数据划分、源文档日期及不可回答原因等信息。
 
-v2 校验还会检查证据 ID 唯一性、claim 到 evidence 的引用关系、期望行为、检索模式，
+v2 校验还会检查证据 ID 一致性、claim 到 evidence 的引用关系、期望行为、检索模式，
 并要求不可回答题显式标注 `expected_evidence_sufficient=false`。
 
-评测脚本通过统一入口 `retrieve_evidence()` 获取 `RetrievalResult`，在评测输出处使用 `retrieval_record()` 生成 JSON。结果保留 `chunk_id`、各召回分支的原始排名与分数、RRF 分数、最终语义重排分数、候选总数及查询诊断。当前评测集尚未把标准证据映射到 ES 中的稳定 `chunk_id`，因此评测脚本先校验文档名，再对返回片段和 `relevant_evidence[].text` 做规范化文本匹配。完成第一轮基线并确认切块稳定后，可以把标准 chunk ID 补入证据对象，进一步减少模糊匹配。
+评测脚本通过统一入口 `retrieve_evidence()` 获取 `RetrievalResult`，在评测输出处使用 `retrieval_record()` 生成 JSON。结果保留 `chunk_id`、各召回分支的原始排名与分数、RRF 分数、最终语义重排分数、候选总数及查询诊断。当前评测集尚未把标准证据映射到 ES 中的稳定 `chunk_id`，因此评测脚本先校验文档名，再对返回片段和 要求内证据单元的 `text` 做规范化文本匹配。完成第一轮基线并确认切块稳定后，可以把标准 chunk ID 补入证据对象，进一步减少模糊匹配。
 
 当前检索入口只执行给定查询，包括混合召回、重排、过滤、固定别名扩展及表格上下文补全。它不理解需求、不生成子查询、不补查，也不判定答案是否充分。设置 `RETRIEVAL_ALIAS_EXPANSION_ENABLED=false` 可关闭固定别名扩展。原模型改写和扩展开关已移除。
 
@@ -108,14 +108,16 @@ v2 校验还会检查证据 ID 唯一性、claim 到 evidence 的引用关系、
 
 新纯检索结果与旧版包含规划、补查、充分性过滤的结果不可直接比较。检索结果表示命中而非允许回答，端到端评测才统计最终拒答和回答质量。
 
-对于 `evidence_type=figure` 的样本，`text` 是人工核对图片后写下的视觉事实。当前检索评分优先匹配 `locator`（图标题），因此命中表示找到了目标图的文字定位信息，不代表片段已保留视觉事实或足以回答问题。图表样本应与纯文本、表格样本分开统计。
+对于 `type=figure` 的样本，`text` 是人工核对图片后写下的视觉事实。当前检索评分优先匹配 `locator`（图标题），因此命中表示找到了目标图的文字定位信息，不代表片段已保留视觉事实或足以回答问题。图表样本应与纯文本、表格样本分开统计。
+
+当前仓库的四份数据集已统一证据结构，`schema_version` 更新为 `1.1` / `2.1`，`dataset_version` 增加 `-requirements-v1` 后缀。旧 `relevant_evidence` 字段不再接受。原多证据题保留已有替代方案；旧列表中的独立信息改为多个要求。Hit、MRR 和 Recall 按要求统计，迁移后的运行应建立新基线，不与旧结果直接比较。旧版文件名仍用于标识题目集合，不表示继续支持旧证据格式。
 
 ## 数据质量要求
 
-1. 所有可回答题目的参考答案必须被 `relevant_evidence` 完整支持。
+1. 所有可回答题目的参考答案必须被 `evidence_requirements` 中的证据完整支持。
 2. 不使用仅靠常识即可回答的问题。
 3. 不把当前 RAG 系统生成的回答当成参考答案。
-4. 不可回答题必须保持 `relevant_evidence` 为空，系统应明确表示文档未提供答案。
+4. 不可回答题必须保持 `evidence_requirements` 为空，系统应明确表示文档未提供答案。
 5. 修改样本内容时同步更新 `dataset_version`，并重新运行 JSONL 结构校验。
 
 ## 运行检索评估
@@ -220,17 +222,14 @@ docker compose exec LS_api \
 
 检查前后的检索评分使用相同的证据匹配规则：
 
-- `Hit@K`：Top K 是否至少命中一条标准证据。
-- `Recall@K`：每道题的标准证据召回比例，再做宏平均。
-- `Precision@K`：Top K 中命中任一标准证据或 requirement atom 的 chunk 数除以 K；
+- `Hit@K`：前 K 条检索结果是否满足全部证据要求，即“全部要求命中”；任一要求未满足即为 False。要求内任选一个完整替代方案即可，不需要命中所有替代来源。
+- `Recall@K`：每道题已满足要求数除以总要求数，再做宏平均。
+- `Precision@K`：Top K 中命中任一要求中的证据单元 的 chunk 数除以 K；
   因此返回不足 K 条时，缺少的位置也会降低精确率。该指标依赖较完整的标准证据标注，
   否则未标注但有效的证据会被当作无关结果。
-- `MRR@K`：第一条正确证据排名的倒数，再做宏平均。
-- `AllRequirementsHit@K`：仅用于带 `evidence_requirements` 的样本，表示是否完整满足
-  全部强制证据要求。
+- `MRR@K`：完成全部要求时的排名倒数，再做宏平均；未完成记为 0。
 - `duplicate_rate@K`：返回结果中，同文档且规范化文本完全相同的重复 chunk 比例；空结果
   记为 `null`，避免把没有返回任何内容误算成零重复。
-- 若样本使用 `evidence_requirements`，Hit 要求全部要求满足，MRR 使用完成全部要求时的排名。
 - 指标默认只在实际 `top_k` 上计算；例如 `--top-k 5` 只产生 `@5`，避免 summary
   重复展示多个 cutoff。需要排查排序问题时，逐题结果中的 `first_relevant_rank` 会保留
   首次命中的具体位置，内部调用也仍可显式请求多个 cutoff。
@@ -259,7 +258,7 @@ docker compose exec LS_api \
 每个整体或切片汇总还包含 `non_perfect_sample_ids`。它按原指标的层级和名称列出未达到
 理想值的样本，例如
 `non_perfect_sample_ids.retrieval_metrics.hit_at_5`。Hit、Recall、Precision、MRR、
-AllRequirementsHit、拒答召回率等指标以 `1` 为理想值；`error_rate`、`duplicate_rate`、
+拒答召回率等指标以 `1` 为理想值；`error_rate`、`duplicate_rate`、
 `fallback_rate`、可回答题拒绝率等指标以 `0` 为理想值。指标为 `null` 的样本不作为零分
 列入；原有数值字段保持不变，已有汇总读取逻辑无需迁移。
 
@@ -352,13 +351,17 @@ Hit、Recall、MRR、空结果率、旧拒答率和旧 fallback 率。新结果�
 
 ## 端到端 RAG 评估
 
+`--top-k` 是任务未指定返回数量时的默认值。Agent 可为单个任务显式设置 1～20 的 `top_k`；该任务值优先，真实检索记录保留实际使用的 K。
+
 评测分为两个阶段：先完成所有题目的 Agent 问答，再统一执行忠实性、引用支持度和
 答案质量评分。问答中的证据充分性核验仍正常执行；评分使用 `--judge-model` 配置。
-每完成一道题，答案、证据及执行结果即写入 `<run-name>_answers.jsonl`，其中评分状态
-为 `pending`（执行异常的题为 `skipped`）。该文件保留未评分快照，不被后续评分覆盖。
-全部评分结束后生成原有 JSONL、汇总和 HTML 报告；最终记录的 `scoring_status` 区分
-`completed`、`failed` 和 `skipped`，评分异常不会覆盖原问答结果。`--no-judge` 仍不调用
-评分模型。`--fail-fast` 遇到抛出的异常仍提前停止，此前完成的问答快照保留。
+每完成一道问答或评分，原子更新 `<run-name>.json` 并刷新 HTML，不再单独生成答案快照和汇总文件。
+问答阶段评分状态为 `pending`（执行异常为 `skipped`）；评分后为 `completed` 或 `failed`。
+完整 JSON 的 `run.status` 区分 `answering`、`scoring`、`completed` 和提前失败的 `failed`，
+并记录预期题数、已保存题数、评分状态计数和更新时间。中断时保留最近完成的检查点；
+当前正在执行的题或评分可能尚未保存。非完成状态的 HTML 明示为部分结果，不可当作完整评测。
+这里提供持久化检查点，不代表已实现自动断点续跑。`--no-judge` 仍不调用评分模型。
+`--fail-fast` 抛出前会保存失败记录及已完成结果。
 
 `run_e2e_eval.py` 在不读写聊天数据库、Redis、会话标题和推荐问题的情况下，执行与
 线上相同的知识库检索、证据充分性检查、回答提示词和流式模型响应。该 runner 固定为
@@ -416,26 +419,35 @@ faithfulness_score = 被全部最终证据支持的事实主张数 / 事实主�
 事实主张合并后的微平均；同时记录参与评分的样本数、评分覆盖率、judge 失败数和
 支持/不支持主张总数。该指标衡量回答是否忠于检索证据，不判断检索证据本身是否
 真实，也不替代答案正确性。
-汇总中的 `non_perfect_sample_ids` 同样按指标层级列出未达到理想值的样本；例如
-`non_perfect_sample_ids.faithfulness`、
-`non_perfect_sample_ids.refusal_metrics.refusal_recall` 和
-`non_perfect_sample_ids.sufficiency_metrics.accuracy`。危险作答、过度拒答、危险放行和
-错误拒绝等反向指标以 `0` 为理想值。
+新汇总的 `sample_issues` 统一列出逐题问题，`summary.overall.diagnostics` 保留各项过程诊断；旧汇总中的 `non_perfect_sample_ids` 不再输出。
 端到端结果结构版本为 `3.1`。旧结果中的累计 Top K 已经截断，或缺少完整匹配候选及模态可用性信息；需要重新运行，不能与新分数直接横比。
 
-端到端汇总按题型切片，以下路径也存在于 `metrics.by_question_type.<题型>`：
+端到端汇总采用 `summary.summary_schema_version=4.0`，逐题结果结构仍为 3.1。
+主指标保留正确性、完整性、忠实度、有效引用覆盖率（`citation_recall`）、不当作答率、过度拒答率、执行故障数及平均耗时。
+`scoring.<指标>` 保存适用数、有效评分数、评分失败数和无事实主张的不适用数；拒答不进入答案质量评分分母。
+`execution_failure_count` 按题去重，同时覆盖顶层异常及内部非证据故障；不再用 `successful_query_count` 表示任务成功。
+`latency_sample_count` 标明平均耗时分母，沿用有完整结果且无顶层异常的记录口径，不代表所有请求的延迟。
 
-- `metrics.overall.verification_evidence_metrics.recall`：完整核验来源集合的宏平均覆盖率。
-- `metrics.overall.answer_evidence_metrics.recall`：实际回答上下文的宏平均覆盖率。
-- 两个集合指标组还包含 `hit`、`precision`、`all_requirements_hit`、`duplicate_rate`，
+新汇总不输出旧 `retrieval_metrics`、`post_gate_metrics`、旧路由/规划字段及混合补查成功率。
+`diagnostics` 保存核验前后证据集合、单次搜索排名、运行调用次数、补查、忠实度微平均及引用细项。
+核验诊断统一位于 `diagnostics.verification`，内含 `gate_metrics` 与 `sufficiency_metrics`；两者标签含义不同，暂保留各自详细计数。
+各层 `non_perfect_sample_ids` 合并为 `sample_issues`，每题列出需关注的指标路径，保留故障与评分失败。
+纯检索报告及逐题原始轨迹不受影响。历史 HTML 可继续读取；新旧汇总字段路径不可直接混用。
+HTML 主报告只展示核心指标，过程诊断默认折叠；纯拒答显示“不适用”，评分失败仍列为需关注。
+
+端到端汇总按题型切片，以下诊断路径也存在于 `summary.by_question_type.<题型>.diagnostics`：
+
+- `summary.overall.diagnostics.verification_evidence_metrics.recall`：完整核验来源集合的宏平均覆盖率。
+- `summary.overall.diagnostics.answer_evidence_metrics.recall`：实际回答上下文的宏平均覆盖率。
+- 两个集合指标组还包含 `hit`、`precision`、`duplicate_rate`，
   不带 `@K`，也不提供 MRR。precision 的分母为该集合实际片段数，空集合时为 `null`。
   已知空集合的可回答题 recall 为 0；缺少快照时为未知。各指标同时报告评分分母，
-  并在组内 `non_perfect_sample_ids` 列出未达标样本。
-- `metrics.overall.retrieval_call_metrics.by_top_k.5`：所有 K=5 的真实检索调用的排名统计。
+  未达标样本统一列入 `sample_issues`。
+- `summary.overall.diagnostics.retrieval_call_metrics.by_top_k.5`：所有 K=5 的真实检索调用的排名统计。
   这里的 `query_count/evaluated_query_count/error_count` 按调用计数，不按用户问题计数；
   不同 K 分开汇总。每次调用都以整道题的 gold 作诊断（`reference_scope=whole_question`），
   子查询本来只覆盖部分要求，不能把这个分数当作子查询成功率或整体任务完成率。
-- `metrics.overall.gate_metrics`：放行、拒绝、检查失败及拒绝原因归因统计。
+- `summary.overall.diagnostics.verification.gate_metrics`：放行、拒绝、检查失败及拒绝原因归因统计。
 
 集合质量只对成功且数据可用的可回答题做宏平均；不可回答题、执行异常和缺失数据
 不补成零分。`retrieval_call_metrics` 区分没有调用（已记录的空列表）与没有调用快照
@@ -447,20 +459,21 @@ faithfulness_score = 被全部最终证据支持的事实主张数 / 事实主�
 `answerable` 推导。v2 对该字段进行强校验；现有 `guodian_power_eval_v1.jsonl`
 仍可以通过 `--dataset` 显式指定运行，无需迁移。
 
-结果写入：
+每次端到端运行仅输出两个文件：
 
-- `results/<run-name>.jsonl`：逐题回答、引用解析、检索 trace 和各项指标。
-- `results/<run-name>_summary.json`：整体与题型切片汇总。
-- `results/<run-name>.html`：可离线打开的阅读报告，包含问题、参考答案、实际答案、主要评分和失败原因，支持搜索和筛选需关注题目。评分失败显示为未评分，不计作零分；详细检索记录仍保存在 JSONL 中。
+- `results/<run-name>.json`：完整数据，`artifact_schema_version=1.0`；`run` 保存运行状态和数据集信息，`config` 保存配置，`summary` 保存整体与题型汇总，`results` 保存逐题答案、证据、轨迹和评分。
+- `results/<run-name>.html`：可离线阅读、搜索和筛选的报告，由上述完整 JSON 生成。
 
-已有端到端结果无需重新调用模型，可直接补生成 HTML：
+已有完整数据无需重新调用模型，可重新生成 HTML：
 
 ```bash
 cd backend
-python evals/html_report.py evals/results/agent_test_smoke_20261008.jsonl
+python evals/html_report.py evals/results/<run-name>.json --overwrite
 ```
 
-默认读取同名 `_summary.json`，输出同名 `.html`。已有 HTML 需显式添加 `--overwrite` 才会替换。
+旧版 `.jsonl` + `_summary.json` 仍可由同一命令读取；历史文件不会自动删除或迁移。
+纯检索评测继续使用原来的 JSONL 和 summary 文件。JSON 和 HTML 分别原子替换；
+若 HTML 写入失败，最新 JSON 仍可用于重新生成报告。
 
 
 ### 评测终端日志与轮转
@@ -529,7 +542,7 @@ docker compose exec LS_api python /app/evals/run_e2e_eval.py \
   --index-name <用户ID> --split dev --run-name agent_dev_v3
 ```
 
-逐题 `agent_execution` 记录任务、工具查询、依赖绑定和停止原因。`query_metrics` 保留历史规划字段供旧记录读取；新 Agent 不再生成旧 RAG 的路由与补查报告，缺失字段不能当成成功率。补查统计优先读取 `agent_execution`：`steps > 1` 表示实际执行过补查（初始执行不计入），只生成计划但未执行不算；补查后 `stop_reason == evidence_ready` 计为补齐证据成功，与最终回答或 judge 是否成功无关。`repair_count` 按样本计数而非轮数，`repair_success_rate` 的分母为执行过补查的样本数；`repair_unavailable_count` 及分组内的 `unavailable_count` 标记缺失执行数据的样本。没有 Agent 执行记录时兼容旧 `query_repair`。请求 runtime 记录规划、证据核验、桥接及工具搜索预算；最终回答流和 judge 成本另行统计。样本数、失败率和各切片应与成本、P95/P99 一起审阅。
+逐题 `agent_execution` 记录任务、工具查询、依赖绑定和停止原因。`query_metrics` 保留历史规划字段供旧记录读取；新 Agent 不再生成旧 RAG 的路由与补查报告，缺失字段不能当成成功率。补查统计优先读取 `agent_execution`：`steps > 1` 表示实际执行过补查（初始执行不计入），只生成计划但未执行不算；补查后 `stop_reason == evidence_ready` 计为补齐证据成功，与最终回答或 judge 是否成功无关。`repair_count` 按样本计数而非轮数。补查指标口径 `repair_metrics_version=2.0` 删除混合分母的 `repair_success_rate` 和分组 `success_rate`：`repair_cohorts.answerable.evidence_completion_rate` 仅统计执行过补查的可回答题，零样本为 `null`；`repair_cohorts.unanswerable.correct_refusal_rate` 统计补查后正常核验且正确拒答的比例。服务、规划、预算或核验故障不计为正确拒答，已知失败计入分母；历史记录缺少拒答判定依据时排除，并计入 `refusal_unavailable_count`，实际分母见 `refusal_evaluated_count`。缺少可回答性标签的补查样本计入 `repair_answerability_unavailable_count`，不混入两个分组。旧报告需要重新汇总，不可直接横比；`repair_unavailable_count` 及分组内的 `unavailable_count` 标记缺失执行数据的样本。没有 Agent 执行记录时兼容旧 `query_repair`。请求 runtime 记录规划、证据核验、桥接及工具搜索预算；最终回答流和 judge 成本另行统计。样本数、失败率和各切片应与成本、P95/P99 一起审阅。
 
 ### 统一证据核验回归
 
@@ -543,3 +556,42 @@ docker compose exec LS_api python /app/evals/run_e2e_eval.py \
 新记录不再输出财务需求快照、`financial_fact_bundle`、逐事实/关系状态或服务端计算结果。
 历史字段可继续读取为旧数据，但不再汇总旧财务专项指标，也不能把已停用的检查统计成通过。
 评测重点比较充分性误放行与误拒、最终答案正确性与完整性、计算正确性、引用、成本和延迟，并区分服务故障与资料缺失。
+
+### 引用覆盖口径（semantic_citation_v5）
+
+引用评判模型读取完整答案、片段顺序及答案实际引用的来源，判断事实的语义引用覆盖。
+计算、换算、重复总结和数值标题允许通过明确的上下文关联继承引用，不再要求每个片段独立带标记。
+模型仅返回 `claim_index` 及三个核心判断字段：`requires_citation`、`effective_citation_ids`、`supported`。
+`claim_index` 用于对应、去重校验及恢复片段顺序；三个核心字段分别决定评分分母、是否有引用及是否获支持。
+直接引用与多层继承均由模型结合完整答案判断，不再要求输出继承链或限制为单层继承。
+`reason` 是可选调试信息，保存为 `claims[].judge_reason`；缺失、空白或非字符串均记为 null，不影响评分。
+代码只校验核心字段类型、片段一一对应、来源为答案实际引用的有效编号，以及支持成功必须有来源；
+没有明确引用关联时，即使资料中有相应事实，也不能算引用充分。
+全部答案片段均交给引用模型评估；忠实度分类仅作可选提示，可以双向纠正。
+分类缺失、失败或不匹配时忽略提示，不阻断引用评分。
+覆盖率按有效关联且获支持的事实计算；原始引用编号合法性仍单独统计。
+历史报告不会自动重算，新旧引用覆盖率应按 `evaluation_policy_version` 区分口径。
+
+引用评测不再按 40 个片段、每片段 600 字符、每条来源 2400 字符截断。
+完整答案、全部待评片段与实际引用的完整来源一起检查请求预算；默认 32768 tokens，
+可通过 `evaluate_citations(judge_context_tokens=...)` 调整。使用 cl100k_base 本地估算，
+另预留按片段数计算的输出预算及 512 tokens 余量；这不是提供商的精确 token 计数。
+超预算时不发送裁剪后的材料，不自动分批；模型输出截断或其他评判失败同样返回
+`evaluation_status=incomplete`，语义引用指标为 null，编号合法性仍可计算。
+`diagnostics` 记录预算、估算输入、预留输出和是否超限，报告显示评分失败原因。
+
+### 目标支持率与内部异常
+
+`goal_metrics_version=2.0` 的支持率只针对模型明确列出的、已完成核验的规划目标，
+不代表用户问题的全部需求已被规划或满足。诊断同时输出 planned_goal_count、
+evaluated_goal_count、unevaluated_goal_count 和 supported_goal_count；缺少规划的样本
+另计 goal_plan_unavailable_sample_count，不推测目标数。未完成核验、缺少目标判定、
+重复或未知判定不计为已核验；没有有效分母时支持率为 null。
+原始证据身份冲突标记为 EvidenceIdentityConflict / execution_error，并停止补查；
+它计入执行故障，不作为资料不足或正确拒答。两份有效资料的事实分歧仍属于核验目标的
+conflict 状态，不自动算内部执行故障。历史结果不会自动更改分类。
+
+引用协议 v5 中 requires_citation 表示事实是否需要依据，而非本句是否必须独立标注。
+不需要依据的片段不计分，supported 和 effective_citation_ids 归一化为 false 和空列表，忽略不适用的支持字段。
+需要依据的事实若缺少核心字段或来源无效，仍将本次评分标为 incomplete，不通过删掉该片段缩小评分分母。
+核心来源/支持字段错误在 diagnostics.invalid_assessment 中记录片段编号、判断字段、来源编号和具体约束。

@@ -1,5 +1,6 @@
 """纯检索评测直接接收类型化结果，并在输出边界生成 JSON。"""
 
+from tests.evidence_helpers import requirements_for_atoms
 from tests.evidence_helpers import bind_assessment
 
 import importlib.util
@@ -27,7 +28,7 @@ def test_cli_writes_typed_retrieval_result_with_full_evaluation_metadata(monkeyp
     sample = {
         "schema_version": "1.0", "dataset_version": "test", "id": "approval", "question": "差旅如何审批？",
         "reference_answer": "差旅申请需要审批。", "answerable": True, "question_type": "fact",
-        "relevant_evidence": [{"document_name": "制度.pdf", "page": 1, "text": "差旅申请需要审批。"}],
+        "evidence_requirements": requirements_for_atoms([{"document_name": "制度.pdf", "page": 1, "text": "差旅申请需要审批。"}]),
         "metadata": {},
     }
     dataset = tmp_path / "dataset.jsonl"

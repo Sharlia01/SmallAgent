@@ -6,35 +6,14 @@ from typing import Any, Iterable
 
 
 DEFAULT_REFUSAL_MESSAGE = "当前资料不足以可靠回答这个问题。"
-MAX_REFUSAL_REQUIREMENTS = 5
-
-
-def normalize_missing_requirements(values: Any) -> list[str]:
-    """生成长度受限、去重且适合向用户展示的拒答缺口描述。"""
-    if not isinstance(values, list):
-        return []
-
-    normalized: list[str] = []
-    for value in values:
-        if not isinstance(value, str):
-            continue
-        text = " ".join(value.split()).strip()
-        if text and text not in normalized:
-            normalized.append(text[:160])
-        if len(normalized) >= MAX_REFUSAL_REQUIREMENTS:
-            break
-    return normalized
 
 
 def render_refusal(missing_requirements: Any = None) -> str:
-    """生成稳定的拒答文本，避免让模型自行编造。"""
-    requirements = normalize_missing_requirements(missing_requirements)
-    if not requirements:
-        return DEFAULT_REFUSAL_MESSAGE
-    return (
-        f"{DEFAULT_REFUSAL_MESSAGE}"
-        f"当前缺少：{'；'.join(requirements)}。"
-    )
+    """仅输出纯拒答；兼容旧参数，但不展示可能含事实的模型缺口解释。
+
+    详细缺口和原因保留在核验报告中，供补查、日志和评测诊断使用。
+    """
+    return DEFAULT_REFUSAL_MESSAGE
 
 
 def render_evidence_refusal(decision: dict[str, Any]) -> str:

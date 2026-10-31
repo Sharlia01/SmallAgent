@@ -50,7 +50,6 @@ def companies(monkeypatch):
         {"entity_id": "A", "canonical_name": "A公司", "kind": "company"},
         {"entity_id": "B", "canonical_name": "B公司", "kind": "company"},
     ]})
-    monkeypatch.setattr(evidence_assessment, "get_entity_registry", lambda: registry)
     monkeypatch.setattr("service.core.entities.registry.get_entity_registry", lambda: registry)
     return registry
 
@@ -113,7 +112,9 @@ def test_same_id_with_different_source_refuses_before_semantic_model(monkeypatch
     assert len(evidence.conflicts) == 1
     assert evidence.get("one") is original
     assert not assessment.sufficient
-    assert "身份冲突" in assessment.missing_requirements[0]
+    assert assessment.missing_requirements == []
+    assert assessment.verification_status == "unavailable"
+    assert assessment.to_dict()["failure_kind"] == "EvidenceIdentityConflict"
 
 
 def test_assessment_reuse_requires_same_query_evidence_and_policy(monkeypatch):
@@ -157,13 +158,13 @@ def test_report_changes_cannot_reuse_a_verified_snapshot(monkeypatch):
 
 
 def test_query_context_preserves_all_goal_provenance():
-    goal = QueryGoal("g1", "图2和图3中的利润关系", constraints=("2021年",),
-                     source_spans=("图2和图3",), candidate_locators=("图2", "图3"))
+    goal = QueryGoal("g1", "图2和图3中的利润关系", constraints=("2021年", "图2", "图3"),
+                     source_spans=("图2和图3",))
     query = make_query("图2和图3中的2021年利润关系？", (goal,))
     assert query.goals[0] is goal
     version = query.version
     query.understanding = replace(query.understanding,
-                                  goals=(replace(goal, candidate_locators=("图2",)),))
+                                  goals=(replace(goal, constraints=("2021年", "图2")),))
     assert query.version != version
 
 

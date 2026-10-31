@@ -1,3 +1,4 @@
+from tests.evidence_helpers import requirements_for_atoms
 from service.core.evidence.adapter import reference_records
 from service.core.evidence.adapter import collection_from_records
 import pytest
@@ -702,10 +703,10 @@ def test_multi_hop_case_computes_hit_recall_and_mrr():
         "reference_answer": "标准答案",
         "answerable": True,
         "question_type": "multi_hop",
-        "relevant_evidence": [
+        "evidence_requirements": requirements_for_atoms([
             {"document_name": "国电电力.pdf", "page": 1, "text": "第一条证据"},
             {"document_name": "国电电力.pdf", "page": 2, "text": "第二条证据"},
-        ],
+        ]),
         "metadata": {"source_modality": "text"},
     }
     raw_result = {
@@ -749,9 +750,9 @@ def test_multi_hop_case_computes_hit_recall_and_mrr():
     assert result["post_gate_metrics"]["hit_at_5"] is True
     assert result["post_gate_metrics"]["recall_at_5"] == 1.0
     assert result["post_gate_metrics"]["precision_at_5"] == 0.4
-    assert result["post_gate_metrics"]["mrr_at_5"] == 1.0
+    assert result["post_gate_metrics"]["mrr_at_5"] == 0.5
     assert result["matched_evidence_count"] == 2
-    assert result["first_relevant_rank"] == 1
+    assert result["first_relevant_rank"] == 2
     assert [match["matched_rank"] for match in result["evidence_matches"]] == [2, 1]
     assert "vector" not in result["retrieval"]["chunks"][0]
     assert result["retrieval"]["query_transform"]["effective_query"] == (
@@ -776,19 +777,7 @@ def test_multi_chunk_requirement_uses_completion_rank():
         ),
         "answerable": True,
         "question_type": "paraphrase",
-        # 暂时保留旧字段，保证评测集结构向后兼容。
-        "relevant_evidence": [
-            {
-                "document_name": "国电电力.pdf",
-                "page": 1,
-                "text": (
-                    "预计2025-2027年公司归母净利润分别为"
-                    "70.50/78.95/87.17亿元；EPS分别为"
-                    "0.40/0.44/0.49元，当前股价对应PE为"
-                    "11.4/10.2/9.2x。"
-                ),
-            }
-        ],
+
         # 新结构：外层 alternatives 是 OR，内层列表是 AND。
         "evidence_requirements": [
             {
@@ -874,8 +863,11 @@ def test_multi_chunk_requirement_uses_completion_rank():
     assert result["post_gate_metrics"]["hit_at_5"] is True
     assert result["post_gate_metrics"]["recall_at_5"] == 1.0
     assert result["post_gate_metrics"]["mrr_at_5"] == pytest.approx(0.2)
-    assert result["post_gate_metrics"]["all_requirements_hit_at_3"] is False
-    assert result["post_gate_metrics"]["all_requirements_hit_at_5"] is True
+    assert result["post_gate_metrics"]["hit_at_3"] is False
+    assert set(result["post_gate_metrics"]) == {
+        f"{metric}_at_{k}" for k in (3, 5)
+        for metric in ("hit", "recall", "precision", "mrr", "duplicate_rate")
+    }
     assert result["first_relevant_rank"] == 5
 
 # 用例功能：验证评测器能够按表格标题和完整数据行匹配 HTML 表格证据。
@@ -892,7 +884,7 @@ def test_table_row_requirement_matches_html_table():
         "reference_answer": "2026E财务费用为10049百万元。",
         "answerable": True,
         "question_type": "fact",
-        "relevant_evidence": [],
+
         "evidence_requirements": [
             {
                 "id": "financial_expense_row",
@@ -984,7 +976,7 @@ def test_unanswerable_case_is_excluded_from_positive_retrieval_metrics():
         "reference_answer": "文档没有说明。",
         "answerable": False,
         "question_type": "unanswerable",
-        "relevant_evidence": [],
+        "evidence_requirements": requirements_for_atoms([]),
         "metadata": {},
     }
     result = evaluate_retrieval_case(
@@ -1017,18 +1009,18 @@ def test_relevant_table_evidence_uses_table_parser():
         "question": "利润预测表中，国电电力2026E财务费用是多少？",
         "reference_answer": "2026E财务费用为10049百万元。",
         "answerable": True,
-        "relevant_evidence": [
+        "evidence_requirements": requirements_for_atoms([
             {
                 "document_name": "国电电力.pdf",
                 "page": 5,
-                "evidence_type": "table",
+                "type": "table_row",
                 "locator": (
                     "财务预测与估值｜利润表（百万元）"
                     "｜财务费用行｜2026E列"
                 ),
                 "text": "财务费用 6711 6551 8389 10049 10216",
             }
-        ],
+        ]),
     }
 
     raw_result = {
@@ -1109,15 +1101,15 @@ def test_relevant_figure_evidence_uses_locator(
         "question": question,
         "reference_answer": "标准答案",
         "answerable": True,
-        "relevant_evidence": [
+        "evidence_requirements": requirements_for_atoms([
             {
                 "document_name": "国电电力.pdf",
                 "page": 2,
-                "evidence_type": "figure",
+                "type": "figure",
                 "locator": locator,
                 "text": evidence_text,
             }
-        ],
+        ]),
     }
     raw_result = {
         "total": 1,
@@ -1151,15 +1143,15 @@ def test_relevant_figure_evidence_rejects_a_different_figure():
         "question": "图3展示了什么？",
         "reference_answer": "标准答案",
         "answerable": True,
-        "relevant_evidence": [
+        "evidence_requirements": requirements_for_atoms([
             {
                 "document_name": "国电电力.pdf",
                 "page": 2,
-                "evidence_type": "figure",
+                "type": "figure",
                 "locator": "图3：国电电力归母净利润及增速（单位：亿元）",
                 "text": "图3中的视觉证据。",
             }
-        ],
+        ]),
     }
     raw_result = {
         "total": 1,
@@ -1196,18 +1188,18 @@ def test_relevant_table_evidence_falls_back_to_flattened_text():
         "question": "财务预测表中，国电电力2026E固定资产是多少？",
         "reference_answer": "2026E固定资产为467602百万元。",
         "answerable": True,
-        "relevant_evidence": [
+        "evidence_requirements": requirements_for_atoms([
             {
                 "document_name": "国电电力.pdf",
                 "page": 5,
-                "evidence_type": "table",
+                "type": "table_row",
                 "locator": (
                     "财务预测与估值｜资产负债表（百万元）"
                     "｜固定资产行｜2026E列"
                 ),
                 "text": "固定资产 360117 383684 427026 467602 453840",
             }
-        ],
+        ]),
     }
     raw_result = {
         "total": 1,

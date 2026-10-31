@@ -16,6 +16,8 @@ def _incremental_sources(query, evidence, previous, require_semantic):
             or any(item.get("status") == "conflict" for item in previous.goal_coverage)):
         return evidence
 
+    if previous.planning_corrections:
+        return evidence
     scope_ids = previous.diagnostics.get("verification_scope_ids") # 取出上一轮核验对应的完整证据范围
     current_ids = {item.id for item in evidence}
     if not scope_ids or not set(scope_ids) <= current_ids:
@@ -40,6 +42,8 @@ def _gap_context(query, evidence, previous, require_semantic):
     """仅对范围有效、逐目标引用完整的旧模型报告复用已支持目标。"""
     if (not require_semantic or not query.goals or previous is None
             or previous.source != "model" or previous.verification_status != "completed"):
+        return None
+    if previous.planning_corrections:
         return None
     scope = previous.diagnostics.get("verification_scope_ids")
     current_ids = {item.id for item in evidence}
@@ -81,7 +85,9 @@ def _merge_gap_assessment(query, evidence, previous, partial, context):
     evaluated = set(previous.evaluated_chunk_ids) | set(partial.evaluated_chunk_ids)
     ids = [item.id for item in evidence if item.id in evaluated]
     supported = {identifier for item in coverage for identifier in item["supporting_chunk_ids"]}
-    sufficient = partial.sufficient and all(item["status"] == "supported" for item in coverage)
+    supported.update(partial.evaluated_chunk_ids[index - 1] for index in partial.supporting_chunk_indices)
+    sufficient = partial.sufficient if partial.answer_scope else (
+        partial.sufficient and all(item["status"] == "supported" for item in coverage))
     return replace(partial, sufficient=sufficient, goal_coverage=coverage,
                    evaluated_chunk_ids=ids, evaluated_chunk_count=len(ids),
                    supporting_chunk_indices=[index for index, identifier in enumerate(ids, 1) if identifier in supported],
@@ -98,7 +104,7 @@ def _merge_gap_assessment(query, evidence, previous, partial, context):
 def _verify_with_previous(query: QueryContext, evidence: EvidenceCollection,
                           previous: EvidenceAssessment, *, require_semantic: bool,
                           client: Any | None = None) -> EvidenceAssessment:
-    """有历史报告时尝试增量与缺口核验，必要时恢复完整核验。"""
+    """有历史报告时执行一次增量与缺口核验，不回退完整核验。"""
     selected = _incremental_sources(query, evidence, previous, require_semantic)
     gap = _gap_context(query, evidence, previous, require_semantic)
     extra = {"gap_context": gap} if gap is not None else {}
@@ -111,22 +117,7 @@ def _verify_with_previous(query: QueryContext, evidence: EvidenceCollection,
     # 局部判定必须是完整模型结果；失败时不得把局部放行当作全局充分。
     gap_completed = (gap is not None and assessment.source == "model"
                      and assessment.verification_status == "completed")
-    gap_conflict = gap_completed and (
-        bool(assessment.diagnostics.get("recheck_goal_ids"))
-        or any(item.get("status") == "conflict" for item in assessment.goal_coverage)
-    )
-    restore_reduced = reduced and not assessment.sufficient and (
-        assessment.verification_status == "completed"
-        or assessment.diagnostics.get("failure_kind") == "input_limit"
-    )
-    missing_context = gap is not None and assessment.diagnostics.get("failure_kind") == "input_limit"
-    restored = bool(gap_conflict or restore_reduced or missing_context)
-    if restored: # 如果有冲突就回退，重新核验整体目标和证据
-        assessment = assess_evidence_sufficiency(
-            query.question, evidence, client=client, goals=query.goals,
-            require_semantic=require_semantic,
-        )
-    elif gap_completed:
+    if gap_completed:
         assessment = _merge_gap_assessment(query, evidence, previous, assessment, gap)
     elif gap is not None:
         assessment = replace(assessment, sufficient=False)
@@ -134,14 +125,14 @@ def _verify_with_previous(query: QueryContext, evidence: EvidenceCollection,
         assessment = replace(assessment, diagnostics={**assessment.diagnostics,
             "gap_verification": True,
             "gap_goal_ids": [goal.id for goal in gap["pending_goals"]],
-            "reused_goal_ids": [] if restored or not gap_completed else [item["goal_id"] for item in gap["retained_goals"]],
-            "gap_restored_full_verification": restored,
+            "reused_goal_ids": [] if not gap_completed else [item["goal_id"] for item in gap["retained_goals"]],
+            "gap_restored_full_verification": False,
         })
     assessment = replace(assessment, diagnostics={
         **assessment.diagnostics,
         "incremental_input": reduced,
         "incremental_selected_count": len(selected),
-        "incremental_restored_full_input": restored,
+        "incremental_restored_full_input": False,
     })
     return assessment
 
@@ -158,8 +149,10 @@ def verify_evidence(query: QueryContext, evidence: EvidenceCollection, *,
     if evidence.conflicts:
         assessment = EvidenceAssessment(
             sufficient=False, reason="相同证据标识对应不同原文或定位", source="rule",
-            missing_requirements=["无身份冲突的来源证据"],
-            evaluated_chunk_count=len(evidence), evaluated_chunk_ids=[item.id for item in evidence],
+            verification_status="unavailable",
+            diagnostics={"outcome": "execution_error", "failure_kind": "EvidenceIdentityConflict",
+                         "failure": "原始证据身份冲突，未进行语义充分性核验",
+                         "conflicting_evidence_ids": sorted({item.evidence_id for item in evidence.conflicts})},
         )
     # 如果之前已经进行过证据核验，且查询、证据、规则和核验模式一致，则复用之前的报告。
     elif previous is not None and previous.matches(query.version, evidence.version, verification_policy_version(),

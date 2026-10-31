@@ -29,18 +29,16 @@ class GroundedTurnResult:
 
     question: str  # 用户本次传进来的原始问题，不是Agent拆分出来的子查询
     answer: str  #最终返回给用户的正文。可能是正常答案、拒答说明，也可能是要求用户补充信息的问题
+    documents: list[dict[str, Any]]  #最终回答上下文选中的来源片段，带引用编号、原文、文档名等信息。用于判断回答是否得到证据支持
+    raw_retrieval: dict[str, Any]  #供评测和排查使用的详细记录，包括每次搜索、累计核验证据、最终回答证据、核验结果以及 Agent 执行情况。
     thinking: str  #回答模型通过接口的 reasoning_content 字段返回的推理文本。没有返回时为空字符串；它不包含整个 Agent 的执行记录
     response_mode: str #流程选择了哪种回答方式：answer 正常回答、refuse 拒答、clarify 请求澄清。它记录流程决定，不是分析最终正文后得出的分类
-    documents: list[dict[str, Any]]  #最终回答上下文选中的来源片段，带引用编号、原文、文档名等信息。不是所有搜到的资料，也不保证模型在答案中实际引用了每一条
-    raw_retrieval: dict[str, Any]  #供评测和排查使用的详细记录，包括每次搜索、累计核验证据、最终回答证据、核验结果以及 Agent 执行情况。
-    answer_messages: list[dict[str, str]] #实际构造给回答模型的完整消息列表，包括系统提示、适用的历史消息、参考资料和当前问题。拒答或澄清不调用回答模型时，通常为空列表
     latency_ms: dict[str, float] #本次问答各部分的耗时，单位是毫秒。
 
 
     def metadata(self) -> dict[str, Any]:
         data = asdict(self)
         data.pop("raw_retrieval", None)
-        data.pop("answer_messages", None)
         return data
 
 
@@ -77,7 +75,7 @@ def execute_agent_turn(
         '''这层包装需要记录每一次搜索，保存查询词、结果、错误和耗时'''
         # 应用评测参数，比如返回多少条、候选数量、重排参数，并传递任务中的文档范围限制
         options = dict(retrieval_options or {})
-        options.setdefault("page_size", page_size)
+        options["page_size"] = page_size  # 执行器已解析任务值或全局默认值，不得再次覆盖
         before = time.perf_counter()
         with retrieval_lock:
             call = {"call_id": len(retrieval_runs) + 1, "query": query,
@@ -108,6 +106,7 @@ def execute_agent_turn(
         planner_model=planner_model or agent_model(),
         answer_client=client, answer_model=answer_model or os.getenv("CHAT_MODEL", DEFAULT_ANSWER_MODEL),
         tools=[tool],
+        default_top_k=(retrieval_options or {}).get("page_size", 5),
     )
     execution = orchestrator.run(
         session_id="offline-agent-eval", question=question,
@@ -168,7 +167,7 @@ def execute_agent_turn(
     return GroundedTurnResult(
         question=question, answer=answer, thinking=thinking,
         response_mode=execution.response_mode, documents=documents,
-        raw_retrieval=raw, answer_messages=execution.answer_messages,
+        raw_retrieval=raw,
         latency_ms={
             "retrieval": round(retrieval_ms, 3),
             "planning_and_answer_request": round(max(0, orchestration_ms - retrieval_ms), 3),

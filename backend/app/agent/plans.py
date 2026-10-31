@@ -6,7 +6,7 @@ from typing import Any
 import logging
 import re
 
-from service.core.query.contract import QueryUnderstanding
+from service.core.query.contract import QueryUnderstanding, parse_subjects
 from service.core.query.context import QueryContext
 from service.core.query.semantics import canonical_text
 from service.core.query.validation import QueryValidationError
@@ -24,14 +24,13 @@ class AgentTask:
     tool: str = "search_knowledge_base"  #要调用的工具名称，必须是已注册工具
     query: str = ""   # 可以直接执行的查询文本
     query_template: str = ""  # 等待前置结果填入的查询模板 如"{company}最新公告" 与 query 二选一，不能同时填写。
-    depends_on: tuple[str, ...] = ()  # 当前任务依赖的前置任务编号，要求前置任务提供所需变量，不只是控制执行先后。
-    output_slot: str | None = None  # 从本任务证据中提取并输出的变量名称，实际值要从检索证据中提取，可以被后续任务的 query_template 引用。
     required_slots: tuple[str, ...] = ()  # 当前模板需要的变量名称
+    depends_on: tuple[str, ...] = ()  # 当前任务依赖的前置任务编号，要求前置任务提供所需变量，不只是控制执行先后。
     inherit_document_scope: bool = False # 是否限定在前置证据所在的同一文档内检索
     goal_ids: tuple[str, ...] = ()  # 当前任务服务的用户目标编号
-    top_k: int = 5                  # 希望工具返回的结果数量
-    binding_key: str | None = None  # 补查输出对应的目标 subject_slot；模板仍引用 output_slot。
-    subject_refs: tuple[str, ...] | None = None
+    top_k: int | None = None        # None 表示继承请求的全局默认返回数量
+    output_slot: str | None = None  # 从本任务证据中提取并输出的变量名称，实际值要从检索证据中提取，可以被后续任务的 query_template 引用。
+    subjects: tuple[str, ...] | None = None  # 模型省略时在计划校验阶段补齐；校验后始终为元组 # 本次检索的主体，主要用于把多主体比较拆成分别检索，避免每个任务都带上全部主体
 
     def to_dict(self):
         return asdict(self)
@@ -76,13 +75,8 @@ def validate_dependency_graph(subqueries: list[AgentTask]) -> list[list[AgentTas
     by_id = {step.id: step for step in subqueries}
     if len(by_id) != len(subqueries):
         raise QueryValidationError("duplicate_graph_node", "duplicate graph node", field="subqueries[].id")
-    producers = {}
     #检查编号重复、依赖不存在、循环依赖、模板变量与前置输出不匹配等问题；不合法就抛异常。
     for step in subqueries:
-        if step.output_slot:
-            if step.output_slot in producers:
-                raise QueryValidationError("duplicate_output_slot", "duplicate output slot", field="subqueries[].output_slot", node_id=step.id)
-            producers[step.output_slot] = step.id
         if bool(step.query) == bool(step.query_template):
             raise QueryValidationError("query_template_exclusivity", "node needs exactly one query or template", field="subqueries[].query_template", node_id=step.id)
         if any(dep not in by_id or dep == step.id for dep in step.depends_on):
@@ -106,9 +100,17 @@ def validate_dependency_graph(subqueries: list[AgentTask]) -> list[list[AgentTas
             raise QueryValidationError("template_slot_mismatch", "template fields do not match required slots", field="subqueries[].required_slots", node_id=step.id)
         if step.query_template and not fields:
             raise QueryValidationError("template_without_slots", "dependent template has no slots", field="subqueries[].query_template", node_id=step.id)
-        if any(producers.get(slot) not in step.depends_on for slot in fields):
+        # 变量按直接依赖任务解析，允许补查复用旧变量名，但禁止同一消费者来源歧义。
+        producers = {}
+        for parent_id in step.depends_on:
+            slot = by_id[parent_id].output_slot
+            if slot and slot in producers:
+                raise QueryValidationError("ambiguous_slot_producer", "同一变量不能来自多个直接前置任务", field="subqueries[].depends_on", node_id=step.id)
+            if slot:
+                producers[slot] = parent_id
+        if any(slot not in producers for slot in fields):
             raise QueryValidationError("slot_producer_missing", "slot producer is not a dependency", field="subqueries[].depends_on", node_id=step.id)
-        if step.depends_on and set(step.depends_on) != {producers.get(slot) for slot in fields}:
+        if step.depends_on and set(step.depends_on) != {producers[slot] for slot in fields}:
             raise QueryValidationError("unused_dependency", "dependency does not supply a consumed slot", field="subqueries[].depends_on", node_id=step.id)
     # 生成执行批次：把依赖关系转换为执行器可以逐批处理的结构。
     completed, waves = set(), []
@@ -140,8 +142,8 @@ def decode_plan(payload: Any) -> AgentPlan:
     for raw in payload["tasks"]:
         if not isinstance(raw, dict):
             raise QueryValidationError("invalid_task", "任务必须是对象")
-        allowed = {"id", "tool", "query", "query_template", "depends_on", "output_slot", "binding_key",
-                   "required_slots", "inherit_document_scope", "goal_ids", "top_k", "subject_refs"}
+        allowed = {"id", "tool", "query", "query_template", "depends_on", "output_slot",
+                   "required_slots", "inherit_document_scope", "goal_ids", "top_k", "subjects"}
         if set(raw) - allowed:
             raise QueryValidationError("unexpected_task_field", "任务含有未声明字段")
         identifier, tool = raw.get("id"), raw.get("tool")
@@ -157,11 +159,8 @@ def decode_plan(payload: Any) -> AgentPlan:
                 expected="null 或匹配 ^[a-z][a-z0-9_]{0,31}$ 的字符串",
                 actual=output,
             )
-        binding_key = raw.get("binding_key")
-        if binding_key is not None and (not isinstance(binding_key, str) or not PLAN_ID_PATTERN.fullmatch(binding_key) or not output):
-            raise QueryValidationError("invalid_binding_key", "主体绑定必须具有合法目标变量名和输出变量")
-        scope, top_k = raw.get("inherit_document_scope", False), raw.get("top_k", 5)
-        if type(scope) is not bool or type(top_k) is not int or not 1 <= top_k <= 20:
+        scope, top_k = raw.get("inherit_document_scope", False), raw.get("top_k")
+        if type(scope) is not bool or (top_k is not None and (type(top_k) is not int or not 1 <= top_k <= 20)):
             raise QueryValidationError("invalid_options", "文档范围或结果数量无效")
         tasks.append(AgentTask(
             id=identifier, tool=tool,
@@ -169,13 +168,12 @@ def decode_plan(payload: Any) -> AgentPlan:
             query_template=_normalize_plan_text(raw.get("query_template", ""), field_name="query_template"),
             depends_on=tuple(_parse_identifier_list(raw.get("depends_on", []), field_name="depends_on")),
             output_slot=output,
-            binding_key=binding_key,
             required_slots=tuple(_parse_identifier_list(raw.get("required_slots", []), field_name="required_slots")),
             inherit_document_scope=scope,
             goal_ids=tuple(_parse_identifier_list(raw.get("goal_ids", []), field_name="goal_ids")),
             top_k=top_k,
-            subject_refs=(tuple(_parse_identifier_list(raw["subject_refs"], field_name="subject_refs"))
-                          if raw.get("subject_refs") is not None else None),
+            subjects=(parse_subjects(raw["subjects"], field="tasks[].subjects")
+                          if raw.get("subjects") is not None else None),
         ))
     if clarification and tasks:
         raise QueryValidationError("clarification_with_tasks", "需要澄清时不得同时提交执行任务")
@@ -188,12 +186,9 @@ def validate_plan(plan: AgentPlan, context: QueryContext, tools: set[str], *,
     if plan.clarification:
         return plan
     subject_slots = {goal.subject_slot for goal in context.goals if goal.subject_slot}
-    producers = {task.binding_key or task.output_slot for task in (*previous, *plan.tasks)}
+    producers = {task.output_slot for task in (*previous, *plan.tasks)}
     if subject_slots - producers:
         raise QueryValidationError("subject_without_producer", "待取证主体必须由任务产出")
-    for task in plan.tasks:
-        if task.binding_key and task.binding_key not in subject_slots:
-            raise QueryValidationError("unknown_subject_binding", "绑定目标必须是已声明的主体变量")
     if not plan.tasks:
         if initial:
             covered = {goal_id for task in previous for goal_id in task.goal_ids}
@@ -223,15 +218,15 @@ def validate_plan(plan: AgentPlan, context: QueryContext, tools: set[str], *,
             raise QueryValidationError("unknown_goal_ids", "任务必须引用已确认目标")
         if task.inherit_document_scope and task.tool != "search_knowledge_base":
             raise QueryValidationError("unsupported_document_scope", "网页工具不能继承内部文档范围")
-        bound_refs = {ref for g in task.goal_ids for ref in goals[g].subject_refs}
-        if task.subject_refs is not None:
-            if not set(task.subject_refs) <= bound_refs or (bound_refs and not task.subject_refs):
+        bound_refs = {ref for g in task.goal_ids for ref in goals[g].subjects}
+        if task.subjects is not None:
+            if not set(task.subjects) <= bound_refs or (bound_refs and not task.subjects):
                 raise QueryValidationError("invalid_task_subjects", "任务主体只能缩小到目标中已声明的主体")
-        consumed_subjects = {tasks_by_id[parent].binding_key or tasks_by_id[parent].output_slot
+        consumed_subjects = {tasks_by_id[parent].output_slot
                              for parent in task.depends_on}
         for goal_id in task.goal_ids:
             slot = goals[goal_id].subject_slot
-            if slot and (task.binding_key or task.output_slot) != slot and slot not in consumed_subjects:
+            if slot and (task.output_slot) != slot and slot not in consumed_subjects:
                 raise QueryValidationError("subject_slot_not_bound", "未知主体的检索任务必须使用其证据变量")
         if task.inherit_document_scope:
             if any(tasks_by_id[parent].tool != "search_knowledge_base" for parent in task.depends_on):
@@ -244,8 +239,13 @@ def validate_plan(plan: AgentPlan, context: QueryContext, tools: set[str], *,
     consumed_slots = {slot for task in plan.tasks for slot in task.required_slots}
     normalized = []
     for task in plan.tasks:
+        if task.subjects is None:
+            names = tuple(dict.fromkeys(
+                name for goal in context.goals if goal.id in task.goal_ids for name in goal.subjects
+            ))
+            task = replace(task, subjects=names)
         if (task.output_slot and task.output_slot not in consumed_slots
-                and not task.binding_key and task.output_slot not in subject_slots):
+                and task.output_slot not in subject_slots):
             logger.info("unused_output_slot_removed: task_id=%s output_slot=%s", task.id, task.output_slot)
             task = replace(task, output_slot=None)
         normalized.append(task)

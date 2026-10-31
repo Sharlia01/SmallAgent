@@ -197,3 +197,21 @@ def test_unused_repair_slot_does_not_bypass_repeated_search_guard(monkeypatch):
     assert result.stop_reason == "no_progress"
     assert len(tool.calls) == 1
     assert result.replan_decisions[-1]["execution_skipped"] == "repeated_direct_plan"
+
+
+def test_identity_conflict_is_execution_failure_without_replanning():
+    from service.core.evidence.adapter import collection_from_records
+    evidence = collection_from_records([
+        {'chunk_id': 'same', 'content_with_weight': '原始版本'},
+        {'chunk_id': 'same', 'content_with_weight': '不同原文'},
+    ])
+    client = ModelClient([initial(tasks=[])])
+    run = AgentLoop(client=client, model='test', tools=[]).run(
+        context=prepare_query_context('员工培训要求'), initial_evidence=evidence)
+    assert run.outcome == 'execution_error'
+    assert run.stop_reason == 'verification_failed'
+    assert len(client.calls) == 1
+    assert run.assessment.verification_status == 'unavailable'
+    assert run.assessment.to_dict()['failure_kind'] == 'EvidenceIdentityConflict'
+    assert run.assessment.missing_requirements == []
+    assert run.assessment.goal_coverage == []

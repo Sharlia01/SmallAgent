@@ -23,6 +23,26 @@ E2E_RESULT_SCHEMA_VERSION = "3.1"
 ANSWER_JUDGE_SYSTEM_PROMPT = """
 你是严格的 RAG 答案质量评估器。比较生成答案与参考答案，只评价事实正确性和要求覆盖度，不评价文风。
 
+先区分输入角色：question 是用户要求，reference_answer 是核对基准，generated_answer 是唯一被评分的实际回答。
+参考答案不能替生成答案补充其未表达的事实、数值、单位、期间、口径或限定条件。
+先确认生成答案实际表达了什么，再与参考答案比较；不能因数值相同就认为单位及限定条件也已表达。
+允许从生成答案自身明确的表头、上下文或等价表述理解含义，但不得仅从参考答案移植信息。
+reason 中描述“生成答案给出/说明/遗漏”的内容必须与 generated_answer 一致；若信息仅出现在参考答案中，应明确区分。
+例如参考答案为“每股分红0.25元”，生成答案为“每股分红0.25，原表未标明货币单位”：
+应描述为“数值一致，生成答案未确定货币单位，并说明原表未标明”，不能写“生成答案给出了0.25元”。
+生成答案声称原文未标单位，不代表你已核实原文；本次没有原始证据时，不得声称已确认来源内容。
+该例只说明如何准确描述差异，不预设分数；是否影响正确性或完整性，仍须结合用户要求和实际回答判断。
+涉及数值时，分别检查数值和单位，再综合评分：
+- 数值检查：核对指标、主体、期间对应的数字及计算结果；仅数字相同而单位未确定时，只能认定数字一致，不能直接认定金额或数量完全一致。
+- 单位检查：区分明确正确、由生成答案自身上下文明确、未说明、明确表示不确定、明确错误及不适用。
+  同一列表或表格已统一说明单位时，不要求每个数值重复标注；纯比例或其他无量纲数值不强求货币或数量单位。
+- 单位明确且可换算时，统一单位后比较数量，不能仅因数字写法不同判错，例如100百万元与1亿元等价。
+  单位错误、数量级错误、百分比与百分点混淆属于实质错误，应影响 correctness_score。
+- 未说明单位或明确表示单位不确定，不自动等同于单位错误；结合问题要求及答案上下文判断是否留下必要信息缺口，并据此判断 completeness_score。
+  明确说明限制不代表已经满足需求，也不能因参考答案标了单位，就声称生成答案已标注或使用了错误单位。
+- 若单位差异影响评分，在 reason 中分别说明数字是否一致、单位如何表达以及对评分的影响；不要求没有相关问题的回答逐项展开检查过程。
+输出前检查评分理由，确保没有把参考答案中的信息写成生成答案已经提供的信息。
+
 规则：
 1. correctness_score 和 completeness_score 必须是 0 到 1 之间的数字。
 2. 与参考答案矛盾、数值或时间错误会降低 correctness_score。
@@ -517,6 +537,90 @@ def aggregate_e2e_results(
     return aggregated
 
 
+def _compact_e2e_metrics(metrics: dict[str, Any], results: list[dict[str, Any]]) -> dict[str, Any]:
+    """主指标与诊断分层；原始逐题记录和纯检索聚合保持原口径。"""
+    main_keys = ("query_count", "outcome_counts", "average_total_latency_ms",
+                 "answer_correctness", "answer_completeness", "faithfulness", "citation_recall")
+    main = {key: metrics[key] for key in main_keys}
+    main["execution_failure_count"] = sum(
+        bool(row.get("error")) or result_outcome(row) in NON_EVIDENCE_OUTCOMES for row in results)
+    refusal = metrics["refusal_metrics"]
+    main["refusal_metrics"] = {key: refusal[key] for key in (
+        "unsafe_answer_rate", "over_refusal_rate", "unsafe_answer_count", "over_refusal_count",
+        "expected_refusal_count", "expected_clarification_count", "clarification_accuracy")}
+    main["refusal_metrics"]["expected_answer_count"] = sum(
+        not row.get("error") and result_outcome(row) not in NON_EVIDENCE_OUTCOMES
+        and (row.get("refusal_metrics") or {}).get("expected_behavior") == "answer" for row in results)
+    scoring = {}
+    for name, group, key in (
+        ("answer_correctness", "answer_metrics", "correctness_score"),
+        ("answer_completeness", "answer_metrics", "completeness_score"),
+        ("faithfulness", "faithfulness_metrics", "faithfulness_score"),
+        ("citation_recall", "citation_metrics", "citation_recall"),
+    ):
+        applicable = [r for r in results if r.get("response_mode") == "answer"
+                      and (group != "answer_metrics" or r.get("answerable"))]
+        no_facts = [r for r in applicable if group != "answer_metrics" and (
+            (r.get(group) or {}).get("factual_claim_count") == 0
+            or (r.get(group) or {}).get("judge_source") == "skipped_no_claims")]
+        applicable = [r for r in applicable if r not in no_facts]
+        scoring[name] = {
+            "applicable_count": len(applicable),
+            "evaluated_count": sum((r.get(group) or {}).get(key) is not None for r in applicable),
+            "judge_failure_count": sum(bool((r.get(group) or {}).get("judge_error")) for r in applicable),
+            "not_applicable_count": len(no_facts),
+        }
+    main["scoring"] = scoring
+    main["latency_sample_count"] = sum(not r.get("error") for r in results)
+    query = metrics["query_metrics"]
+    query_keys = ("runtime_sample_count", "runtime_unavailable_count", "average_model_calls",
+                  "average_retrieval_calls", "evaluated_goal_count", "supported_goal_rate",
+                  "verification_unavailable_count", "goal_metrics_version", "goal_metric_scope",
+                  "planned_goal_count", "unevaluated_goal_count", "supported_goal_count",
+                  "goal_plan_unavailable_sample_count")
+    diagnostics = {
+        "query_metrics": {k: v for k, v in query.items() if k in query_keys or k.startswith("repair_")},
+        "verification": {"gate_metrics": metrics["gate_metrics"],
+                         "sufficiency_metrics": metrics["sufficiency_metrics"]},
+        **{k: metrics[k] for k in ("verification_evidence_metrics", "answer_evidence_metrics",
+                                   "retrieval_call_metrics")},
+        "faithfulness": {k: v for k, v in metrics.items() if k.startswith("faithfulness_")},
+        "citation": {k: metrics[k] for k in ("citation_validity", "citation_precision")},
+    }
+    # 将各层级样本索引统一为逐题诊断列表，避免重复存储同一批 ID。
+    issues: dict[str, list[str]] = {}
+    def collect(value, path):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                collect(item, f"{path}.{key}" if path else key)
+        elif isinstance(value, list):
+            for identifier in value:
+                if isinstance(identifier, str):
+                    issues.setdefault(identifier, []).append(path)
+    indexes = metrics["non_perfect_sample_ids"]
+    collect({k: v for k, v in indexes.items() if k not in {"retrieval_metrics", "post_gate_metrics"}}, "")
+    def strip_indexes(value, path=""):
+        if isinstance(value, dict):
+            for key in list(value):
+                if key == "non_perfect_sample_ids":
+                    collect(value.pop(key), path)
+                else:
+                    strip_indexes(value[key], f"{path}.{key}" if path else key)
+    strip_indexes(diagnostics)
+    for row in results:
+        identifier = str(row.get("id") or "")
+        if not identifier:
+            continue
+        if row.get("error") or result_outcome(row) in NON_EVIDENCE_OUTCOMES:
+            issues.setdefault(identifier, []).append("execution_failure")
+        for group in ("answer_metrics", "faithfulness_metrics", "citation_metrics"):
+            if (row.get(group) or {}).get("judge_error"):
+                issues.setdefault(identifier, []).append(f"{group}.judge_failure")
+    main["sample_issues"] = [{"id": key, "metrics": sorted(set(value))} for key, value in issues.items()]
+    main["diagnostics"] = diagnostics
+    return main
+
+
 def build_e2e_summary(
     results: list[dict[str, Any]],
     *,
@@ -528,6 +632,7 @@ def build_e2e_summary(
             result
         )
     return {
+        "summary_schema_version": "4.0",
         "result_schema_version": E2E_RESULT_SCHEMA_VERSION,
         "metric_ks": list(resolve_metric_ks(top_k)),
         "question_type_counts": dict(
@@ -538,9 +643,9 @@ def build_e2e_summary(
                 ).items()
             )
         ),
-        "overall": aggregate_e2e_results(results, top_k=top_k),
+        "overall": _compact_e2e_metrics(aggregate_e2e_results(results, top_k=top_k), results),
         "by_question_type": {
-            name: aggregate_e2e_results(items, top_k=top_k)
+            name: _compact_e2e_metrics(aggregate_e2e_results(items, top_k=top_k), items)
             for name, items in sorted(by_question_type.items())
         },
     }

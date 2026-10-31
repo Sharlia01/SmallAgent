@@ -46,6 +46,7 @@ EVIDENCE_FIELDS = (
     "table_schema_version_kwd",
     "table_context_obj",
     "table_candidate_obj",
+    "table_source_fingerprints_obj",
     "visual_status_kwd",
     "visual_model_kwd",
     "image_ref_kwd",

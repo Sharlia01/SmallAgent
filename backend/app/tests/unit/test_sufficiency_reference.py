@@ -1,4 +1,5 @@
 """充分性标签独立于系统决定，并在逐题、归因和汇总中保持一致。"""
+from tests.evidence_helpers import requirements_for_atoms
 from copy import deepcopy
 
 import pytest
@@ -9,14 +10,10 @@ from evaluation.retrieval import evaluate_retrieval_case, aggregate_retrieval_st
 pytestmark = pytest.mark.unit
 
 
-def table_sample(*, requirement=False):
-    sample = {"id": "table", "answerable": True, "relevant_evidence": [
-        {"document_name": "报告.pdf", "evidence_type": "table", "row_cells": ["收入", "100"], "text": "收入100"}
-    ]}
-    if requirement:
-        sample["evidence_requirements"] = [{"id": "income", "alternatives": [[
-            {"type": "table_row", "document_name": "报告.pdf", "row_cells": ["收入", "100"]}
-        ]]}]
+def table_sample():
+    sample = {"id": "table", "answerable": True, "evidence_requirements": requirements_for_atoms([
+        {"document_name": "报告.pdf", "type": "table_row", "row_cells": ["收入", "100"], "text": "收入100"}
+    ])}
     return sample
 
 
@@ -40,10 +37,9 @@ def e2e(case):
             "sufficiency_metrics": evaluate_sufficiency(case, case)}
 
 
-@pytest.mark.parametrize("requirement", [False, True])
 @pytest.mark.parametrize("binding,expected", [("bound", True), ("unbound", False), (None, None), ("legacy", None)])
-def test_table_annotation_form_does_not_change_reference(requirement, binding, expected):
-    sample = table_sample(requirement=requirement)
+def test_table_requirement_uses_binding_for_reference(binding, expected):
+    sample = table_sample()
     case = score(sample, [table_chunk("table", binding)])
     # 都是检索命中；结构可靠性是另一项判断。
     assert case["verification_evidence_metrics"]["recall"] == 1
@@ -60,23 +56,21 @@ def test_table_annotation_form_does_not_change_reference(requirement, binding, e
 
 
 @pytest.mark.parametrize("reverse", [False, True])
-@pytest.mark.parametrize("requirement", [False, True])
-def test_later_usable_chunk_is_not_hidden_by_first_unbound_match(reverse, requirement):
+def test_later_usable_chunk_is_not_hidden_by_first_unbound_match(reverse):
     chunks = [table_chunk("bad", "unbound"), table_chunk("good", "bound")]
     if reverse:
         chunks.reverse()
-    case = score(table_sample(requirement=requirement), chunks)
+    case = score(table_sample(), chunks)
     assert case["evidence_sufficiency_reference"]["expected_sufficient"] is True
     match = case["evidence_matches_before_sufficiency"][0]
-    if requirement:
-        match = match["alternative_matches"][0]["atom_matches"][0]
+    match = match["alternative_matches"][0]["atom_matches"][0]
     assert len(match["candidate_matches"]) == 2
     assert next(c for c in match["candidate_matches"] if c["matched_chunk_id"] == "good")["usable"] is True
 
 
 @pytest.mark.parametrize("reverse", [False, True])
 def test_complete_text_alternative_can_replace_unusable_table(reverse):
-    sample = table_sample(requirement=True)
+    sample = table_sample()
     alternatives = sample["evidence_requirements"][0]["alternatives"]
     alternatives.append([{"type": "text", "document_name": "报告.pdf", "text": "正文明确收入一百"}])
     if reverse:
@@ -102,13 +96,10 @@ def test_atoms_from_different_incomplete_alternatives_cannot_be_combined():
     assert all(not a["usable"] for a in case["evidence_matches_before_sufficiency"][0]["alternative_matches"])
 
 
-@pytest.mark.parametrize("requirement", [False, True])
 @pytest.mark.parametrize("status,expected", [("extracted", True), ("unextracted", False), (None, None)])
-def test_figure_uses_same_reference_for_both_metric_groups(requirement, status, expected):
-    figure = {"document_name": "报告.pdf", "evidence_type": "figure", "locator": "图1 发电量", "text": "发电量下降"}
-    sample = {"id": "figure", "answerable": True, "relevant_evidence": [figure]}
-    if requirement:
-        sample["evidence_requirements"] = [{"id": "figure", "alternatives": [[{**figure, "type": "figure"}]]}]
+def test_figure_uses_same_reference_for_both_metric_groups(status, expected):
+    figure = {"document_name": "报告.pdf", "type": "figure", "locator": "图1 发电量", "text": "发电量下降"}
+    sample = {"id": "figure", "answerable": True, "evidence_requirements": requirements_for_atoms([figure])}
     chunk = {"chunk_id": "figure", "document_name": "报告.pdf", "content_with_weight": "图1 发电量",
              **({"visual_status_kwd": status} if status else {})}
     case = score(sample, [chunk])
@@ -118,7 +109,7 @@ def test_figure_uses_same_reference_for_both_metric_groups(requirement, status, 
 
 
 def test_unknown_alternative_does_not_become_false_and_known_failure_dominates_and():
-    sample = table_sample(requirement=True)
+    sample = table_sample()
     sample["evidence_requirements"][0]["alternatives"].append([
         {"type": "text", "document_name": "报告.pdf", "text": "未找到的正文"}
     ])
@@ -158,7 +149,8 @@ def test_missing_snapshot_and_legacy_records_stay_unknown_even_with_perfect_reca
     legacy.pop("evidence_sufficiency_reference")
     for match in legacy["evidence_matches_before_sufficiency"]:
         match.pop("usable")
-        match.pop("candidate_matches")
+        match.pop("alternative_matches")
+        match.pop("atom_matches")
     assert evaluate_sufficiency(table_sample(), legacy)["expected_sufficient"] is None
     gate = aggregate_retrieval_stages([legacy], top_k=5)["gate_metrics"]
     assert gate["false_rejection_with_sufficient_evidence_count"] == 0

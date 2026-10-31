@@ -1,5 +1,6 @@
 """独立检索指标与拒绝指标的回归测试。"""
 
+from tests.evidence_helpers import requirements_for_atoms
 import json
 
 import pytest
@@ -30,9 +31,9 @@ def sample(*, answerable=True):
         "reference_answer": "467602百万元" if answerable else "未提供",
         "answerable": answerable,
         "question_type": "fact" if answerable else "unanswerable",
-        "relevant_evidence": [
+        "evidence_requirements": requirements_for_atoms([
             {"document_name": "report.pdf", "text": "固定资产467602百万元"}
-        ] if answerable else [],
+        ] if answerable else []),
         "metadata": {},
     }
 

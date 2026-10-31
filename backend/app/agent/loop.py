@@ -68,12 +68,12 @@ def collect_tool_evidence(results: list[ToolResult]) -> EvidenceCollection:
 
 
 class AgentLoop:
-    def __init__(self, *, client: Any, model: str, tools: list, max_steps: int | None = None):
+    def __init__(self, *, client: Any, model: str, tools: list, max_steps: int | None = None, default_top_k: int = 5):
         if max_steps is None:
             max_steps = int(positive_setting("AGENT_MAX_STEPS", DEFAULT_MAX_STEPS, maximum=10))
         if type(max_steps) is not int or not 1 <= max_steps <= 10:
             raise ValueError("max_steps 必须为1到10的整数")
-        self.executor = ToolExecutor(tools)
+        self.executor = ToolExecutor(tools, default_top_k=default_top_k)
         self.planner = AgentPlanner(client=client, model=model, tool_definitions=self.executor.definitions())
         self.max_steps = max_steps
 

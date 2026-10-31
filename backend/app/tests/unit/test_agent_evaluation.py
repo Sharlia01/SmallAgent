@@ -1,4 +1,5 @@
 """独立问答与端到端评测共用 Agent；外部报告不能替代服务端核验。"""
+from tests.evidence_helpers import requirements_for_atoms
 import pytest
 from agent import loop
 from evaluation.agent import execute_agent_turn
@@ -8,6 +9,44 @@ from service.core.retrieval.result import adapt_retrieval_records
 from service.core.query.contract import RetrievalTask
 
 pytestmark = pytest.mark.unit
+
+
+@pytest.mark.parametrize("task_options,global_options,expected", [
+    ({}, {}, 5), ({}, {"page_size": 8}, 8),
+    ({"top_k": None}, {"page_size": 8}, 8),
+    ({"top_k": 10}, {"page_size": 5}, 10),
+    ({"top_k": 5}, {"page_size": 8}, 5),
+])
+def test_task_top_k_overrides_global_default(monkeypatch, task_options, global_options, expected):
+    monkeypatch.setattr(loop, "verify_evidence", coverage_verifier())
+    sizes = []
+    def retrieve(index, query, **options):
+        sizes.append(options["page_size"])
+        return {"chunks": records()}
+    result = execute_agent_turn(
+        index_names="test", question="员工培训要求",
+        planner_client=ModelClient([initial(tasks=[task(**task_options)])]),
+        answer_client=AnswerClient(), retrieval_function=retrieve,
+        retrieval_options=global_options)
+    assert sizes == [expected]
+    assert result.raw_retrieval["retrieval_calls"][0]["top_k"] == expected
+    assert result.raw_retrieval["agent_execution"]["tasks"][0]["top_k"] == expected
+
+
+def test_repair_can_expand_top_k_beyond_global_default(monkeypatch):
+    monkeypatch.setattr(loop, "verify_evidence", coverage_verifier(2))
+    sizes = []
+    def retrieve(index, query, **options):
+        sizes.append(options["page_size"])
+        return {"chunks": records(f"c{options['page_size']}")}
+    result = execute_agent_turn(
+        index_names="test", question="员工培训要求",
+        planner_client=ModelClient([initial(), {"tasks": [task(id="s2", top_k=10)]}]),
+        answer_client=AnswerClient(), retrieval_function=retrieve,
+        retrieval_options={"page_size": 5})
+    assert sizes == [5, 10]
+    assert [call["top_k"] for call in result.raw_retrieval["retrieval_calls"]] == sizes
+    assert [item["top_k"] for item in result.raw_retrieval["agent_execution"]["tasks"]] == sizes
 
 
 def test_evaluation_preserves_contract_and_returns_full_evidence(monkeypatch):
@@ -108,7 +147,7 @@ def test_repaired_sixth_evidence_is_scored_and_only_selected_context_is_delivere
         assert "每年培训一次" in answer.calls[0]["messages"][-1]["content"]
         assert "无关信息" not in answer.calls[0]["messages"][-1]["content"]
     sample = {"id": "sixth-evidence", "answerable": True,
-              "relevant_evidence": [{"document_name": "制度", "text": "员工培训要求：每年培训一次"}]}
+              "evidence_requirements": requirements_for_atoms([{"document_name": "制度", "text": "员工培训要求：每年培训一次"}])}
     case = evaluate_retrieval_case(sample, result.raw_retrieval, latency_ms=1, top_k=5, match_threshold=1)
     assert case["retrieval_metrics"] is None and case["post_gate_metrics"] is None
     assert case["verification_evidence_metrics"]["recall"] == 1

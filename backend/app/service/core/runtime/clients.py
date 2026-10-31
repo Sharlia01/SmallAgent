@@ -22,11 +22,11 @@ def agent_fallback_model() -> str:
 
 @lru_cache(maxsize=1)
 def get_verification_client() -> OpenAI:
-    api_key = os.getenv("SILICONFLOW_API_KEY", "").strip()
-    base_url = os.getenv("SILICONFLOW_BASE_URL", "").strip()
+    api_key = os.getenv("DASHSCOPE_API_KEY", "").strip()
+    base_url = os.getenv("DASHSCOPE_BASE_URL", "").strip()
     if not api_key or not base_url:
         raise RuntimeError(
-            "SILICONFLOW_API_KEY and SILICONFLOW_BASE_URL are required for "
+            "DASHSCOPE_API_KEY and DASHSCOPE_BASE_URL are required for "
             "evidence sufficiency checks"
         )
     return OpenAI(api_key=api_key, base_url=base_url)

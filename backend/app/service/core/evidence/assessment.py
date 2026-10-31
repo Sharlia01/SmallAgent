@@ -5,7 +5,6 @@ from dataclasses import replace
 
 from domain.assessment import EvidenceAssessment
 from domain.evidence import EvidenceCollection, fingerprint
-from service.core.entities.registry import get_entity_registry
 from service.core.query.context import QueryContext
 from service.core.runtime.context import POLICY_VERSION
 from service.core.query.semantics import domain_policy
@@ -18,8 +17,8 @@ def verification_policy_version() -> str:
         "RAG_EVIDENCE_SUFFICIENCY_TRANSIENT_RETRY",
         "RAG_EVIDENCE_SUFFICIENCY_CONTEXT_TOKENS",
     )}
-    return fingerprint((POLICY_VERSION, "unified-evidence-v9-gap", domain_policy()["version"],
-                        get_entity_registry().version, settings))
+    return fingerprint((POLICY_VERSION, "unified-evidence-v12-question-authority", domain_policy()["version"],
+                        settings))
 
 
 def finalize_assessment(query: QueryContext, evidence: EvidenceCollection, assessment: EvidenceAssessment, *,

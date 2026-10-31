@@ -9,7 +9,6 @@ from domain.evidence import EvidenceCollection
 from service.core.evidence.adapter import collection_from_records, evidence_from_record
 from service.core.evidence.metadata import evidence_metadata
 from service.core.retrieval.result import RetrievalResult
-from service.core.retrieval.entities import resolve_company_hints
 from service.core.retrieval.table_context import expand_table_contexts
 from service.core.query.semantics import alias_expansions
 from service.core.query.contract import RetrievalTask
@@ -51,13 +50,13 @@ def retrieve_evidence(index_names: str | list[str], question: str, *,
         raise ValueError("分页参数无效")
     query = query.strip()
     started = time.perf_counter()
-    scope = task.company_hints if task and task.company_hints is not None else resolve_company_hints(query)
+    scope = task.subject_names if task else None
     options = Dealer.RetrievalOptions(
         kb_ids=None, page=page, page_size=page_size,
         similarity_threshold=similarity_threshold, vector_similarity_weight=vector_similarity_weight,
         candidate_size=candidate_size, rerank_candidate_size=rerank_candidate_size,
         rrf_k=rrf_k, final_reranker_weight=final_reranker_weight, final_rrf_k=final_rrf_k,
-        company_hints=scope, doc_ids=list(task.document_ids) if task and task.document_ids else None,
+        subject_names=scope, doc_ids=list(task.document_ids) if task and task.document_ids else None,
     )
     # 这里只增加词表里明确等价的别名；模型生成的新搜索方向由 Agent 负责。
     aliases = (alias_expansions(query, 8) if os.getenv("RETRIEVAL_ALIAS_EXPANSION_ENABLED", "true").lower()
@@ -163,7 +162,7 @@ def retrieval_diagnostics(results: dict[str, Any]) -> dict[str, Any]:
     return {
         "retrieval_fusion": dict(results.get("retrieval_fusion") or {}),
         "doc_aggs": list(results.get("doc_aggs") or []),
-        "company_hints": dict(results.get("company_hints") or {}),
+        "subject_names": list(results.get("subject_names") or []),
         "stage_latency_ms": dict(results.get("stage_latency_ms") or {}),
         "query_runtime": dict(results.get("query_runtime") or {}),
     }

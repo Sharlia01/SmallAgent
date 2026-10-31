@@ -12,6 +12,7 @@ from service.core.answering.answer_context import build_answer_context, build_an
 from service.core.runtime.execution import bounded_query
 from service.core.runtime.context import current_runtime
 from service.core.answering.policy import render_evidence_refusal
+from service.core.answering.streaming import ObservedAnswerStream
 
 from agent.loop import AgentLoop, AgentRun
 from agent.tools.base import AgentTool
@@ -24,10 +25,10 @@ logger = logging.getLogger(__name__)
 class AgentExecution:
     """完整执行结果；证据和核验报告统一保存在 AgentRun，前端数据在输出边界生成。"""
 
-    agent_run: AgentRun  #保存了证据集合、证据核验结果
-    context: AnswerContext | None = None  #最终回答采用的内容上下文，保留了完整的chunk原始内容
-    answer_messages: list[dict[str, str]] = field(default_factory=list) #发给回答模型，让模型生成答案的输入
-    answer_stream: Any | None = None #回答模型根据answer_messages生成的输出
+    agent_run: AgentRun  # 保存了证据集合、证据核验结果
+    context: AnswerContext | None = None  # 最终回答采用的内容上下文，保留了完整的chunk原始内容
+    answer_messages: list[dict[str, str]] = field(default_factory=list) # 发给回答模型，让模型生成答案的输入
+    answer_stream: Any | None = None # 回答模型根据answer_messages生成的输出
     direct_answer: str | None = None  #拒答或请求澄清的文本，表示不需要调用模型，直接返回给用户
     response_mode: str = "answer"
     query_runtime: dict[str, Any] = field(default_factory=dict)
@@ -74,12 +75,14 @@ class AgentOrchestrator:
         answer_model: str,
         tools: list[AgentTool],
         max_steps: int | None = None,
+        default_top_k: int = 5,
     ):
         self._agent = AgentLoop(
             client=planner_client,
             model=planner_model,
             tools=tools,
             max_steps=max_steps,
+            default_top_k=default_top_k,
         )
         self._answer_client = answer_client
         self._answer_model = answer_model
@@ -140,15 +143,22 @@ class AgentOrchestrator:
         reference_count: int,
     ) -> Any:
         """启动回答流，记录请求耗时，并保持原始异常向上传递。"""
+        runtime = current_runtime()
+        observed = ObservedAnswerStream(
+            model=self._answer_model, session_id=session_id,
+            trace_id=runtime.trace_id if runtime else None, reference_count=reference_count,
+            messages=messages, sdk_max_retries=getattr(self._answer_client, 'max_retries', None))
         answer_request_started_at = time.perf_counter()
         try:
             answer_stream = self._answer_client.chat.completions.create(
                 model=self._answer_model,
                 messages=messages,
                 stream=True,
+                stream_options={"include_usage": True},
                 temperature=0,
             )
-        except Exception:
+        except Exception as error:
+            observed.request_failed(error)
             logger.info(
                 "PERF session_id=%s stage=answer_request model=%s "
                 "status=error duration_ms=%.1f",
@@ -165,7 +175,7 @@ class AgentOrchestrator:
             reference_count,
             (time.perf_counter() - answer_request_started_at) * 1000,
         )
-        return answer_stream
+        return observed.attach(answer_stream)
 
     @bounded_query
     def run(self, *, session_id: str, question: str, session_context: str | None = None,

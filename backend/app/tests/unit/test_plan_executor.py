@@ -12,6 +12,24 @@ from tests.agent_helpers import SearchTool, records
 pytestmark = pytest.mark.unit
 
 
+def test_top_k_cache_uses_effective_value_and_expansion_is_not_repeated():
+    tool = SearchTool([records(), records("expanded")])
+    executor = ToolExecutor([tool], default_top_k=8)
+    context = prepare_query_context("员工培训要求")
+    cache = {}
+    first = AgentTask("first", query="员工培训要求", goal_ids=("g1",))
+    explicit = AgentTask("same", query=first.query, goal_ids=first.goal_ids, top_k=8)
+    expanded = AgentTask("more", query=first.query, goal_ids=first.goal_ids, top_k=10)
+    with query_runtime():
+        state = executor.execute_task(first, context, {}, cache)
+        assert state.task.top_k == 8
+        assert executor.is_repeated_direct_plan(AgentPlan((explicit,)), context, cache)
+        assert executor.execute_task(explicit, context, {}, cache).cache_hit
+        assert not executor.is_repeated_direct_plan(AgentPlan((expanded,)), context, cache)
+        assert executor.execute_task(expanded, context, {}, cache).task.top_k == 10
+    assert len(tool.calls) == 2
+
+
 def dependent_plan(tool="search_knowledge_base", scoped=False):
     return AgentPlan((
         AgentTask("first", "search_knowledge_base", query="研报推荐公司", goal_ids=("g1",), output_slot="company"),
@@ -21,7 +39,7 @@ def dependent_plan(tool="search_knowledge_base", scoped=False):
 
 
 def binding(**kwargs):
-    return BridgeExtraction(kwargs["slot"], "甲公司", 1, "c1", "doc1", "rule", source_quote="甲公司")
+    return BridgeExtraction(kwargs["slot"], "甲公司", "c1", "doc1", source_quote="甲公司")
 
 
 def test_kb_binding_can_drive_web_query():

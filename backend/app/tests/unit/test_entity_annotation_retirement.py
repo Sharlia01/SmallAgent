@@ -10,7 +10,6 @@ from service.core.evidence.sufficiency import VerificationItem
 from service.core.ingestion import pipeline as ingestion
 from service.core.persistence import evidence_store
 from service.core.rag.nlp.search_v2 import Dealer
-from service.core.retrieval.entities import CompanyHints
 from service.core.retrieval.table_context import expand_table_chunk_context
 
 
@@ -91,9 +90,12 @@ def test_legacy_parent_and_chunk_reach_verifier_with_raw_structure_only(monkeypa
     model_input = VerificationItem(evidence, evidence.text).model_record(1)
     output = source_record(evidence)
 
-    assert "华能国际" in model_input["content"]
-    assert "600011" in model_input["content"]
-    for record in (model_input, output):
+    assert "content" not in model_input
+    assert "华能国际" in str(model_input)
+    assert "600011" in str(model_input)
+    assert "entity_attribution" not in str(model_input)
+    assert "subject_entity_ids" not in str(model_input)
+    for record in (output,):
         exported = record["table_context_obj"]["rows"][0]
         assert exported["row_index"] == 3
         assert exported["headers"] == row["headers"]
@@ -120,9 +122,7 @@ def test_peer_mentions_and_missing_or_conflicting_labels_do_not_drop_candidates(
     fields["peer-mention"]["candidate_subject_entity_ids"] = ["华能国际"]
     fields["wrong-tag"]["subject_entity_ids"] = ["华能国际"]
     result = Dealer.SearchResult(total=3, candidate_ids=list(texts), candidate_fields=fields)
-    options = Dealer.RetrievalOptions(company_hints=CompanyHints(
-        entity_names=("国电电力",), source="model_understanding",
-    ))
+    options = Dealer.RetrievalOptions(subject_names=("国电电力",))
     dealer = object.__new__(Dealer)
     dealer.rerank_by_model = lambda search_result, question: np.array([0.9, 0.8, 0.7])
 

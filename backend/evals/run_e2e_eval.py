@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import hashlib
 import json
 import logging
@@ -12,6 +13,7 @@ import re
 import sys
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -39,10 +41,9 @@ if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 
 from openai import OpenAI  # noqa: E402
-from html_report import render_html_report  # noqa: E402
+from e2e_artifact import write_outputs  # noqa: E402
 
 from run_retrieval_eval import (  # noqa: E402
-    atomic_write_text,
     expand_index_names,
     load_dataset,
     select_samples,
@@ -73,7 +74,7 @@ logger = logging.getLogger(__name__)
 
 
 def run_stage(sample_id: str, stage: str, function: Callable[..., Any], *args, **kwargs) -> Any:
-    """每个可能等待外部服务的阶段单独记录，HTTP 200 不能代表整个样本已完成。"""
+    """给执行过程加上统一的阶段日志和耗时记录，不改变被包装函数的计算逻辑"""
     started = time.perf_counter()
     logger.info("EVAL sample_id=%s stage=%s status=start", sample_id, stage)
     try:
@@ -253,26 +254,6 @@ def error_result(
     }
 
 
-def write_outputs(
-    result_path: Path,
-    summary_path: Path,
-    results: list[dict[str, Any]],
-    summary: dict[str, Any],
-) -> None:
-    atomic_write_text(
-        result_path,
-        "".join(
-            json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n"
-            for result in results
-        ),
-    )
-    atomic_write_text(
-        summary_path,
-        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
-    )
-    atomic_write_text(result_path.with_suffix(".html"), render_html_report(results, summary))
-
-
 def score_result(result: dict[str, Any], *, client: Any, judge_model: str | None,
                  judge_timeout: float) -> None:
     """只对已保存的答案和证据评分，不重新执行问答或检索。"""
@@ -318,13 +299,17 @@ def score_result(result: dict[str, Any], *, client: Any, judge_model: str | None
                   citation_metrics=citation_metrics)
 
 
-def main() -> int:
-    args = parse_args()
-    validate_args(args)
+@dataclass
+class EvaluationRunState:
+    """一次评测的结果快照与落盘状态。"""
 
-    from dotenv import load_dotenv
+    results: list[dict[str, Any]]
+    summary: dict[str, Any]
+    result_path: Path
+    started_clock: float
 
-    load_dotenv(BACKEND_DIRECTORY / ".env")
+
+def load_selected_samples(args: argparse.Namespace) -> list[dict[str, Any]]:
     samples = select_samples(
         load_dataset(args.dataset.resolve()),
         args.sample_id,
@@ -332,37 +317,11 @@ def main() -> int:
         splits=args.split,
     )
     validate_e2e_samples(samples)
-    if args.validate_only:
-        print(json.dumps({"dataset": str(args.dataset.resolve()), "selected_samples": len(samples),
-                          "execution_mode": "agent", "valid": True}, ensure_ascii=False, indent=2))
-        return 0
-    index_names = expand_index_names(args.index_name)
-    index_argument: str | list[str] = (
-        index_names[0] if len(index_names) == 1 else index_names
-    )
-    answer_model = args.answer_model or os.getenv(
-        "CHAT_MODEL",
-        DEFAULT_ANSWER_MODEL,
-    )
-    judge_model = None if args.no_judge else (
-        args.judge_model
-        or os.getenv("E2E_JUDGE_MODEL", DEFAULT_JUDGE_MODEL)
-    )
-    client = build_client()
+    return samples
 
-    output_directory = args.output_dir.resolve()
-    result_path = output_directory / f"{args.run_name}.jsonl"
-    answers_path = output_directory / f"{args.run_name}_answers.jsonl"
-    summary_path = output_directory / f"{args.run_name}_summary.json"
-    html_path = result_path.with_suffix(".html")
-    existing = [path for path in (result_path, answers_path, summary_path, html_path) if path.exists()]
-    if existing and not args.overwrite:
-        raise FileExistsError(
-            "Result files already exist: "
-            + ", ".join(str(path) for path in existing)
-        )
 
-    retrieval_options = {
+def build_retrieval_options(args: argparse.Namespace) -> dict[str, Any]:
+    return {
         "page_size": args.top_k,
         "similarity_threshold": args.similarity_threshold,
         "vector_similarity_weight": args.vector_weight,
@@ -372,127 +331,88 @@ def main() -> int:
         "final_reranker_weight": args.final_reranker_weight,
         "final_rrf_k": args.final_rrf_k,
     }
-    started_at = datetime.now(timezone.utc)
-    started_clock = time.perf_counter()
-    results = []
-    # 第一阶段逐题落盘。即使后续问答或评分失败，已完成的答案和证据仍可保留。
+
+
+def resolve_run_config(args: argparse.Namespace) -> dict[str, Any]:
+    index_names = expand_index_names(args.index_name)
+    answer_model = args.answer_model or os.getenv(
+        "CHAT_MODEL",
+        DEFAULT_ANSWER_MODEL,
+    )
+    judge_model = None if args.no_judge else (
+        args.judge_model
+        or os.getenv("E2E_JUDGE_MODEL", DEFAULT_JUDGE_MODEL)
+    )
+    return {
+        "pipeline": "knowledge_base_only",
+        "index_names": index_names,
+        "answer_model": answer_model,
+        "execution_mode": "agent",
+        "planner_model": args.planner_model or agent_model(),
+        "planner_fallback_model": agent_fallback_model(),
+        "answer_temperature": 0,
+        "judge_model": judge_model,
+        "judge_enabled": judge_model is not None,
+        "faithfulness_enabled": judge_model is not None,
+        "execution_scope": "agent_knowledge_base",
+        "bridge_extraction_model": os.getenv(
+            "RAG_BRIDGE_EXTRACTION_MODEL",
+            "qwen3.7-flash",
+        ),
+        "evidence_sufficiency_enabled": environment_flag(
+            "RAG_EVIDENCE_SUFFICIENCY_ENABLED",
+            True,
+        ),
+        "evidence_sufficiency_model": os.getenv(
+            "RAG_EVIDENCE_SUFFICIENCY_MODEL",
+            "qwen3.6-plus",
+        ),
+        "evidence_sufficiency_fail_open": environment_flag(
+            "RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN",
+            False,
+        ),
+        "reranker_backend": os.getenv("RERANKER_BACKEND", "local"),
+        "reranker_score_mode": os.getenv(
+            "RERANKER_SCORE_MODE",
+            "probability",
+        ),
+        "reranker_remote_score_mode": os.getenv(
+            "RERANKER_REMOTE_SCORE_MODE",
+            "raw_logits",
+        ),
+        "top_k": args.top_k,
+        "metric_ks": list(resolve_metric_ks(args.top_k)),
+        "match_threshold": args.match_threshold,
+        **build_retrieval_options(args), # 检索参数，比如相似度权重等
+    }
+
+
+def prepare_output_paths(args: argparse.Namespace) -> Path:
+    output_directory = args.output_dir.resolve()
+    result_path = output_directory / f"{args.run_name}.json"
+    html_path = result_path.with_suffix(".html")
+    existing = [path for path in (result_path, html_path) if path.exists()]
+    if existing and not args.overwrite:
+        raise FileExistsError(
+            "Result files already exist: "
+            + ", ".join(str(path) for path in existing)
+        )
+
     output_directory.mkdir(parents=True, exist_ok=True)
-    answers_path.write_text("", encoding="utf-8")
+    return result_path
 
-    for position, sample in enumerate(samples, start=1):
-        case_started = time.perf_counter()
-        try:
-            turn = run_stage(sample["id"], "agent_answer", execute_agent_turn,
-                index_names=index_argument,
-                question=str(sample["question"]),
-                answer_client=client,
-                answer_model=answer_model,
-                planner_client=client,
-                planner_model=args.planner_model,
-                retrieval_options=retrieval_options,
-                conversation_history=sample.get("conversation_history"),
-            )
-            retrieval_case = run_stage(sample["id"], "retrieval_metrics", evaluate_retrieval_case,
-                sample,
-                turn.raw_retrieval,
-                latency_ms=turn.latency_ms["retrieval"],
-                top_k=args.top_k,
-                match_threshold=args.match_threshold,
-            )
-            outcome = (turn.raw_retrieval.get("agent_execution") or {}).get("outcome")
-            refusal_metrics = evaluate_refusal(sample, turn.response_mode, outcome=outcome)
-            sufficiency_metrics = evaluate_sufficiency(sample, retrieval_case)
-            result = {
-                "result_schema_version": E2E_RESULT_SCHEMA_VERSION,
-                "id": sample.get("id"),
-                "question": sample.get("question"),
-                "question_type": sample.get("question_type"),
-                "split": str(
-                    (sample.get("metadata") or {}).get("split") or "unknown"
-                ),
-                "answerable": bool(sample.get("answerable")),
-                "reference_answer": sample.get("reference_answer"),
-                "error": outcome if outcome in {"invalid_plan", "calculation_error", "execution_error"} else None,
-                "outcome": outcome,
-                "latency_ms": turn.latency_ms,
-                "retrieval": retrieval_case["retrieval"],
-                "retrieval_metrics": retrieval_case["retrieval_metrics"],
-                "post_gate_metrics": retrieval_case["post_gate_metrics"],
-                "verification_evidence_metrics": retrieval_case.get("verification_evidence_metrics"),
-                "answer_evidence_metrics": retrieval_case.get("answer_evidence_metrics"),
-                "gate_metrics": retrieval_case["gate_metrics"],
-                "evidence_sufficiency_reference": retrieval_case["evidence_sufficiency_reference"],
-                "evidence_matches_before_sufficiency": retrieval_case[
-                    "evidence_matches_before_sufficiency"
-                ],
-                "evidence_matches": retrieval_case["evidence_matches"],
-                "answer": turn.answer,
-                "thinking": turn.thinking,
-                "response_mode": turn.response_mode,
-                "documents": turn.documents,
-                "answer_metrics": {},
-                "faithfulness_metrics": {},
-                "citation_metrics": {},
-                "refusal_metrics": refusal_metrics,
-                "sufficiency_metrics": sufficiency_metrics,
-            }
-            print(
-                f"[{position}/{len(samples)}] {sample['id']} "
-                f"mode={turn.response_mode} outcome={outcome} "
-                f"verification_recall={(retrieval_case.get('verification_evidence_metrics') or {}).get('recall')} "
-                f"behavior_correct={refusal_metrics['correct']} "
-                f"latency_ms={turn.latency_ms['total']:.3f}",
-                flush=True,
-            )
-        except Exception as error:
-            latency_ms = (time.perf_counter() - case_started) * 1000
-            if args.fail_fast:
-                raise
-            traceback.print_exc()
-            result = error_result(
-                sample,
-                error=error,
-                latency_ms=latency_ms,
-                top_k=args.top_k,
-            )
-            print(
-                f"[{position}/{len(samples)}] {sample['id']} ERROR: {result['error']}",
-                file=sys.stderr,
-                flush=True,
-            )
-        result["scoring_status"] = "pending" if result["response_mode"] != "error" else "skipped"
-        results.append(result)
-        with answers_path.open("a", encoding="utf-8") as output:
-            output.write(json.dumps(result, ensure_ascii=False) + "\n")
 
-    # 第二阶段只读取第一阶段结果中的快照；评分模型与业务核验模型独立配置。
-    print("所有题目问答执行完毕，开始评分。", flush=True)
-    for position, result in enumerate(results, start=1):
-        if result["scoring_status"] == "skipped":
-            continue
-        try:
-            score_result(result, client=client, judge_model=judge_model,
-                         judge_timeout=args.judge_timeout)
-            # 评分器可能自行捕获接口异常并返回 judge_error，也应标记评分失败。
-            scoring_failed = any(result[key].get("judge_error") for key in (
-                "answer_metrics", "faithfulness_metrics", "citation_metrics"))
-            result["scoring_status"] = "failed" if scoring_failed else "completed"
-        except Exception as error:
-            # 评分故障不能覆盖成功的问答结果或伪装成业务执行失败。
-            result["scoring_status"] = "failed"
-            result["scoring_error"] = f"{type(error).__name__}: {error}"
-            if args.fail_fast:
-                raise
-            traceback.print_exc()
-        print(f"[评分 {position}/{len(results)}] {result['id']} {result['scoring_status']}", flush=True)
-
-    completed_at = datetime.now(timezone.utc)
-    summary = {
+def build_initial_summary(
+    args: argparse.Namespace, samples: list[dict[str, Any]],
+    config: dict[str, Any], result_path: Path,
+) -> dict[str, Any]:
+    return {
         "result_schema_version": E2E_RESULT_SCHEMA_VERSION,
         "run_name": args.run_name,
-        "started_at": started_at.isoformat(),
-        "completed_at": completed_at.isoformat(),
-        "duration_seconds": round(time.perf_counter() - started_clock, 3),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+        "status": "answering",
+        "duration_seconds": 0,
         "dataset": {
             "path": str(args.dataset.resolve()),
             "sha256": hashlib.sha256(args.dataset.resolve().read_bytes()).hexdigest(),
@@ -513,59 +433,191 @@ def main() -> int:
                 }
             ),
         },
-        "config": {
-            "pipeline": "knowledge_base_only",
-            "index_names": index_names,
-            "answer_model": answer_model,
-            "execution_mode": "agent",
-            "planner_model": args.planner_model or agent_model(),
-            "planner_fallback_model": agent_fallback_model(),
-            "answer_temperature": 0,
-            "judge_model": judge_model,
-            "judge_enabled": judge_model is not None,
-            "faithfulness_enabled": judge_model is not None,
-            "execution_scope": "agent_knowledge_base",
-            "bridge_extraction_model": os.getenv(
-                "RAG_BRIDGE_EXTRACTION_MODEL",
-                "qwen3.7-flash",
-            ),
-            "evidence_sufficiency_enabled": environment_flag(
-                "RAG_EVIDENCE_SUFFICIENCY_ENABLED",
-                True,
-            ),
-            "evidence_sufficiency_model": os.getenv(
-                "RAG_EVIDENCE_SUFFICIENCY_MODEL",
-                "qwen3.6-plus",
-            ),
-            "evidence_sufficiency_fail_open": environment_flag(
-                "RAG_EVIDENCE_SUFFICIENCY_FAIL_OPEN",
-                False,
-            ),
-            "reranker_backend": os.getenv("RERANKER_BACKEND", "local"),
-            "reranker_score_mode": os.getenv(
-                "RERANKER_SCORE_MODE",
-                "probability",
-            ),
-            "reranker_remote_score_mode": os.getenv(
-                "RERANKER_REMOTE_SCORE_MODE",
-                "raw_logits",
-            ),
-            "top_k": args.top_k,
-            "metric_ks": list(resolve_metric_ks(args.top_k)),
-            "match_threshold": args.match_threshold,
-            **retrieval_options,
-        },
-        "answers_file": str(answers_path),
+        "config": config,
         "result_file": str(result_path),
-        "metrics": build_e2e_summary(results, top_k=args.top_k),
+        "metrics": build_e2e_summary([], top_k=args.top_k),
     }
-    write_outputs(result_path, summary_path, results, summary)
-    print(f"Answers: {answers_path}")
-    print(f"Results: {result_path}")
-    print(f"Summary: {summary_path}")
-    print(f"HTML report: {html_path}")
-    print(json.dumps(summary["metrics"]["overall"], ensure_ascii=False, indent=2))
-    return 1 if summary["metrics"]["overall"]["error_count"] else 0
+
+
+def checkpoint(state: EvaluationRunState, status: str, *, render_html: bool = True) -> None:
+    summary, results = state.summary, state.results
+    summary["status"] = status
+    summary["updated_at"] = datetime.now(timezone.utc).isoformat()
+    summary["duration_seconds"] = round(time.perf_counter() - state.started_clock, 3)
+    summary["answered_sample_count"] = len(results)
+    summary["scored_sample_count"] = sum(r.get("scoring_status") == "completed" for r in results)
+    summary["scoring_status_counts"] = dict(Counter(r.get("scoring_status", "pending") for r in results))
+    summary["metrics"] = build_e2e_summary(results, top_k=summary["config"]["top_k"])
+    if status == "completed":
+        summary["completed_at"] = summary["updated_at"]
+    write_outputs(state.result_path, results, summary, render_html=render_html)
+
+
+def evaluate_sample(
+    sample: dict[str, Any], *, args: argparse.Namespace,
+    config: dict[str, Any], client: OpenAI,
+) -> dict[str, Any]:
+    """执行单题问答并生成确定性指标；异常交由阶段循环处理。"""
+    turn = run_stage(sample["id"], "agent_answer", execute_agent_turn,
+        index_names=(config["index_names"][0] if len(config["index_names"]) == 1 else config["index_names"]),
+        question=str(sample["question"]),
+        answer_client=client,
+        answer_model=config["answer_model"],
+        planner_client=client,
+        planner_model=args.planner_model,
+        retrieval_options=build_retrieval_options(args),
+        conversation_history=sample.get("conversation_history"),
+    )
+    retrieval_case = run_stage(sample["id"], "retrieval_metrics", evaluate_retrieval_case,
+        sample,
+        turn.raw_retrieval,
+        latency_ms=turn.latency_ms["retrieval"],
+        top_k=args.top_k,
+        match_threshold=args.match_threshold,
+    )
+    outcome = (turn.raw_retrieval.get("agent_execution") or {}).get("outcome")
+    refusal_metrics = evaluate_refusal(sample, turn.response_mode, outcome=outcome)
+    sufficiency_metrics = evaluate_sufficiency(sample, retrieval_case)
+    return {
+        "result_schema_version": E2E_RESULT_SCHEMA_VERSION,
+        "id": sample.get("id"),
+        "question": sample.get("question"),
+        "question_type": sample.get("question_type"),
+        "split": str(
+            (sample.get("metadata") or {}).get("split") or "unknown"
+        ),
+        "answerable": bool(sample.get("answerable")),
+        "reference_answer": sample.get("reference_answer"),
+        "error": outcome if outcome in {"invalid_plan", "calculation_error", "execution_error"} else None,
+        "outcome": outcome,
+        "latency_ms": turn.latency_ms,
+        "retrieval": retrieval_case["retrieval"],
+        "retrieval_metrics": retrieval_case["retrieval_metrics"],
+        "post_gate_metrics": retrieval_case["post_gate_metrics"],
+        "verification_evidence_metrics": retrieval_case.get("verification_evidence_metrics"),
+        "answer_evidence_metrics": retrieval_case.get("answer_evidence_metrics"),
+        "gate_metrics": retrieval_case["gate_metrics"],
+        "evidence_sufficiency_reference": retrieval_case["evidence_sufficiency_reference"],
+        "evidence_matches_before_sufficiency": retrieval_case[
+            "evidence_matches_before_sufficiency"
+        ],
+        "evidence_matches": retrieval_case["evidence_matches"],
+        "answer": turn.answer,
+        "thinking": turn.thinking,
+        "response_mode": turn.response_mode,
+        "documents": turn.documents,
+        "answer_metrics": {},
+        "faithfulness_metrics": {},
+        "citation_metrics": {},
+        "refusal_metrics": refusal_metrics,
+        "sufficiency_metrics": sufficiency_metrics,
+    }
+
+
+def run_answering_phase(
+    samples: list[dict[str, Any]], *, args: argparse.Namespace,
+    state: EvaluationRunState, client: OpenAI,
+) -> None:
+    results = state.results
+    checkpoint(state, "answering")
+    for position, sample in enumerate(samples, start=1): # position是当前样本的序号，表示第几道题
+        case_started = time.perf_counter()
+        try:
+            result = evaluate_sample(sample, args=args, config=state.summary["config"], client=client)
+            print(
+                f"[{position}/{len(samples)}] {sample['id']} "
+                f"mode={result['response_mode']} outcome={result['outcome']} "
+                f"verification_recall={(result.get('verification_evidence_metrics') or {}).get('recall')} "
+                f"behavior_correct={result['refusal_metrics']['correct']} "
+                f"latency_ms={result['latency_ms']['total']:.3f}",
+                flush=True,
+            )
+        except Exception as error:
+            latency_ms = (time.perf_counter() - case_started) * 1000
+            if args.fail_fast:
+                results.append(error_result(sample, error=error, latency_ms=latency_ms, top_k=args.top_k))
+                results[-1]["scoring_status"] = "skipped"
+                checkpoint(state, "failed", render_html=True)
+                raise
+            traceback.print_exc()
+            result = error_result(
+                sample,
+                error=error,
+                latency_ms=latency_ms,
+                top_k=args.top_k,
+            )
+            print(
+                f"[{position}/{len(samples)}] {sample['id']} ERROR: {result['error']}",
+                file=sys.stderr,
+                flush=True,
+            )
+        result["scoring_status"] = "pending" if result["response_mode"] != "error" else "skipped"
+        results.append(result)
+        checkpoint(state, "answering")
+
+
+def run_scoring_phase(
+    *, args: argparse.Namespace, state: EvaluationRunState, client: OpenAI,
+) -> None:
+    results = state.results
+    # 第二阶段只读取第一阶段结果中的快照；评分模型与业务核验模型独立配置。
+    checkpoint(state, "scoring")
+    print("所有题目问答执行完毕，开始评分。", flush=True)
+    for position, result in enumerate(results, start=1):
+        if result["scoring_status"] == "skipped":
+            continue
+        try:
+            score_result(result, client=client, judge_model=state.summary["config"]["judge_model"],
+                         judge_timeout=args.judge_timeout)
+            # 评分器可能自行捕获接口异常并返回 judge_error，也应标记评分失败。
+            scoring_failed = any(result[key].get("judge_error") for key in (
+                "answer_metrics", "faithfulness_metrics", "citation_metrics"))
+            result["scoring_status"] = "failed" if scoring_failed else "completed"
+        except Exception as error:
+            # 评分故障不能覆盖成功的问答结果或伪装成业务执行失败。
+            result["scoring_status"] = "failed"
+            result["scoring_error"] = f"{type(error).__name__}: {error}"
+            if args.fail_fast:
+                checkpoint(state, "failed", render_html=True)
+                raise
+            traceback.print_exc()
+        checkpoint(state, "scoring")
+        print(f"[评分 {position}/{len(results)}] {result['id']} {result['scoring_status']}", flush=True)
+
+
+def print_run_summary(state: EvaluationRunState) -> None:
+    print(f"Results: {state.result_path}")
+    print(f"HTML report: {state.result_path.with_suffix('.html')}")
+    print(json.dumps({key: value for key, value in state.summary["metrics"]["overall"].items()
+                      if key not in {"diagnostics", "sample_issues"}}, ensure_ascii=False, indent=2))
+
+
+def main() -> int:
+    args = parse_args()
+    validate_args(args)
+
+    from dotenv import load_dotenv
+
+    load_dotenv(BACKEND_DIRECTORY / ".env")
+    samples = load_selected_samples(args)
+    if args.validate_only:
+        print(json.dumps({"dataset": str(args.dataset.resolve()), "selected_samples": len(samples),
+                          "execution_mode": "agent", "valid": True}, ensure_ascii=False, indent=2))
+        return 0
+
+    config = resolve_run_config(args)
+    client = build_client()
+    result_path = prepare_output_paths(args)
+    started_clock = time.perf_counter()
+    state = EvaluationRunState(
+        results=[], summary=build_initial_summary(args, samples, config, result_path),
+        result_path=result_path, started_clock=started_clock,
+    )
+    run_answering_phase(samples, args=args, state=state, client=client)
+    run_scoring_phase(args=args, state=state, client=client)
+    checkpoint(state, "completed", render_html=True)
+    print_run_summary(state)
+    return 1 if any(result.get("error") for result in state.results) else 0
 
 
 if __name__ == "__main__":

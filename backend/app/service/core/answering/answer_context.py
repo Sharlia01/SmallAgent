@@ -27,13 +27,22 @@ ANSWER_SYSTEM_PROMPT = """
 8. 标有“未提取视觉事实”或 figure.status 不是 extracted 的图表片段只提供文字定位信息。不得据此猜测柱高、正负、趋势、图例对应关系或未展示的数据；缺少直接证据时明确说明无法从当前资料判断。视觉模型提取的事实也不得扩展成未给出的精确数值。
 9. 标有“表格结构未可靠绑定”、table.binding 不是 bound 或 table.reliable 为 false 的片段保留的是原始识别结果，不得猜测缺失或错位的列对应关系。
 10. 数值、公司、期间、单位和口径以本轮参考原文为准，不能用历史回答替代或补齐。需要计算时自行根据有依据的输入选择公式并计算，说明必要的计算过程及单位，引用原始输入的来源。原文直接披露的数值优先引用，不必重复推算。输入有歧义时说明限制，不猜测缺失值。
-11. 基于本轮参考内容给出的每条事实或数字陈述都必须单独标注引用，紧接对应陈述放置 ##引用编号$$。列表中的每一项也必须分别标注；即使多条陈述来自同一片段，也要重复标注，不能只在段落或列表最后一项添加引用。纯标题和过渡语无需引用。
+11. 基于参考资料的事实应有清晰的引用依据，在相应陈述或紧密关联的说明处标注 ##引用编号$$，不要求每句话重复标注。
+同一段落或数据列表中的共同主体、时间、单位说明，可以与其明确限定的数据项共用引用；来源必须同时支持这些限定和数据。
+计算、单位换算的结果若已明确关联到带引用的完整操作数，无需重复标注；同一上下文中重复总结已引用结论也无需重复引用。
+纯标题和过渡语无需引用；含事实或数值的标题须由明确关联的已引用说明支持。不能用段末一个引用笼统覆盖来源不同或关联不明的事实。
+新增事实或改变主体、期间、单位、统计口径时，必须重新确认依据，不能自动沿用原引用；关联不清楚时，在相应陈述处补充有效引用，无依据则说明限制。
 12. 每条参考资料包含 document_name（文档名）、location（可用的出处位置）、content（正文或不可靠表格原文）或 table（可靠表格结构）。结合这些信息和其他参考片段解析“公司”“本期”等省略表达。文档名只是主体线索，不能覆盖正文或表格公司列明确说明的归属；也不能仅因用户问了某家公司就把无主体的数字归给它。缺少必要上下文时应说明无法确认。
 13. 可靠表格只提供结构化 table：matched_rows 是检索命中行，context_rows 是扩展辅助行，unknown_rows 是角色未知的行。每行 values 直接配对 header 和 value，并保留 column_index；in_selected_window=false 的单元格用于保留窗口外的原始上下文。优先定位命中行，再核对行内指标、列头、主体、期间和单位，不要把辅助行的数字套到命中行的指标上。角色仅说明检索来源，不代表相关性或事实已核验，辅助行也可能提供必要证据。context、preamble 和 source_notes 是原始分组及说明，不是额外推断的结论。
 14. 如提供“目标与支持来源”，它表示证据核验认为哪些本轮引用可支持对应目标，仅用于定位资料。不能据此认定片段内每个数字都属于该目标的主体；仍须核对正文、公司列、指标、期间和单位。以当前用户问题为完整需求，目标映射不能替代或缩减问题；缺少映射不表示目标无需回答，也不表示其他参考资料不可使用。
 例如，若本轮参考内容 [1] 同时支持营业收入及归母净利润，应写成：
 - 营业收入：8.95亿元，同比增长20.31% ##1$$。
 - 归母净利润：1.88亿元，同比增长4.16% ##1$$。
+共同说明示例：若本轮来源 [1] 明确记载甲公司截至2025年6月的风电、光伏装机分别为100、200万千瓦，可以写成：
+截至2025年6月，甲公司装机情况如下：
+- 风电装机100万千瓦 ##1$$。
+- 光伏装机200万千瓦 ##1$$。
+开头说明可与数据项共用引用，无需单独重复标注；如果来源仅披露2024年的数据，就不能写成“截至2025年6月”。
 示例仅说明引用位置和格式，实际数字与引用编号必须来自本轮参考内容，不得照抄示例数据。
 """.strip()
 
@@ -79,7 +88,8 @@ def build_answer_context(query: QueryContext, evidence: EvidenceCollection,
                           tuple(sorted(supported_by_goal[goal.id])))
         for goal in query.goals if supported_by_goal.get(goal.id)
     )
-    return AnswerContext(query.question, blocks, citations, goal_support)
+    return AnswerContext(query.question, blocks, citations, goal_support,
+                         assessment.answer_scope, tuple(assessment.answer_notes))
 
 
 def _matched_table_rows(table: EvidenceTable) -> set[int]:
@@ -207,6 +217,10 @@ def build_answer_messages(context: AnswerContext, history: list[dict[str, str]])
     navigation = ("**目标与支持来源（本轮引用编号，仅作资料导航）：**\n"
                   + json.dumps([plain(goal) for goal in context.goal_support], ensure_ascii=False)
                   + "\n\n") if context.goal_support else ""
+    if context.answer_scope:
+        navigation = ("**核验确认的回答范围及必要说明（须结合原问题和来源，不能当作新增事实来源）：**\n"
+                      + json.dumps({"answer_scope": context.answer_scope, "answer_notes": context.answer_notes}, ensure_ascii=False)
+                      + "\n必须在回答中体现适用的口径与限制，不能将合并值当作分项值。核验说明不是数据来源；数值、年份列与单位必须从本轮原始参考内容重新核对，不能照抄核验说明里的数值。\n\n" + navigation)
     text = (navigation + f"**本轮参考内容：**\n{format_reference_content(context)}\n\n"
             f"**当前用户问题：**\n{context.question}\n\n请基于对话上下文和本轮参考内容回答。")
     return [{"role": "system", "content": ANSWER_SYSTEM_PROMPT},

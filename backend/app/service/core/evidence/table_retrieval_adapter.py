@@ -5,6 +5,12 @@ from domain.table_retrieval import TableCandidate, TableContext
 
 
 def candidate_record(candidate: TableCandidate) -> dict:
+    from service.core.evidence.adapter import evidence_from_record
+
+    originals = {}
+    for snapshot in candidate.source_rows:
+        original = evidence_from_record({**plain(snapshot.source), "chunk_id": snapshot.chunk_id})
+        originals.update(original.source_identities)
     record = plain(candidate.source)
     rows = plain(candidate.matched_rows)
     primary = rows[0]
@@ -13,6 +19,7 @@ def candidate_record(candidate: TableCandidate) -> dict:
     record.pop('table_context_obj', None)
     record.update(
         chunk_id=candidate.candidate_id,
+        table_source_fingerprints_obj=originals,
         content_with_weight=text,
         table_semantic_text_with_weight=candidate.ranking_text,
         table_markdown_excerpt_with_weight=text,
@@ -38,6 +45,9 @@ def candidate_record(candidate: TableCandidate) -> dict:
 def context_record(context: TableContext, retrieval_record: dict | None = None) -> dict:
     base = (candidate_record(context.candidate) if isinstance(context.candidate, TableCandidate)
             else plain(context.candidate.source))
+    if not isinstance(context.candidate, TableCandidate):
+        from service.core.evidence.adapter import evidence_from_record
+        base['table_source_fingerprints_obj'] = dict(evidence_from_record(base).source_identities)
     record = {**base, **(retrieval_record or {})}
     record['content_with_weight'] = context.text
     record['table_context_obj'] = plain(context.diagnostics)

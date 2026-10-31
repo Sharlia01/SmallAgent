@@ -85,20 +85,18 @@ def test_invalid_previous_scope_uses_full_goals(monkeypatch, change):
     assert "gap_verification" not in report.diagnostics
 
 
-@pytest.mark.parametrize("signal", ["old_goal", "new_conflict"])
-def test_new_conflicts_restore_full_verification(monkeypatch, signal):
+@pytest.mark.parametrize("status", ["supported", "missing", "conflict"])
+def test_gap_result_does_not_trigger_full_verification(monkeypatch, status):
     query, current, previous, _ = setup_case(monkeypatch)
-    partial = verdict([("reason", "supported" if signal == "old_goal" else "conflict", [3])],
-                      sufficient=signal == "old_goal", recheck=["income"] if signal == "old_goal" else [])
-    client = ModelClient([partial, verdict([("income", "conflict", [2, 4]), ("reason", "supported", [4])])])
+    client = ModelClient([verdict([("reason", status, [3])], sufficient=status == "supported")])
     report = verify_evidence(query, current, previous=previous, client=client)
-    assert len(client.calls) == 2
-    full = json.loads(client.calls[1]["messages"][1]["content"])
-    assert len(full["goals"]) == 2 and len(full["candidate_evidence"]) == 4
-    assert "retained_goals" not in full
-    assert report.diagnostics["gap_restored_full_verification"]
-    assert report.diagnostics["reused_goal_ids"] == []
-    assert not report.sufficient
+    assert len(client.calls) == 1
+    payload = json.loads(client.calls[0]["messages"][1]["content"])
+    assert len(payload["goals"]) == 1 and len(payload["candidate_evidence"]) == 3
+    assert not report.diagnostics["gap_restored_full_verification"]
+    assert report.diagnostics["reused_goal_ids"] == ["income"]
+    assert report.sufficient is (status == "supported")
+    assert report.goal_coverage[1]["status"] == status
 
 
 def test_existing_conflict_is_pending_and_keeps_all_context(monkeypatch):
@@ -110,7 +108,7 @@ def test_existing_conflict_is_pending_and_keeps_all_context(monkeypatch):
     assert report.sufficient and report.diagnostics["gap_goal_ids"] == ["reason"]
 
 
-def test_context_budget_omission_restores_full_goals_without_partial_model_call(monkeypatch):
+def test_context_budget_omission_returns_without_full_retry(monkeypatch):
     query, current, previous, _ = setup_case(monkeypatch)
     original = sufficiency._prepare_evidence
     def prepare(candidates, sources, **kwargs):
@@ -120,16 +118,7 @@ def test_context_budget_omission_restores_full_goals_without_partial_model_call(
     monkeypatch.setattr(sufficiency, "_prepare_evidence", prepare)
     client = ModelClient([verdict([("income", "supported", [2]), ("reason", "supported", [4])], sufficient=True)])
     report = verify_evidence(query, current, previous=previous, client=client)
-    assert len(client.calls) == 1
-    assert len(json.loads(client.calls[0]["messages"][1]["content"])["goals"]) == 2
-    assert report.diagnostics["gap_restored_full_verification"]
-
-
-def test_missing_conflict_signal_is_rejected_not_silently_inherited(monkeypatch):
-    query, current, previous, _ = setup_case(monkeypatch)
-    client = ModelClient([verdict([("reason", "supported", [3])], sufficient=True)])
-    report = verify_evidence(query, current, previous=previous, client=client)
-    assert not report.sufficient and report.verification_status == "unavailable"
-    assert report.diagnostics["failure_kind"] == "contract_rejected"
-    assert report.diagnostics["reused_goal_ids"] == []
-    assert len(client.calls) == 1
+    assert len(client.calls) == 0
+    assert not report.sufficient
+    assert report.diagnostics["failure_kind"] == "input_limit"
+    assert not report.diagnostics["gap_restored_full_verification"]

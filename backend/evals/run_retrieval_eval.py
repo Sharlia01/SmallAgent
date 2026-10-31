@@ -42,6 +42,7 @@ from evaluation.retrieval import (  # noqa: E402
     build_summary,
     evaluate_retrieval_case,
     resolve_metric_ks,
+    iter_evidence_atoms,
 )
 from service.core.rag.nlp.model import RERANKER_MODEL  # noqa: E402
 from service.core.retrieval.result import RetrievalResult, retrieval_record  # noqa: E402
@@ -55,7 +56,7 @@ REQUIRED_SAMPLE_FIELDS = {
     "reference_answer",
     "answerable",
     "question_type",
-    "relevant_evidence",
+    "evidence_requirements",
     "metadata",
 }
 
@@ -229,85 +230,12 @@ def expand_index_names(values: list[str]) -> list[str]:
     return names
 
 
-def validate_v2_annotations(sample: dict[str, Any], line_number: int) -> None:
-    """校验第二版评测集的扩展标注。"""
-    if not str(sample.get("schema_version") or "").startswith("2."):
-        return
-
+def validate_evidence_requirements(sample: dict[str, Any]) -> None:
+    """只接受统一的要求结构，防止旧标注被静默忽略。"""
     sample_id = str(sample.get("id") or "")
-    metadata = sample.get("metadata")
-    if not isinstance(metadata, dict) or metadata.get("split") not in V2_SPLITS:
-        raise ValueError(
-            f"Dataset line {line_number} sample {sample_id!r} must use one "
-            f"of metadata.split={sorted(V2_SPLITS)}"
-        )
-
-    expected_behavior = sample.get("expected_behavior")
-    required_behavior = "answer" if sample.get("answerable") else "refuse"
-    if expected_behavior != required_behavior:
-        raise ValueError(
-            f"Sample {sample_id!r} expected_behavior must be "
-            f"{required_behavior!r}"
-        )
-
-    retrieval = sample.get("expected_retrieval")
-    if not isinstance(retrieval, dict):
-        raise ValueError(f"Sample {sample_id!r} has no expected_retrieval")
-    if retrieval.get("mode") not in V2_RETRIEVAL_MODES:
-        raise ValueError(f"Sample {sample_id!r} has invalid retrieval mode")
-    hop_count = retrieval.get("hop_count")
-    if (
-        not isinstance(hop_count, int)
-        or isinstance(hop_count, bool)
-        or hop_count <= 0
-    ):
-        raise ValueError(f"Sample {sample_id!r} has invalid retrieval hop_count")
-
-    evidence_ids = []
-    for evidence in sample.get("relevant_evidence") or []:
-        evidence_id = evidence.get("id")
-        if not isinstance(evidence_id, str) or not evidence_id.strip():
-            raise ValueError(f"Sample {sample_id!r} has evidence without an id")
-        evidence_ids.append(evidence_id)
-    if len(evidence_ids) != len(set(evidence_ids)):
-        raise ValueError(f"Sample {sample_id!r} has duplicate evidence ids")
-
-    claims = sample.get("reference_claims")
-    if not isinstance(claims, list):
-        raise ValueError(f"Sample {sample_id!r} has invalid reference_claims")
-    if sample.get("answerable") and not claims:
-        raise ValueError(f"Answerable sample {sample_id!r} has no reference claims")
-    if not sample.get("answerable") and claims:
-        raise ValueError(f"Unanswerable sample {sample_id!r} has reference claims")
-
-    claim_ids = set()
-    known_evidence_ids = set(evidence_ids)
-    for claim in claims:
-        if not isinstance(claim, dict):
-            raise ValueError(f"Sample {sample_id!r} has a non-object claim")
-        claim_id = claim.get("id")
-        if (
-            not isinstance(claim_id, str)
-            or not claim_id.strip()
-            or claim_id in claim_ids
-        ):
-            raise ValueError(f"Sample {sample_id!r} has an invalid claim id")
-        claim_ids.add(claim_id)
-        if not str(claim.get("text") or "").strip():
-            raise ValueError(f"Sample {sample_id!r} claim {claim_id!r} has no text")
-        required_ids = claim.get("required_evidence_ids")
-        if not isinstance(required_ids, list) or not required_ids:
-            raise ValueError(
-                f"Sample {sample_id!r} claim {claim_id!r} has no evidence links"
-            )
-        unknown_ids = sorted(set(required_ids) - known_evidence_ids)
-        if unknown_ids:
-            raise ValueError(
-                f"Sample {sample_id!r} claim {claim_id!r} references unknown "
-                f"evidence ids: {unknown_ids}"
-            )
-
-    requirements = sample.get("evidence_requirements") or []
+    if "relevant_evidence" in sample:
+        raise ValueError(f"Sample {sample_id!r}: migrate relevant_evidence to evidence_requirements")
+    requirements = sample.get("evidence_requirements")
     if not isinstance(requirements, list):
         raise ValueError(f"Sample {sample_id!r} has invalid evidence_requirements")
     requirement_ids = set()
@@ -363,13 +291,99 @@ def validate_v2_annotations(sample: dict[str, Any], line_number: int) -> None:
                         f"Sample {sample_id!r} requirement {requirement_id!r} "
                         "has a text atom without text"
                     )
-                if match_type == "table_row" and not atom.get("row_cells"):
+                if match_type == "table_row" and not (atom.get("row_cells") or str(atom.get("text") or "").strip()):
                     raise ValueError(
                         f"Sample {sample_id!r} requirement {requirement_id!r} "
-                        "has a table atom without row_cells"
+                        "has a table atom without row_cells or text"
                     )
                 if match_type == "figure" and not str(atom.get("locator") or atom.get("text") or "").strip():
                     raise ValueError(f"Sample {sample_id!r} has a figure atom without locator or text")
+
+    for atom in iter_evidence_atoms(sample):
+        if "page" in atom and (type(atom["page"]) is not int or atom["page"] <= 0):
+            raise ValueError(f"Sample {sample_id!r} has an atom with invalid page")
+    if bool(requirements) != sample["answerable"]:
+        raise ValueError(f"Sample {sample_id!r} evidence requirements disagree with answerable")
+
+
+def validate_v2_annotations(sample: dict[str, Any], line_number: int) -> None:
+    """校验第二版评测集的扩展标注。"""
+    if not str(sample.get("schema_version") or "").startswith("2."):
+        return
+
+    sample_id = str(sample.get("id") or "")
+    metadata = sample.get("metadata")
+    if not isinstance(metadata, dict) or metadata.get("split") not in V2_SPLITS:
+        raise ValueError(
+            f"Dataset line {line_number} sample {sample_id!r} must use one "
+            f"of metadata.split={sorted(V2_SPLITS)}"
+        )
+
+    expected_behavior = sample.get("expected_behavior")
+    required_behavior = "answer" if sample.get("answerable") else "refuse"
+    if expected_behavior != required_behavior:
+        raise ValueError(
+            f"Sample {sample_id!r} expected_behavior must be "
+            f"{required_behavior!r}"
+        )
+
+    retrieval = sample.get("expected_retrieval")
+    if not isinstance(retrieval, dict):
+        raise ValueError(f"Sample {sample_id!r} has no expected_retrieval")
+    if retrieval.get("mode") not in V2_RETRIEVAL_MODES:
+        raise ValueError(f"Sample {sample_id!r} has invalid retrieval mode")
+    hop_count = retrieval.get("hop_count")
+    if (
+        not isinstance(hop_count, int)
+        or isinstance(hop_count, bool)
+        or hop_count <= 0
+    ):
+        raise ValueError(f"Sample {sample_id!r} has invalid retrieval hop_count")
+
+    evidence_by_id = {}
+    for evidence in iter_evidence_atoms(sample):
+        evidence_id = evidence.get("id")
+        if not isinstance(evidence_id, str) or not evidence_id.strip():
+            raise ValueError(f"Sample {sample_id!r} has evidence without an id")
+        # 同一证据可被多个要求复用，但不能让相同 ID 指向不同内容。
+        if evidence_id in evidence_by_id and evidence_by_id[evidence_id] != evidence:
+            raise ValueError(f"Sample {sample_id!r} has conflicting evidence id {evidence_id!r}")
+        evidence_by_id[evidence_id] = evidence
+
+    claims = sample.get("reference_claims")
+    if not isinstance(claims, list):
+        raise ValueError(f"Sample {sample_id!r} has invalid reference_claims")
+    if sample.get("answerable") and not claims:
+        raise ValueError(f"Answerable sample {sample_id!r} has no reference claims")
+    if not sample.get("answerable") and claims:
+        raise ValueError(f"Unanswerable sample {sample_id!r} has reference claims")
+
+    claim_ids = set()
+    known_evidence_ids = set(evidence_by_id)
+    for claim in claims:
+        if not isinstance(claim, dict):
+            raise ValueError(f"Sample {sample_id!r} has a non-object claim")
+        claim_id = claim.get("id")
+        if (
+            not isinstance(claim_id, str)
+            or not claim_id.strip()
+            or claim_id in claim_ids
+        ):
+            raise ValueError(f"Sample {sample_id!r} has an invalid claim id")
+        claim_ids.add(claim_id)
+        if not str(claim.get("text") or "").strip():
+            raise ValueError(f"Sample {sample_id!r} claim {claim_id!r} has no text")
+        required_ids = claim.get("required_evidence_ids")
+        if not isinstance(required_ids, list) or not required_ids:
+            raise ValueError(
+                f"Sample {sample_id!r} claim {claim_id!r} has no evidence links"
+            )
+        unknown_ids = sorted(set(required_ids) - known_evidence_ids)
+        if unknown_ids:
+            raise ValueError(
+                f"Sample {sample_id!r} claim {claim_id!r} references unknown "
+                f"evidence ids: {unknown_ids}"
+            )
 
     if not sample.get("answerable") and sample.get(
         "expected_evidence_sufficient"
@@ -411,52 +425,7 @@ def load_dataset(path: Path) -> list[dict[str, Any]]:
             raise ValueError(
                 f"Dataset line {line_number} has a non-boolean answerable field"
             )
-        if not isinstance(sample["relevant_evidence"], list):
-            raise ValueError(
-                f"Dataset line {line_number} has invalid relevant_evidence"
-            )
-        for evidence_index, evidence in enumerate(
-            sample["relevant_evidence"],
-            start=1,
-        ):
-            if not isinstance(evidence, dict):
-                raise ValueError(
-                    f"Sample {sample['id']!r} evidence {evidence_index} is not "
-                    "a JSON object"
-                )
-            missing_evidence_fields = {
-                "document_name",
-                "page",
-                "text",
-            } - set(evidence)
-            if missing_evidence_fields:
-                raise ValueError(
-                    f"Sample {sample['id']!r} evidence {evidence_index} is "
-                    f"missing fields: {sorted(missing_evidence_fields)}"
-                )
-            if not str(evidence["document_name"]).strip():
-                raise ValueError(
-                    f"Sample {sample['id']!r} evidence {evidence_index} has "
-                    "an empty document_name"
-                )
-            if not isinstance(evidence["page"], int) or evidence["page"] <= 0:
-                raise ValueError(
-                    f"Sample {sample['id']!r} evidence {evidence_index} has "
-                    "an invalid page"
-                )
-            if not str(evidence["text"]).strip():
-                raise ValueError(
-                    f"Sample {sample['id']!r} evidence {evidence_index} has "
-                    "empty text"
-                )
-        if sample["answerable"] and not sample["relevant_evidence"]:
-            raise ValueError(
-                f"Answerable sample {sample['id']!r} has no gold evidence"
-            )
-        if not sample["answerable"] and sample["relevant_evidence"]:
-            raise ValueError(
-                f"Unanswerable sample {sample['id']!r} has gold evidence"
-            )
+        validate_evidence_requirements(sample)
         if sample["id"] in identifiers:
             raise ValueError(f"Duplicate sample ID: {sample['id']!r}")
         validate_v2_annotations(sample, line_number)

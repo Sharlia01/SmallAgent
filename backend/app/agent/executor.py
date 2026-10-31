@@ -45,13 +45,22 @@ class TaskExecution:
 
 
 class ToolExecutor:
-    def __init__(self, tools, *, bridge_extractor=None):
+    def __init__(self, tools, *, bridge_extractor=None, default_top_k: int = 5):
+        if type(default_top_k) is not int or not 1 <= default_top_k <= 20:
+            raise ValueError("default_top_k 必须为1到20的整数")
+        self.default_top_k = default_top_k
         self.tools = {tool.name: tool for tool in tools}
         if len(self.tools) != len(tools):
             raise ValueError("工具名称不能重复")
         if "search_knowledge_base" in self.tools:
             self.tools.setdefault(RestoreTableRowsTool.name, RestoreTableRowsTool())
         self._bridge_extractor = bridge_extractor or extract_bridge_value
+
+    def resolve_task(self, task: AgentTask) -> AgentTask:
+        value = self.default_top_k if task.top_k is None else task.top_k
+        if type(value) is not int or not 1 <= value <= 20:
+            raise ValueError("top_k 必须为1到20的整数")
+        return replace(task, top_k=value)
 
     def definitions(self):
         return [{"type": "function", "function": {
@@ -63,17 +72,15 @@ class ToolExecutor:
         if not plan.tasks:
             return False
         for task in plan.tasks:
+            task = self.resolve_task(task)
             if (task.tool not in {"search_knowledge_base", "search_web"}
                     or not task.query or task.query_template or task.depends_on
-                    or task.output_slot or task.required_slots or task.binding_key or task.inherit_document_scope):
+                    or task.output_slot or task.required_slots or task.inherit_document_scope):
                 return False
             if any(goal.subject_slot for goal in context.goals if goal.id in task.goal_ids):
                 return False
-            names = context.company_names(task.goal_ids, subject_refs=task.subject_refs)
-            scope = None
-            if names is not None:
-                from service.core.retrieval.entities import company_hints_from_names
-                scope = company_hints_from_names(names)
+            names = task.subjects or ()
+            scope = names
             query = normalize_relative_years(task.query, context.request.reference_date)
             result = cache.get((task.tool, query, (), task.top_k, scope))
             if result is None or not result.success:
@@ -82,6 +89,7 @@ class ToolExecutor:
 
     def execute_task(self, task: AgentTask, context: QueryContext,
                      completed: dict[str, TaskExecution], cache: dict) -> TaskExecution:
+        task = self.resolve_task(task)
         # 获取前置任务的变量的绑定结果
         parents = [completed[parent] for parent in task.depends_on]
         if any(parent.binding is None for parent in parents):
@@ -103,21 +111,21 @@ class ToolExecutor:
             if any(parent.task.tool != "search_knowledge_base" for parent in parents):
                 return TaskExecution(task, "blocked", error="内部文档范围只能来自知识库任务")
             document_ids = tuple(sorted(scopes))
-        names = context.company_names(task.goal_ids, subject_refs=task.subject_refs)
-        scope = None
-        if names is not None:
-            from service.core.retrieval.entities import company_hints_from_names
-            subject_slots = {g.subject_slot for g in context.goals if g.id in task.goal_ids
-                             and g.subject_slot and g.subject_slot != (task.binding_key or task.output_slot)}
-            subject_values = {parent.task.binding_key or parent.binding.slot: parent.binding.value
-                              for parent in parents}
-            # 主体必须来自当前任务实际消费的前置证据，不能猜测或借用其他分支。
-            if subject_slots - subject_values.keys():
-                return TaskExecution(task, "blocked", error="主体变量尚无经过来源校验的证据绑定")
-            names = tuple(dict.fromkeys((*names, *(subject_values[slot] for slot in sorted(subject_slots)))))
-            scope = company_hints_from_names(names)
+
+        names = task.subjects or ()
+        # 已知主体由计划校验补齐，动态主体在此读取前置证据绑定。
+        subject_slots = {g.subject_slot for g in context.goals if g.id in task.goal_ids
+                         and g.subject_slot and g.subject_slot != task.output_slot}
+        subject_values = {parent.binding.slot: parent.binding.value
+                          for parent in parents}
+        # 主体必须来自当前任务实际消费的前置证据，不能猜测或借用其他分支。
+        if subject_slots - subject_values.keys():
+            return TaskExecution(task, "blocked", error="主体变量尚无经过来源校验的证据绑定")
+        names = tuple(dict.fromkeys((*names, *(subject_values[slot] for slot in sorted(subject_slots)))))
+        scope = names
+
         request = RetrievalTask(query, task.goal_ids, document_ids, scope)
-        identity = (task.tool, query, document_ids, task.top_k, scope)
+        identity = (task.tool, query, document_ids, task.top_k, scope) # 用于判断同样的查询是否已经执行过
         if identity in cache:
             result = replace(cache[identity], task=request)
             status = "cached"
@@ -171,7 +179,7 @@ class ToolExecutor:
     def execute_plan(self, plan: AgentPlan, context: QueryContext,
                      completed: dict[str, TaskExecution], cache: dict) -> list[TaskExecution]:
         """按依赖分批执行；失败分支不覆盖已经成功的兄弟分支。"""
-        all_tasks = [state.task for state in completed.values()] + list(plan.tasks)
+        all_tasks = [state.task for state in completed.values()] + [self.resolve_task(task) for task in plan.tasks]
         waves = validate_dependency_graph(all_tasks) if all_tasks else []
         results = []
         for wave in waves:

@@ -497,7 +497,7 @@ def get_chat_completion(
                             "thinking": False,
                         },
                     )
-                elif thinking_text:
+                if thinking_text:
                     thinking_parts.append(thinking_text)
                     yield _make_sse_event(
                         "message",
@@ -508,7 +508,7 @@ def get_chat_completion(
                         },
                     )
                 # 结束事件也可能携带正文，先转发内容再结束读取。
-                if finish_reason is not None:
+                if finish_reason is not None and not getattr(completion, "consume_usage_tail", False):
                     break
 
         # 后续推荐问题可能继续调用模型，先归还当前响应占用的连接。

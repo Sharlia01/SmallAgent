@@ -149,7 +149,7 @@ def test_incremental_union_reindexes_and_binds_complete_scope(monkeypatch):
 
 
 @pytest.mark.parametrize("failure", ["insufficient", "input_limit", "service_unavailable"])
-def test_incremental_restores_material_only_for_evidence_shortfall(monkeypatch, failure):
+def test_incremental_never_retries_with_full_material(monkeypatch, failure):
     query, current, previous = incremental_fixture(monkeypatch)
     calls = []
     def check(question, evidence, **kwargs):
@@ -162,11 +162,10 @@ def test_incremental_restores_material_only_for_evidence_shortfall(monkeypatch, 
     monkeypatch.setattr(verification, "assess_evidence_sufficiency", check)
     report = verification.verify_evidence(query, current, previous=previous)
     assert calls[0] == ["global", "goal", "new"]
-    restored = failure != "service_unavailable"
-    assert len(calls) == (2 if restored else 1)
-    assert report.diagnostics["incremental_restored_full_input"] is restored
-    if restored:
-        assert calls[1] == [item.id for item in current]
+    assert len(calls) == 1
+    assert not report.sufficient
+    assert report.diagnostics["incremental_restored_full_input"] is False
+
 
 
 @pytest.mark.parametrize("change", ["content", "removed", "query", "policy", "conflict", "tampered"])
@@ -192,3 +191,61 @@ def test_incremental_invalid_old_scope_uses_all_candidates(monkeypatch, change):
     monkeypatch.setattr(verification, "assess_evidence_sufficiency", check)
     verification.verify_evidence(query, current, previous=previous)
     assert calls == [[item.id for item in current]]
+
+
+def test_fact_disagreement_is_not_an_identity_failure(monkeypatch):
+    from agent.loop import AgentRun
+    query, evidence = make_query("差旅如何审批？"), sources()
+    monkeypatch.setattr(verification, "assess_evidence_sufficiency", lambda *args, **kwargs:
+        EvidenceAssessment(False, "两份有效来源规定不同", source="model",
+            goal_coverage=[{"goal_id": "g1", "status": "conflict", "supporting_chunk_ids": []}]))
+    report = verification.verify_evidence(query, evidence)
+    assert report.verification_status == "completed"
+    assert report.to_dict()["failure_kind"] is None
+    assert AgentRun(evidence=evidence, assessment=report).outcome == "insufficient_evidence"
+
+
+def test_corrected_question_scope_reaches_answer_and_invalidates_when_tampered():
+    from service.core.answering.answer_context import build_answer_messages
+    query, evidence = make_query('两个年份长期借款及应付债券分别是多少？'), sources()
+    report = finalize_assessment(query, evidence, EvidenceAssessment(
+        True, '合并行足够', source='model', supporting_chunk_indices=[2],
+        evaluated_chunk_ids=[item.id for item in evidence],
+        answer_scope='回答合并金额', answer_notes=['该表未分别列示两个科目'],
+        planning_corrections=[{'goal_id': 'g1', 'reason': '规划误拆分'}],
+        goal_coverage=[{'goal_id': 'g1', 'status': 'missing', 'supporting_chunk_ids': []}]))
+    context = build_answer_context(query, evidence, report)
+    assert len(context.citations) == 1
+    assert context.citations[0].evidence.id == 'second'
+    messages = build_answer_messages(context, [])
+    assert '回答合并金额' in messages[-1]['content']
+    assert '该表未分别列示两个科目' in messages[-1]['content']
+    report.answer_notes.append('篡改')
+    assert not report.matches(query.version, evidence.version, verification_policy_version(), require_semantic=True)
+
+
+def test_corrected_previous_report_disables_goal_gap_reuse():
+    query, evidence = make_query('问题'), sources()
+    report = EvidenceAssessment(False, '还有原问题缺口', source='model',
+        planning_corrections=[{'goal_id': 'g1', 'reason': '原目标有误'}])
+    assert verification._gap_context(query, evidence, report, True) is None
+    assert verification._incremental_sources(query, evidence, report, True) is evidence
+
+
+def test_gap_merge_preserves_whole_question_decision_and_independent_sources():
+    from service.core.query.contract import QueryGoal
+    query = make_query('原问题', (QueryGoal('g1', '原目标1'), QueryGoal('g2', '原目标2')))
+    evidence = sources()
+    previous = EvidenceAssessment(False, '缺口', goal_coverage=[
+        {'goal_id': 'g1', 'status': 'supported', 'supporting_chunk_ids': ['first']},
+        {'goal_id': 'g2', 'status': 'missing', 'supporting_chunk_ids': []}])
+    partial = EvidenceAssessment(True, '原问题可回答', answer_scope='实际口径', answer_notes=['说明口径'],
+        planning_corrections=[{'goal_id': 'g2', 'reason': '额外要求'}],
+        evaluated_chunk_ids=['first', 'second'], supporting_chunk_indices=[2],
+        goal_coverage=[{'goal_id': 'g2', 'status': 'missing', 'supporting_chunk_ids': []}])
+    context = {'pending_goals': (query.goals[1],)}
+    merged = verification._merge_gap_assessment(query, evidence, previous, partial, context)
+    assert merged.sufficient
+    assert merged.goal_coverage[1]['status'] == 'missing'
+    assert merged.supporting_chunk_indices == [1, 2]
+    assert merged.answer_notes == ['说明口径']

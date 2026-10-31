@@ -1,3 +1,4 @@
+from tests.evidence_helpers import requirements_for_atoms
 import pytest
 
 from evaluation.end_to_end import (
@@ -136,9 +137,9 @@ def test_e2e_aggregation_reports_unsafe_answers_and_over_refusals():
 
 @pytest.mark.unit
 def test_unread_figure_match_is_relevant_but_not_sufficient():
-    sample = {"answerable": True, "relevant_evidence": [
-        {"document_name": "报告.pdf", "evidence_type": "figure", "locator": "图1 收入", "text": "收入增长"}
-    ]}
+    sample = {"answerable": True, "evidence_requirements": requirements_for_atoms([
+        {"document_name": "报告.pdf", "type": "figure", "locator": "图1 收入", "text": "收入增长"}
+    ])}
     case = evaluate_retrieval_case(sample, {
         "chunks_before_sufficiency": [{"chunk_id": "figure-1", "document_name": "报告.pdf",
                                         "content_with_weight": "图1 收入", "visual_status_kwd": "disabled"}],
@@ -156,10 +157,10 @@ def _sample(identifier, *, evidence_texts=("收入100亿元",), split="dev"):
         "question": "报告中的业绩是多少？",
         "answerable": bool(evidence_texts),
         "question_type": "fact" if evidence_texts else "unanswerable",
-        "relevant_evidence": [
+        "evidence_requirements": requirements_for_atoms([
             {"document_name": "报告.pdf", "text": text}
             for text in evidence_texts
-        ],
+        ]),
         "metadata": {"split": split},
     }
 
@@ -193,7 +194,7 @@ def _as_e2e_result(case, response_mode="answer"):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("top_k", [5, 10])
-def test_e2e_summary_aggregates_retrieval_scores_and_slices(top_k):
+def test_requirement_e2e_aggregation_preserves_retrieval_scores_and_slices(top_k):
     partial = _score(
         _sample("partial", evidence_texts=("收入100亿元", "净利润20亿元")),
         {
@@ -233,11 +234,14 @@ def test_e2e_summary_aggregates_retrieval_scores_and_slices(top_k):
         _as_e2e_result(failed, "error"),
     ]
 
-    summary = build_e2e_summary(results, top_k=top_k)
+    summary = build_summary(cases, top_k=top_k)
+    summary["overall"] = aggregate_e2e_results(results, top_k=top_k)
+    summary["by_question_type"] = {name: aggregate_e2e_results(
+        [row for row in results if row["question_type"] == name], top_k=top_k)
+        for name in summary["by_question_type"]}
     overall = summary["overall"]
     before = overall["retrieval_metrics"]
     after = overall["post_gate_metrics"]
-    assert summary["result_schema_version"] == "3.1"
     assert summary["metric_ks"] == [top_k]
     assert before["query_count"] == 4
     assert before["evaluated_query_count"] == 3
@@ -245,15 +249,14 @@ def test_e2e_summary_aggregates_retrieval_scores_and_slices(top_k):
     assert before["unanswerable_query_count"] == 1
     assert before["error_count"] == 1
     assert before["error_rate"] == 0.25
-    assert before[f"hit_at_{top_k}"] == 1.0
+    assert before[f"hit_at_{top_k}"] == 0.5
     assert before[f"recall_at_{top_k}"] == 0.75
-    assert before[f"mrr_at_{top_k}"] == 0.75
+    assert before[f"mrr_at_{top_k}"] == 0.25
     assert before[f"precision_at_{top_k}"] == pytest.approx(1 / top_k)
     assert before[f"duplicate_rate_at_{top_k}"] == 0.0
-    assert before[f"all_requirements_hit_at_{top_k}"] is None
-    assert after[f"hit_at_{top_k}"] == 0.5
+    assert after[f"hit_at_{top_k}"] == 0
     assert after[f"recall_at_{top_k}"] == 0.25
-    assert after[f"mrr_at_{top_k}"] == 0.5
+    assert after[f"mrr_at_{top_k}"] == 0
     assert after[f"precision_at_{top_k}"] == pytest.approx(1 / (2 * top_k))
     assert overall["gate_metrics"]["false_rejection_with_sufficient_evidence_count"] == 1
     assert overall["refusal_metrics"]["over_refusal_count"] == 1
@@ -268,8 +271,8 @@ def test_e2e_summary_aggregates_retrieval_scores_and_slices(top_k):
     failures = overall["non_perfect_sample_ids"]
     assert failures["error_rate"] == ["failed"]
     assert failures["retrieval_metrics"][f"recall_at_{top_k}"] == ["partial"]
-    assert failures["retrieval_metrics"][f"mrr_at_{top_k}"] == ["rejected"]
-    assert failures["post_gate_metrics"][f"mrr_at_{top_k}"] == ["rejected"]
+    assert failures["retrieval_metrics"][f"mrr_at_{top_k}"] == ["partial", "rejected"]
+    assert failures["post_gate_metrics"][f"mrr_at_{top_k}"] == ["partial", "rejected"]
     assert failures["refusal_metrics"]["over_refusal_rate"] == ["rejected"]
 
     # 两个评测执行器必须使用相同的分母、得分和诊断规则。
@@ -318,11 +321,11 @@ def test_e2e_summary_without_scored_answerable_queries_has_null_metrics(cohort):
         results.append(_as_e2e_result(build_error_case(
             _sample("failed"), error=RuntimeError("failed"), latency_ms=10, top_k=5,
         ), "error"))
-    overall = build_e2e_summary(results)["overall"]
+    overall = aggregate_e2e_results(results)
     for group in ("retrieval_metrics", "post_gate_metrics"):
         assert overall[group]["answerable_query_count"] == 0
         assert overall[group]["error_count"] == int(cohort == "error")
-        for metric in ("recall", "mrr", "hit", "precision", "all_requirements_hit"):
+        for metric in ("recall", "mrr", "hit", "precision"):
             assert overall[group][f"{metric}_at_5"] is None
 
 
@@ -330,22 +333,17 @@ def test_e2e_summary_without_scored_answerable_queries_has_null_metrics(cohort):
 def test_e2e_summary_preserves_multi_evidence_completion_rank():
     sample = _sample("multi", evidence_texts=("收入100亿元", "净利润20亿元"))
     sample["question_type"] = "parallel_multi_evidence"
-    sample["evidence_requirements"] = [
-        {"id": f"r{i}", "alternatives": [[{"type": "text", **evidence}]]}
-        for i, evidence in enumerate(sample["relevant_evidence"])
-    ]
     chunks = [_chunk(), _chunk("noise", "无关信息"), _chunk("profit", "净利润20亿元")]
     result = _as_e2e_result(_score(sample, {
         "chunks_before_sufficiency": chunks,
         "chunks": chunks,
         "evidence_sufficiency": {"source": "model", "sufficient": True},
     }))
-    summary = build_e2e_summary([result])
+    summary = {"overall": aggregate_e2e_results([result])}
     for group in ("retrieval_metrics", "post_gate_metrics"):
         metrics = summary["overall"][group]
         assert metrics["recall_at_5"] == 1.0
         assert metrics["hit_at_5"] == 1.0
-        assert metrics["all_requirements_hit_at_5"] == 1.0
         assert metrics["mrr_at_5"] == pytest.approx(1 / 3, abs=1e-6)
 
 

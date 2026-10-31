@@ -4,6 +4,39 @@
 
 后端业务模块的职责、调用入口和资源路径约定见 [核心模块目录说明](app/service/core/README.md)。
 
+## 后端各流程使用的模型
+
+下表以代码默认值为准，视觉模型另外标注当前项目 `.env` 配置；部署时以 `.env`、容器环境变量及显式传入的模型配置为准，不代表运行中进程的实时配置。需求理解、规划、桥接、核验和最终回答是不同调用，修改其中一个模型不会自动替换其他流程。
+
+| 流程 | 模型（代码默认值） | 模型配置 / 调用方式 | 主要入口与说明 |
+| --- | --- | --- | --- |
+| 历史指代消解 | 首轮 `qwen3.7-flash`；兜底 `qwen3.8-max` | `AGENT_CONTEXT_MODEL` / `AGENT_CONTEXT_FALLBACK_MODEL`；DashScope | [query/contract.py](app/service/core/query/contract.py)；未单独设置时分别继承 `AGENT_MODEL` / `AGENT_FALLBACK_MODEL`，按需要消解历史或当前问题中的指代 |
+| 查询理解、目标与主体提取、初始任务规划 | 首轮 `qwen3.7-flash`；兜底 `qwen3.8-max` | `AGENT_MODEL` / `AGENT_FALLBACK_MODEL`；DashScope | [agent/planner.py](app/agent/planner.py) 的 `agent_initial_plan`；这些工作在同一次模型调用中完成，不另调实体识别模型 |
+| 证据不足后的补查规划 | 首轮 `qwen3.7-flash`；兜底 `qwen3.8-max` | 与初始规划共用 `AGENT_MODEL` / `AGENT_FALLBACK_MODEL`；DashScope | [agent/planner.py](app/agent/planner.py) 的 `agent_replan`；根据证据缺口和已执行任务生成新任务 |
+| 任务间桥接变量提取 | `qwen3.7-flash` | `RAG_BRIDGE_EXTRACTION_MODEL`；DashScope | [evidence/bindings.py](app/service/core/evidence/bindings.py)；任务需要 `output_slot` 且取得证据时，从原文提取后续任务需要的值和来源 |
+| 证据充分性、逐目标覆盖与冲突核验 | `deepseek-ai/DeepSeek-V4.1-Flash` | `RAG_EVIDENCE_SUFFICIENCY_MODEL`；**硅基流动** | [evidence/sufficiency.py](app/service/core/evidence/sufficiency.py)、[evidence/verification.py](app/service/core/evidence/verification.py)；包括后续缺口核验，由 `RAG_EVIDENCE_SUFFICIENCY_ENABLED` 控制模型核验开关 |
+| 最终回答、计算与引用生成 | `qwen3.8-max` | `CHAT_MODEL`；DashScope | [answering/turn.py](app/service/core/answering/turn.py)、[agent/orchestrator.py](app/agent/orchestrator.py)；使用核验后的回答上下文生成流式回答 |
+| 回答后的推荐问题 | `qwen3.7-flash` | `RECOMMENDED_QUESTIONS_MODEL`；DashScope | [answering/chat.py](app/service/core/answering/chat.py)；网页端可生成，CLI 请求默认关闭 |
+| 联网搜索 | `qwen-plus` | `WEB_SEARCH_MODEL`；DashScope **原生搜索接口** | [agent/tools/web_search.py](app/agent/tools/web_search.py)；启用搜索并取得网页来源信息，不是知识库向量检索 |
+| 入库片段向量化、查询向量化 | `BAAI/bge-small-zh-v1.5`，512 维 | `EMBEDDING_BACKEND=local`（默认）或 `remote`；本地用 `EMBEDDING_MODEL_PATH`，远程请求用 `EMBEDDING_MODEL_ID` | [rag/nlp/model.py](app/service/core/rag/nlp/model.py)；本地默认目录 `/models/bge-small-zh-v1.5`，入库与查询须使用兼容的模型和向量配置 |
+| 检索候选语义重排、表格上下文相关性排序 | `BAAI/bge-reranker-v2-m3` | `RERANKER_BACKEND=local`（默认）或 `remote`；本地用 `RERANKER_MODEL_PATH`，远程请求用 `RERANKER_MODEL_ID` | [rag/nlp/model.py](app/service/core/rag/nlp/model.py) 的 `rerank_similarity`；本地默认目录 `/models/bge-reranker-v2-m3`，不调用聊天模型 |
+| 入库图表视觉事实提取 | 当前项目 `.env`：`qwen3-vl-plus`；代码无默认模型 | `FIGURE_VISION_ENABLED=true` 且设置 `FIGURE_VISION_MODEL` | [ingestion/figures.py](app/service/core/ingestion/figures.py)；当前项目 `.env` 已开启，代码缺省关闭；不能把 OCR 文字当成已提取的图表视觉事实 |
+| 入库表格视觉解析与结构绑定 | 当前项目 `.env`：`qwen3-vl-plus`；与图表共用配置 | `FIGURE_VISION_ENABLED` / `FIGURE_VISION_MODEL` | [ingestion/tables.py](app/service/core/ingestion/tables.py)；按表格处理路径需要调用，失败时保留原始或未绑定结构 |
+| PDF OCR、版面与表格结构检测 | DeepDoc 的 `det.onnx`、`rec.onnx`、`layout.onnx`、`tsr.onnx` 等本地模型资源 | DeepDoc 本地模型目录；部分模型缺失时尝试从 `InfiniFlow/deepdoc` 下载 | [deepdoc/parser/pdf_parser.py](app/service/core/deepdoc/parser/pdf_parser.py)、[deepdoc/vision/](app/service/core/deepdoc/vision/)；不使用上述聊天模型配置 |
+| PDF 上下文本拼接判断 | XGBoost `updown_concat_xgb.model` | DeepDoc 本地资源；缺失时尝试从 `InfiniFlow/text_concat_xgb_v1.0` 下载 | [deepdoc/parser/pdf_parser.py](app/service/core/deepdoc/parser/pdf_parser.py)；用于 PDF 文本整理 |
+| 离线端到端评测裁判 | `qwen3.7-plus` | `--judge-model` 优先，其次 `E2E_JUDGE_MODEL`；DashScope；`--no-judge` 可关闭 | [evals/run_e2e_eval.py](evals/run_e2e_eval.py)；用于答案语义判定、忠实性和引用支持等评判，不是线上证据核验模型 |
+
+连接配置：
+
+- **DashScope 文本模型**：`DASHSCOPE_API_KEY` + `DASHSCOPE_BASE_URL`（OpenAI 兼容接口）。联网搜索使用同一 Key，但地址由 `DASHSCOPE_NATIVE_BASE_URL` 控制。
+- **硅基流动核验模型**：`SILICONFLOW_API_KEY` + `SILICONFLOW_BASE_URL`，模型名由 `RAG_EVIDENCE_SUFFICIENCY_MODEL` 单独控制。
+- **可选视觉模型**：`FIGURE_VISION_API_KEY` + `FIGURE_VISION_BASE_URL`；未配置时分别继承 DashScope 的 Key 和地址。该地址上的模型必须支持图像输入。
+- **远程向量化 / 重排**：分别使用 `EMBEDDING_REMOTE_BASE_URL` / `EMBEDDING_REMOTE_API_KEY` 和 `RERANKER_REMOTE_BASE_URL` / `RERANKER_REMOTE_API_KEY`；实际加载的权重由远程服务配置决定。
+
+理解、规划和指代消解在请求、解析或校验失败后最多再调用一次兜底模型；正常成功或正常澄清不会升级模型。桥接、核验、回答等流程不会自动套用 `AGENT_FALLBACK_MODEL`。
+
+普通知识库搜索不额外调用理解模型；固定别名扩展、约束兼容性计算、依赖校验和表格行恢复由代码执行。会话标题取首次问题前 30 个字符，不调用模型。纯检索评测会执行向量化和重排，但不执行 Agent 规划或在线充分性核验。[rag/nlp/model.py](app/service/core/rag/nlp/model.py) 中的 `get_chat_completion_block()` 是旧示例入口，不属于当前在线回答流程。
+
 ## 🚀 快速启动
 
 ### 环境要求
@@ -23,6 +56,10 @@ cd LS-p1
 2. **.env 配置文件**
 ```bash
 DASHSCOPE_API_KEY="your-api-key"
+DASHSCOPE_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+SILICONFLOW_API_KEY="your-siliconflow-api-key"
+SILICONFLOW_BASE_URL="https://api.siliconflow.cn/v1"
+RAG_EVIDENCE_SUFFICIENCY_MODEL=deepseek-ai/DeepSeek-V4.1-Flash
 EMBEDDING_BACKEND=local
 BGE_MODEL_HOST_PATH=../../models/bge-small-zh-v1.5
 RERANKER_BACKEND=local
@@ -38,7 +75,7 @@ RAG_EVIDENCE_SUFFICIENCY_ENABLED=true
 
 Embedding 和重排默认分别使用本地 `bge-small-zh-v1.5` 与
 `bge-reranker-v2-m3`，也可以各自切换到远程推理服务；DashScope Key 用于 RAG
-Agent 需求理解、规划、证据核验及聊天模型。本地模型宿主机路径都相对于本目录的
+Agent 需求理解、规划、桥接及聊天模型；证据核验使用硅基流动配置。本地模型宿主机路径都相对于本目录的
 `docker-compose.yml`。
 
 远程 GPU 模式配置示例：
@@ -133,11 +170,7 @@ CLI 请求默认关闭回答后的推荐问题生成；会话标题直接取首�
 
 ### 表格、图表与重新入库
 
-入库现在会区分资料研究对象、发布方、片段提及公司和明确表格行列归属，
-保留固定公司编号、归属状态及原文依据。名称对应表位于
-`app/service/core/conf/entity_registry.json`；未登记或有歧义的名称保留为未知，
-仅有报告背景时记录为可能归属。旧资料需重新入库才能补上标签；本步骤不增加
-模型调用。字段含义、名称表配置和边界见 [入库归属标注](docs/entity_attribution.md)。
+入库保留原文、文档信息和表格结构，不生成公司归属标签。查询主体由模型识别并按目标保留，可表示公司、板块、项目等；在线链路不再依赖公司注册表。主体归属及证据支持关系由核验模型结合原文判断。旧标签在证据边界忽略，无需为本次主体调整重新入库。详见 [查询主体契约](app/service/core/query/README.md)。
 
 表格解析采用两层结构。`Table Object` 保存解析器原始 HTML、规范化单元格网格、
 合并关系、完整 Markdown、表级摘要和来源信息，是可审计、可重建的事实源；

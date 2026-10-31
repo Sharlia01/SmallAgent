@@ -19,7 +19,7 @@ def test_validation_cli_automatically_captures_and_appends(tmp_path, entry):
     source = app.parent / "evals"
     scripts = tmp_path / "evals"
     scripts.mkdir()
-    for name in ("evaluation_logging.py", "run_e2e_eval.py", "run_retrieval_eval.py", "html_report.py"):
+    for name in ("evaluation_logging.py", "run_e2e_eval.py", "run_retrieval_eval.py", "html_report.py", "e2e_artifact.py"):
         shutil.copyfile(source / name, scripts / name)
     env = {**os.environ, "PYTHONPATH": str(app) + os.pathsep + os.environ.get("PYTHONPATH", "")}
     command = [sys.executable, str(scripts / entry), "--validate-only", "--limit", "1",

@@ -150,23 +150,22 @@ def test_retired_financial_statistics_are_not_reported_as_zero_success():
 
 def test_repaired_subject_uses_generic_goal_binding():
     query = QueryContext(QueryRequest.from_user("先查推荐公司，再查它的收入"),
-                         QueryUnderstanding((QueryGoal("g1", "推荐公司的收入", subject_slot="company"),),
-                                            entity_names=()))
+                         QueryUnderstanding((QueryGoal("g1", "推荐公司的收入", subject_slot="company"),)))
     previous = (AgentTask("first", query="推荐公司", output_slot="company", goal_ids=("g1",)),)
-    retry = AgentTask("retry", query="推荐公司 完整报告", output_slot="retry_company",
-                      binding_key="company", goal_ids=("g1",))
-    consumer = AgentTask("income", query_template="{retry_company}收入", depends_on=("retry",),
-                         required_slots=("retry_company",), goal_ids=("g1",))
+    retry = AgentTask("retry", query="推荐公司 完整报告", output_slot="company", goal_ids=("g1",))
+    consumer = AgentTask("income", query_template="{company}收入", depends_on=("retry",),
+                         required_slots=("company",), goal_ids=("g1",))
     planned = AgentPlan((retry, consumer))
-    assert validate_plan(planned, query, {"search_knowledge_base"}, previous=previous) is planned
+    planned = validate_plan(planned, query, {"search_knowledge_base"}, previous=previous)
+    retry, consumer = planned.tasks
     tool = SearchTool([records(text="推荐国电电力"), records("income", text="营业收入80亿元")])
     executor = ToolExecutor([tool], bridge_extractor=lambda **kwargs: BridgeExtraction(
-        kwargs["slot"], "国电电力", 1, "c1", "doc1", "model", "推荐国电电力"))
+        kwargs["slot"], "国电电力", "c1", "doc1", "推荐国电电力"))
     discovery = executor.execute_task(retry, query, {}, {})
     result = executor.execute_task(consumer, query, {"retry": discovery}, {})
     assert result.status == "succeeded"
     assert tool.calls[-1].query == "国电电力收入"
-    assert tool.calls[-1].company_hints.entity_names == ("国电电力",)
+    assert tool.calls[-1].subject_names == ("国电电力",)
 
 
 def test_turn_delivers_inputs_to_answer_model_without_server_calculation(monkeypatch):

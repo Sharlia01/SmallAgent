@@ -23,6 +23,9 @@ class EvidenceAssessment:
     goal_coverage: list[dict[str, Any]] = field(default_factory=list)  # 逐目标覆盖结果，包含 goal_id、supported/missing/conflict 状态及支持片段 ID
     verification_status: str = "completed"  # 核验执行状态：completed 已完成、unavailable 未能完成；完成不代表证据充分
     diagnostics: dict[str, Any] = field(default_factory=dict)  # 诊断信息，如失败类型、尝试次数、输入预算限制及未送审片段 ID
+    answer_scope: str = ""  # 核验确认的原问题回答范围
+    answer_notes: list[str] = field(default_factory=list)
+    planning_corrections: list[dict[str, Any]] = field(default_factory=list)
     query_version: str = ""  # 绑定的查询及目标版本指纹；为空表示尚未绑定，变化后旧报告不能复用
     evidence_version: str = ""  # 绑定的完整证据集合版本指纹；证据内容、顺序或身份冲突变化后需重新核验
     policy_version: str = ""  # 绑定的核验规则与配置版本指纹；策略变化后旧报告不能复用
@@ -32,7 +35,7 @@ class EvidenceAssessment:
     def __post_init__(self):
         # 报告保存独立快照；抽取结果、模型响应或调用方列表的后续修改不能污染报告。
         for name in ("missing_requirements", "supporting_chunk_indices", "evaluated_chunk_ids",
-                     "goal_coverage", "diagnostics"):
+                     "goal_coverage", "diagnostics", "answer_notes", "planning_corrections"):
             object.__setattr__(self, name, deepcopy(getattr(self, name)))
         object.__setattr__(self, "_report_version", self._current_report_version())
 
@@ -54,6 +57,8 @@ class EvidenceAssessment:
         """导出通用核验结果；不再生成财务事实或服务端计算记录。"""
         return deepcopy({
             "sufficient": self.sufficient,
+            "answer_scope": self.answer_scope, "answer_notes": self.answer_notes,
+            "planning_corrections": self.planning_corrections,
             "reason": self.reason,
             "missing_requirements": self.missing_requirements,
             "supporting_chunk_indices": self.supporting_chunk_indices,

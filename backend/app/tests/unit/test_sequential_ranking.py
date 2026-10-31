@@ -55,8 +55,8 @@ def merge(hops, *, page_size=3, page=1, question=QUESTION):
         original_question=question,
         hop_results=hops,
         bridge=BridgeExtraction(
-            slot="rating", value="优于大市", source_chunk_index=2,
-            source_chunk_id="rating", document_id="report", source="rule",
+            slot="rating", value="优于大市",
+            source_chunk_id="rating", document_id="report",
         ),
         options=retrieval.Dealer.RetrievalOptions(page=page, page_size=page_size),
     )

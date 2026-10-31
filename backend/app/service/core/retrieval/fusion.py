@@ -97,8 +97,9 @@ def _merge_sequential_hops(
         # 保留已经核验的桥接证据，避免仅保留无关的第一跳最高分结果。
         # 后续各跳保留自己的最佳独立结果，防止背景证据因对完整问题得分较低而丢失。
         representative = None
-        if hop_number == 1 and 1 <= bridge.source_chunk_index <= len(current_keys):
-            representative = current_keys[bridge.source_chunk_index - 1]
+        if hop_number == 1 and bridge.source_chunk_id:
+            representative = next((key for key in current_keys
+                                   if str(chunks_by_key[key].get("chunk_id") or "") == bridge.source_chunk_id), None)
         if representative is None:
             representative = next(
                 (key for key in current_keys if key not in representative_keys),
@@ -234,7 +235,7 @@ def _merge_sequential_hops(
                     "subquery_id": step.id,
                     "hop": hop_number,
                     "query": query,
-                    "company_hints": result.get("company_hints") or {},
+                    "subject_names": result.get("subject_names") or [],
                     "retrieval_fusion": result.get("retrieval_fusion") or {},
                     "returned_chunk_count": len(result.get("chunks") or []),
                 }

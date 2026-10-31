@@ -42,14 +42,14 @@ def test_rating_bridge_is_extracted_from_the_exact_source_chunk():
         original_question="研报给了什么评级？",
         first_query="研报给了什么评级？",
         chunks=chunks,
-        client=fake_client("must not be used"),
+        client=fake_client('{"found":true,"value":"优于大市","source_chunk_index":1,"subject":"","source_quote":"投资建议：维持“优于大市”评级。"}'),
     )
 
     assert result is not None
     assert result.value == "优于大市"
     assert result.source_chunk_id == "rating"
     assert result.document_id == "doc-1"
-    assert result.source == "rule"
+    assert set(result.to_dict()) == {"slot", "value", "source_chunk_id", "document_id", "source_quote"}
 
 
 @pytest.mark.unit
@@ -81,3 +81,22 @@ def test_query_template_rejects_unknown_dependency_slot():
             "{unknown}的定义是什么？",
             {"rating": "优于大市"},
         )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("source_index", [0, 2, 3])
+def test_model_index_resolves_original_chunk_id_after_empty_chunk_is_skipped(source_index):
+    import json
+    quote = "甲公司采用现金分红政策。"
+    result = sequential_retrieval.extract_bridge_value(
+        slot="policy", original_question="甲公司采用什么政策？", first_query="甲公司采用什么政策？",
+        chunks=[{"chunk_id": "empty", "content_with_weight": ""},
+                {"chunk_id": "policy", "doc_id": "report", "content_with_weight": quote}],
+        client=fake_client(json.dumps(dict(found=True, value="现金分红政策",
+                                          source_chunk_index=source_index, source_quote=quote))),
+    )
+    if source_index != 2:
+        assert result is None
+    else:
+        assert result.to_dict() == dict(slot="policy", value="现金分红政策", source_chunk_id="policy",
+                                       document_id="report", source_quote=quote)

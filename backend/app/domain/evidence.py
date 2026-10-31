@@ -195,6 +195,14 @@ class Evidence:
         return fingerprint(self)
 
     @property
+    def source_identities(self) -> Mapping[str, str]:
+        """表格视图按原始 chunk 检查身份；无来源快照时保守检查当前证据。"""
+        originals = self.structure.table.metadata.get("table_source_fingerprints_obj")
+        if originals:
+            return originals
+        return {self.id: self.source_content_fingerprint}
+
+    @property
     def source_content_fingerprint(self) -> str:
         """来源内容身份，不把检索排名和候选诊断当成原文变化。
 
@@ -229,6 +237,7 @@ class EvidenceCollection:
     def __init__(self, evidence: Iterable[Evidence] = ()):
         self._items: dict[str, Evidence] = {}  #证据，按 ID 存放，证据之间有顺序
         self._traces: dict[str, list[RetrievalTrace]] = {}  #每条证据的检索记录
+        self._sources: dict[str, tuple[str, str]] = {}  # 原始 chunk ID -> 内容指纹、首次证据版本
         self._conflicts: list[EvidenceConflict] = []  #证据冲突记录，主要检查同一个证据编号是否有被混用
         for item in evidence:
             self.add(item)
@@ -256,13 +265,21 @@ class EvidenceCollection:
 
     def add(self, item: Evidence, trace: RetrievalTrace | None = None) -> None:
         previous = self._items.get(item.id)
-        if (previous is not None
-                and previous.source_content_fingerprint != item.source_content_fingerprint):
-            conflict = EvidenceConflict(item.id, previous.version, item.version)
-            if conflict not in self._conflicts:
-                self._conflicts.append(conflict)
-        else:
-            self._items.setdefault(item.id, item)
+        conflicted = False
+        for identifier, content_hash in item.source_identities.items():
+            retained = self._sources.get(identifier)
+            if retained is not None and retained[0] != content_hash:
+                conflict = EvidenceConflict(identifier, retained[1], item.version)
+                if conflict not in self._conflicts:
+                    self._conflicts.append(conflict)
+                conflicted = True
+        if not conflicted:
+            for identifier, content_hash in item.source_identities.items():
+                self._sources.setdefault(identifier, (content_hash, item.version))
+            if (previous is None or
+                    previous.source_content_fingerprint != item.source_content_fingerprint):
+                # 同一来源的展示窗口变化不是冲突，但必须更新快照使旧核验失效。
+                self._items[item.id] = item
         if trace is not None and trace not in self._traces.setdefault(item.id, []):
             self._traces[item.id].append(trace)
 
@@ -271,6 +288,13 @@ class EvidenceCollection:
             self.add(item)
             for trace in other.traces(item.id):
                 self.add(item, trace)
+        # 视图替换后仍保留已见过的原始身份，copy/merge 不能丢失冲突检查历史。
+        for identifier, incoming in other._sources.items():
+            retained = self._sources.setdefault(identifier, incoming)
+            if retained[0] != incoming[0]:
+                conflict = EvidenceConflict(identifier, retained[1], incoming[1])
+                if conflict not in self._conflicts:
+                    self._conflicts.append(conflict)
         for conflict in other.conflicts:
             if conflict not in self._conflicts:
                 self._conflicts.append(conflict)
@@ -288,7 +312,7 @@ class EvidenceCollection:
             result.add(item)
             for trace in self.traces(identifier):
                 result.add(item, trace)
-        result._conflicts = [item for item in self.conflicts if item.evidence_id in result._items]
+        result._conflicts = [item for item in self.conflicts if item.evidence_id in result._sources]
         return result
 
 
@@ -322,6 +346,8 @@ class AnswerContext:
     blocks: tuple[AnswerBlock, ...]
     citations: tuple[Citation, ...]
     goal_support: tuple[AnswerGoalSupport, ...] = ()
+    answer_scope: str = ""
+    answer_notes: tuple[str, ...] = ()
 
     def __post_init__(self):
         ids = {citation.evidence.id for citation in self.citations}

@@ -458,7 +458,7 @@ def table_row_chunk_match_score(evidence, chunk):
                     ):
                         return 1.0
 
-            # 支持现有relevant_evidence.text
+            # 表格也允许用原文匹配整行。
             if expected_text:
                 actual_row_text = " ".join(row)
                 row_score = evidence_text_match_score(
@@ -487,27 +487,6 @@ def figure_chunk_match_score(
                  else evidence.get("locator") or evidence.get("text"))
     return evidence_text_match_score(reference, _chunk_content(chunk))
 
-
-def relevant_evidence_chunk_match_score(
-    evidence: dict[str, Any],
-    chunk: dict[str, Any],
-) -> float:
-    evidence_type = str(
-        evidence.get("evidence_type") or "text"
-    ).casefold()
-
-    if evidence_type == "table":
-        return table_row_chunk_match_score(evidence, chunk)
-
-    if evidence_type == "figure":
-        return figure_chunk_match_score(evidence, chunk)
-
-    if evidence_type == "text":
-        return evidence_chunk_match_score(evidence, chunk)
-
-    raise ValueError(
-        f"Unsupported evidence_type: {evidence_type}"
-    )
 
 def _candidate_matches(evidence_type, passing_matches, chunks):
     return [{"matched_rank": rank, "matched_chunk_id": chunk_id,
@@ -575,7 +554,7 @@ def evaluate_evidence_requirement(
                 (item[1] for item in scored_chunks),
                 default=0.0,
             )
-            evidence_type = "table" if match_type == "table_row" else str(atom.get("evidence_type") or match_type).casefold()
+            evidence_type = "table" if match_type == "table_row" else match_type
             candidates = _candidate_matches(evidence_type, passing_matches, chunks)
 
             atom_matches.append(
@@ -645,9 +624,9 @@ def evaluate_evidence_requirement(
     )
 
     return {
-        "requirement_id": requirement.get("id"),
+        "requirement_id": requirement.get("id"), # 每个要求的id
         "matched": True,
-        "matched_rank": best_alternative["completion_rank"],
+        "matched_rank": best_alternative["completion_rank"], # 表示读完第几个chunk, 这组证据才凑齐
         "matched_chunk_id": None,
         "matched_chunk_ids": best_alternative["matched_chunk_ids"],
         "best_match_score": 1.0,
@@ -749,36 +728,30 @@ def get_source_modality(sample: dict[str, Any]) -> str:
     if metadata.get("source_modality"):
         return str(metadata["source_modality"])
     evidence_types = {
-        evidence.get("evidence_type")
-        for evidence in sample.get("relevant_evidence", [])
-        if evidence.get("evidence_type")
+        "table" if atom.get("type") == "table_row" else atom.get("type", "text")
+        for atom in iter_evidence_atoms(sample)
     }
     if evidence_types:
         return "+".join(sorted(evidence_types))
     return "text" if sample.get("answerable") else "none"
 
 
-def _iter_gold_matchers(sample: dict[str, Any]):
-    requirements = sample.get("evidence_requirements") or []
-    if requirements:
-        for requirement in requirements:
-            for alternative in requirement.get("alternatives") or []:
-                for atom in alternative:
-                    match_type = atom.get("type", "text")
-                    if match_type == "text":
-                        yield evidence_chunk_match_score, atom
-                    elif match_type == "table_row":
-                        yield table_row_chunk_match_score, atom
-                    elif match_type == "figure":
-                        yield figure_chunk_match_score, atom
-                    else:
-                        raise ValueError(
-                            f"Unsupported evidence match type: {match_type}"
-                        )
-        return
+def iter_evidence_atoms(sample: dict[str, Any]):
+    """按标注顺序遍历每个要求的全部替代方案。"""
+    for requirement in sample.get("evidence_requirements") or []:
+        for alternative in requirement.get("alternatives") or []:
+            yield from alternative
 
-    for evidence in sample.get("relevant_evidence") or []:
-        yield relevant_evidence_chunk_match_score, evidence
+
+def _iter_gold_matchers(sample: dict[str, Any]):
+    matchers = {"text": evidence_chunk_match_score,
+                "table_row": table_row_chunk_match_score,
+                "figure": figure_chunk_match_score}
+    for atom in iter_evidence_atoms(sample):
+        match_type = atom.get("type", "text")
+        if match_type not in matchers:
+            raise ValueError(f"Unsupported evidence match type: {match_type}")
+        yield matchers[match_type], atom
 
 
 def _relevant_chunk_count(
@@ -826,104 +799,32 @@ def _evaluate_chunks(
     top_k: int,
     match_threshold: float,
 ) -> dict[str, Any]:
-    """使用完全相同的证据规则评估不同检索阶段。"""
+    """统一评估各阶段；Hit@K 表示前 K 条结果满足全部证据要求。"""
+
+    # evidence_requirements表示回答问题需要满足的证据要求
     evidence_requirements = sample.get("evidence_requirements") or []
 
-    # 先确定“标准答案”长什么样子，然后再去看检索结果里有没有匹配的。
-    # 多证据题的覆盖要求；所有 requirement 都满足，Hit 才算成功
-    if evidence_requirements:
-        evidence_matches = [
-            evaluate_evidence_requirement(
-                requirement,
-                raw_chunks,
-                match_threshold,
-            )
-            for requirement in evidence_requirements
-        ]
-    else:
-        # 对于每一条relevant_evidence，检查检索结果里有没有匹配的chunk。
-        evidence_matches = []
-        for evidence_index, evidence in enumerate(
-            sample.get("relevant_evidence") or [],
-            start=1,
-        ):
-            scored_chunks = [
-                (
-                    rank,
-                    relevant_evidence_chunk_match_score(evidence, chunk),
-                    str(chunk.get("chunk_id", "")),
-                )
-                for rank, chunk in enumerate(raw_chunks, start=1)
-            ]
-            # 检索片段里得分超过阈值的片段
-            passing_matches = [
-                item for item in scored_chunks
-                if item[1] >= match_threshold
-            ]
-            # 排名最前的匹配片段（如果有的话）
-            first_match = min(
-                passing_matches,
-                default=None,
-                key=lambda item: item[0],
-            )
-            # 所有检索片段里得分最高的片段的分数
-            best_score = max(
-                (item[1] for item in scored_chunks),
-                default=0.0,
-            )
-            matched_rank = first_match[0] if first_match else None
-            evidence_type = str(evidence.get("evidence_type") or "text").casefold()
-            candidates = _candidate_matches(evidence_type, passing_matches, raw_chunks)
-
-            # 记录每条evidence的匹配结果，包括是否匹配、匹配的排名、匹配的chunk_id，以及最佳匹配分数。
-            evidence_matches.append(
-                {
-                    "evidence_index": evidence_index,
-                    "document_name": evidence.get("document_name"),
-                    "page": evidence.get("page"),
-                    "evidence_type": evidence.get(
-                        "evidence_type",
-                        "text",
-                    ),
-                    "matched": first_match is not None,
-                    "matched_rank": matched_rank,
-                    "matched_chunk_id": (
-                        first_match[2] if first_match else None
-                    ),
-                    "best_match_score": round(best_score, 6),
-                    "candidate_matches": candidates,
-                    "usable": any_supported(item["usable"] for item in candidates) if candidates else False,
-                }
-            )
+    evidence_matches = [
+        evaluate_evidence_requirement(requirement, raw_chunks, match_threshold)
+        for requirement in evidence_requirements
+    ]
 
     answerable = bool(sample.get("answerable"))
-    gold_evidence_count = len(evidence_matches)
+    gold_evidence_count = len(evidence_matches) # 数据集中有多少条证据要求
     matched_evidence_count = sum(
         1 for evidence in evidence_matches if evidence["matched"]
-    )
+    ) # 满足了多少条证据
     matched_ranks = [
         evidence["matched_rank"]
         for evidence in evidence_matches
         if evidence["matched_rank"] is not None
-    ]
+    ] # 用来计算平均倒数排名，表示完成每个要求的chunk的位置，比如前三个chunk完成了要求A
 
-    if evidence_requirements:
-        # 对于requirements，只有当所有requirements都匹配时，才算满足要求。
-        all_requirements_matched = (
-            bool(evidence_matches)
-            and all(evidence["matched"] for evidence in evidence_matches)
-        )
-        first_relevant_rank = (
-            max(matched_ranks)
-            if all_requirements_matched
-            else None
-        )
-    else:
-        first_relevant_rank = (
-            min(matched_ranks)
-            if matched_ranks
-            else None
-        )
+    all_requirements_matched = (
+        bool(evidence_matches) and all(evidence["matched"] for evidence in evidence_matches)
+    )
+    # 排名表示完成全部要求的位置，而非第一条相关证据的位置。
+    first_relevant_rank = max(matched_ranks) if all_requirements_matched else None
 
     metric_suffix = str(top_k)
     relevant_chunk_count = _relevant_chunk_count(
@@ -932,6 +833,7 @@ def _evaluate_chunks(
         match_threshold,
     )
 
+     # 计算召回率、精确率、平均倒数排名
     metrics = {
         f"hit_at_{metric_suffix}": (
             bool(first_relevant_rank) if answerable else None
@@ -948,11 +850,6 @@ def _evaluate_chunks(
             1.0 / first_relevant_rank
             if answerable and first_relevant_rank
             else (0.0 if answerable else None)
-        ),
-        f"all_requirements_hit_at_{metric_suffix}": (
-            bool(first_relevant_rank)
-            if answerable and evidence_requirements
-            else None
         ),
         f"duplicate_rate_at_{metric_suffix}": _exact_duplicate_rate(raw_chunks),
     }
@@ -1001,7 +898,6 @@ def _unavailable_metrics(
             f"recall_at_{cutoff}": None,
             f"precision_at_{cutoff}": None,
             f"mrr_at_{cutoff}": None,
-            f"all_requirements_hit_at_{cutoff}": None,
             f"duplicate_rate_at_{cutoff}": None,
         })
     return metrics
@@ -1015,7 +911,7 @@ def _evaluate_evidence_set(
     evaluated = _evaluate_chunks(sample, chunks, top_k=max(1, size), match_threshold=match_threshold)
     ranked = evaluated["metrics"]
     metrics = {name: ranked[f"{name}_at_{max(1, size)}"]
-               for name in ("hit", "recall", "precision", "all_requirements_hit", "duplicate_rate")}
+               for name in ("hit", "recall", "precision", "duplicate_rate")}
     if not size:
         metrics["precision"] = None
     metrics["evidence_count"] = size
@@ -1121,8 +1017,8 @@ def evaluate_retrieval_case(
     match_threshold: float,
     metric_ks: Iterable[int] | None = None,
 ) -> dict[str, Any]:
-    """分别评估检索结果、门控决策和最终交付证据。"""
-    resolved_metric_ks = resolve_metric_ks(top_k, metric_ks)
+    """把系统实际找到、交给回答模型的证据，与评测题中标注的标准证据进行对照，判断是否找全，记录核验器的放行或拒绝情况"""
+    resolved_metric_ks = resolve_metric_ks(top_k, metric_ks) # 确定评测指标要统计“前几条检索结果”
     agent_sets = raw_result.get("evaluation_scope") == "agent_evidence_sets"
     raw_chunks = list(raw_result.get("chunks") or [])
     if not agent_sets:
@@ -1293,7 +1189,7 @@ def build_error_case(
                 stage: None for stage in RETRIEVAL_LATENCY_STAGES
             },
         },
-        "gold_evidence_count": len(sample.get("relevant_evidence") or []),
+        "gold_evidence_count": len(sample.get("evidence_requirements") or []),
         "matched_evidence_count": 0,
         "first_relevant_rank": None,
         "evidence_matches": [],
@@ -1396,7 +1292,6 @@ def _stage_non_perfect_sample_ids(
             "recall",
             "precision",
             "mrr",
-            "all_requirements_hit",
         ):
             key = f"{metric_name}_at_{cutoff}"
             failures[key] = _sample_ids(
@@ -1570,7 +1465,6 @@ def _aggregate_stage_metrics(
             "recall",
             "precision",
             "mrr",
-            "all_requirements_hit",
         ):
             key = f"{metric_name}_at_{cutoff}"
             aggregated[key] = _mean(
@@ -1711,7 +1605,7 @@ def aggregate_agent_evidence(results: list[dict[str, Any]]) -> dict[str, Any]:
             "empty_rate": _mean(float(r[group]["evidence_count"] == 0) for r in available),
         }
         failures = {}
-        for name in ("hit", "recall", "precision", "all_requirements_hit", "duplicate_rate"):
+        for name in ("hit", "recall", "precision", "duplicate_rate"):
             cohort = available if name == "duplicate_rate" else answerable
             scored = [r for r in cohort if r[group].get(name) is not None]
             metrics[name] = _mean(float(r[group][name]) for r in scored)
@@ -1758,6 +1652,29 @@ def _repair_status(retrieval: dict[str, Any]) -> tuple[bool, bool] | None:
     return None
 
 
+def _repair_correct_refusal(result: dict[str, Any]) -> bool | None:
+    """拒答必须来自正常完成的核验；历史记录缺少判定依据时不补零。"""
+    retrieval = result.get("retrieval") or {}
+    agent = retrieval.get("agent_execution") or {}
+    assessment = retrieval.get("evidence_sufficiency") or {}
+    outcomes = (result.get("outcome"), agent.get("outcome"), assessment.get("outcome"))
+    if (result.get("error") or any(value in NON_EVIDENCE_OUTCOMES for value in outcomes)
+            or agent.get("stop_reason") in {"verification_failed", "planning_failed", "budget_exhausted"}
+            or assessment.get("verification_status") == "unavailable"
+            or assessment.get("source") == "fallback"):
+        return False
+    if result.get("response_mode") in {"answer", "clarify"}:
+        return False
+    refusal = result.get("refusal_metrics") or {}
+    if (result.get("response_mode") != "refuse"
+            or assessment.get("verification_status") != "completed"
+            or type(assessment.get("sufficient")) is not bool
+            or type(refusal.get("correct")) is not bool):
+        return None
+    return (assessment["sufficient"] is False and refusal["correct"] is True
+            and refusal.get("expected_behavior") == "refuse")
+
+
 def aggregate_query_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     """使用明确分母计算运行指标，不推测调用费用。
 
@@ -1773,21 +1690,51 @@ def aggregate_query_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     repair_statuses = [_repair_status(retrieval) for retrieval in retrievals]
     repair_cohorts = {}
     for answerable in (True, False):
-        cohort = [status for item, status in zip(results, repair_statuses)
+        cohort = [(item, status) for item, status in zip(results, repair_statuses)
                   if item.get("answerable") is answerable]
-        attempts = [status for status in cohort if status is not None and status[0]]
-        satisfied_count = sum(status[1] for status in attempts)
-        repair_cohorts["answerable" if answerable else "unanswerable"] = {
+        attempts = [(item, status) for item, status in cohort if status is not None and status[0]]
+        metrics = {
             "sample_count": len(cohort),
-            "unavailable_count": sum(status is None for status in cohort),
+            "unavailable_count": sum(status is None for _, status in cohort),
             "attempt_count": len(attempts),
-            "goals_satisfied_count": satisfied_count,
-            "success_rate": _rate(satisfied_count, len(attempts)),
         }
+        if answerable:
+            satisfied_count = sum(status[1] for _, status in attempts)
+            metrics.update(goals_satisfied_count=satisfied_count,
+                           evidence_completion_rate=_rate(satisfied_count, len(attempts)))
+        else:
+            decisions = [_repair_correct_refusal(item) for item, _ in attempts]
+            evaluated = [value for value in decisions if value is not None]
+            metrics.update(correct_refusal_count=sum(evaluated),
+                           refusal_evaluated_count=len(evaluated),
+                           refusal_unavailable_count=len(decisions) - len(evaluated),
+                           correct_refusal_rate=_rate(sum(evaluated), len(evaluated)))
+        repair_cohorts["answerable" if answerable else "unanswerable"] = metrics
     annotated = [r for r in retrievals if (r.get("expected_retrieval") or {}).get("mode")
                  and (r.get("retrieval_route") or {}).get("mode")]
     repairs = [status for status in repair_statuses if status is not None and status[0]]
-    coverage = [goal for r in retrievals for goal in (r.get("evidence_sufficiency") or {}).get("goal_coverage", [])]
+    # 仅统计规划中明确列出的目标，不把支持率解释为原问题需求覆盖率。
+    planned_count = evaluated_count = supported_count = goal_unavailable_samples = 0
+    for retrieval in retrievals:
+        goals = (retrieval.get("query_understanding") or {}).get("goals")
+        if not isinstance(goals, list):
+            goal_unavailable_samples += 1
+            continue
+        identifiers = {goal.get("id") for goal in goals if isinstance(goal, dict) and goal.get("id")}
+        planned_count += len(identifiers)
+        assessment = retrieval.get("evidence_sufficiency") or {}
+        if assessment.get("verification_status") != "completed":
+            continue
+        coverage = {}
+        for goal in assessment.get("goal_coverage") or []:
+            if goal.get("goal_id") in identifiers:
+                coverage.setdefault(goal["goal_id"], []).append(goal.get("status"))
+        # 缺少结果、重复结果、未知状态均不能冒充已完成核验。
+        for statuses in coverage.values():
+            if len(statuses) == 1 and statuses[0] in {"supported", "missing", "conflict"}:
+                evaluated_count += 1
+                supported_count += statuses[0] == "supported"
+
     return {
         "runtime_sample_count": len(runtimes),
         "runtime_unavailable_count": len(results) - len(runtimes),
@@ -1805,10 +1752,19 @@ def aggregate_query_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
         "rule_plan_fallback_count": sum(p.get("source") == "rule" and bool(p.get("fallback_reason")) for p in plans),
         "annotated_route_count": len(annotated),
         "route_agreement": _mean(float(r["retrieval_route"]["mode"] == r["expected_retrieval"]["mode"]) for r in annotated),
-        "evaluated_goal_count": len(coverage),
-        "supported_goal_rate": _rate(sum(g.get("status") == "supported" for g in coverage), len(coverage)),
+        "goal_metrics_version": "2.0",
+        "goal_metric_scope": "planned_goals_only",
+        "planned_goal_count": planned_count,
+        "evaluated_goal_count": evaluated_count,
+        "unevaluated_goal_count": planned_count - evaluated_count,
+        "supported_goal_count": supported_count,
+        "goal_plan_unavailable_sample_count": goal_unavailable_samples,
+        "supported_goal_rate": _rate(supported_count, evaluated_count),
         "repair_count": len(repairs),
-        "repair_success_rate": _rate(sum(status[1] for status in repairs), len(repairs)),
+        "repair_metrics_version": "2.0",
+        "repair_answerability_unavailable_count": sum(
+            status is not None and status[0] and type(item.get("answerable")) is not bool
+            for item, status in zip(results, repair_statuses)),
         "repair_unavailable_count": sum(status is None for status in repair_statuses),
         "repair_cohorts": repair_cohorts,
         "verification_unavailable_count": sum((r.get("evidence_sufficiency") or {}).get("verification_status") == "unavailable" for r in retrievals),

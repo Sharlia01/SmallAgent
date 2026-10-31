@@ -20,7 +20,7 @@ class Dealer:
 def dealer(monkeypatch):
     dealer = Dealer()
     monkeypatch.setattr(pipeline, "get_retrieval_dealer", lambda: dealer)
-    monkeypatch.setattr(pipeline, "expand_table_contexts", lambda chunks, question: chunks)
+    monkeypatch.setattr(pipeline, "expand_table_contexts", lambda chunks, question, **kwargs: chunks)
     return dealer
 
 
@@ -58,3 +58,13 @@ def test_only_dictionary_aliases_are_added_to_keyword_query(dealer):
     pipeline.retrieve_evidence("tenant", "每股收益")
     assert dealer.calls[0]["question"] == "每股收益"
     assert "EPS" in dealer.calls[0]["keyword_question"]
+
+
+def test_same_query_different_subjects_have_separate_cache_entries(dealer):
+    with query_runtime():
+        for subject in ("甲公司的煤电板块", "甲公司的煤电板块", "甲公司的水电板块"):
+            pipeline.retrieve_evidence("tenant", "2025年营业收入", task=RetrievalTask(
+                "2025年营业收入", ("g1",), subject_names=(subject,)))
+    assert len(dealer.calls) == 2
+    assert [call["options"].subject_names for call in dealer.calls] == [
+        ("甲公司的煤电板块",), ("甲公司的水电板块",)]

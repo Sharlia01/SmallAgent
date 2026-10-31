@@ -380,3 +380,42 @@ def test_table_metadata_counts_towards_budget_and_survives_selection(monkeypatch
     monkeypatch.setenv("RAG_EVIDENCE_SUFFICIENCY_CONTEXT_TOKENS", str(budget))
     selected = evidence_sufficiency._prepare_evidence((item,), EvidenceCollection([table]), question="收入？")
     assert selected[0].model_record(1) == item.model_record(1)
+
+
+def corrected_payload():
+    return {
+        'sufficient': True, 'reason': '原问题对应合并行，规划误拆分', 'missing_requirements': [],
+        'answer_scope': '回答两个年份的长期借款及应付债券合并金额',
+        'answer_notes': ['该表未分别列示长期借款与应付债券金额'],
+        'planning_corrections': [{'goal_id': 'g1', 'reason': '原问题未要求拆分，原表为同名合并行'},
+                                 {'goal_id': 'g2', 'reason': '原问题未要求拆分，原表为同名合并行'}],
+        'supporting_chunk_indices': [2],
+        'goal_coverage': [{'goal_id': g, 'status': 'missing', 'supporting_chunk_indices': []}
+                          for g in ('g1', 'g2')],
+    }
+
+
+@pytest.mark.unit
+def test_question_answerable_despite_over_split_goals_preserves_scope_and_evidence():
+    from service.core.query.contract import QueryGoal
+    report = evidence_sufficiency._parse_assessment(corrected_payload(), chunk_count=2,
+        chunk_ids=['irrelevant', 'combined'], goals=(QueryGoal('g1', '借款'), QueryGoal('g2', '债券')))
+    assert report.sufficient
+    assert all(g['status'] == 'missing' for g in report.goal_coverage)
+    assert report.supporting_chunk_indices == [2]
+    assert report.to_dict()['answer_notes'] == ['该表未分别列示长期借款与应付债券金额']
+    assert len(report.to_dict()['planning_corrections']) == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize('change', ['correction', 'notes', 'evidence', 'conflict'])
+def test_scope_correction_cannot_silently_bypass_requirements(change):
+    from service.core.query.contract import QueryGoal
+    payload = corrected_payload()
+    if change == 'correction': payload['planning_corrections'].pop()
+    elif change == 'notes': payload['answer_notes'] = []
+    elif change == 'evidence': payload['supporting_chunk_indices'] = []
+    else: payload['goal_coverage'][0]['status'] = 'conflict'
+    with pytest.raises(ValueError):
+        evidence_sufficiency._parse_assessment(payload, chunk_count=2,
+            chunk_ids=['a', 'b'], goals=(QueryGoal('g1', '借款'), QueryGoal('g2', '债券')))

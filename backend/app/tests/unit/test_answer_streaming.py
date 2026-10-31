@@ -144,3 +144,76 @@ def test_online_chat_releases_stream_on_finish_disconnect_or_error(monkeypatch, 
             assert any("event: error" in event for event in events)
             assert not saved
     assert stream.close_count == 1
+
+
+def test_observed_stream_records_usage_tail_and_separate_timings(caplog):
+    import logging
+    from service.core.answering.streaming import ObservedAnswerStream
+    observed = ObservedAnswerStream(model='test', session_id='s', trace_id='trace',
+        reference_count=1, messages=[{'content': 'private input'}])
+    now = [observed._started]
+    observed._clock = lambda: now[0]
+    usage = SimpleNamespace(choices=[], usage=SimpleNamespace(prompt_tokens=12, completion_tokens=8,
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=5)))
+    class TimedStream(TrackedStream):
+        def __iter__(self):
+            for item in self.chunks:
+                now[0] += .1
+                yield item
+    raw = TimedStream([chunk(), chunk(thinking='private reasoning'),
+                       chunk('private answer', finish='stop'), usage])
+    now[0] += .2
+    with caplog.at_level(logging.INFO):
+        result = collect_answer_stream(observed.attach(raw))
+        observed.close()
+    assert result.answer == 'private answer'
+    assert result.thinking == 'private reasoning'
+    m = observed.metrics
+    assert m['request_open_ms'] == 200
+    assert m['first_event_ms'] == 300
+    assert m['first_reasoning_ms'] == 400
+    assert m['first_answer_ms'] == 500
+    assert m['last_answer_ms'] == 500
+    assert m['total_ms'] == 600
+    assert m['after_last_answer_ms'] == 100
+    assert m['max_read_wait_ms'] == 100
+    assert m['input_tokens'] == 12 and m['reasoning_tokens'] == 5
+    assert m['output_tokens'] == 8 and m['sdk_retry_count'] is None
+    assert m['status'] == 'ok'
+    assert raw.close_count == 1
+    assert caplog.text.count('PERF answer_generation') == 1
+    assert 'private' not in caplog.text
+
+
+@pytest.mark.parametrize('finish', [None, 'stop'])
+def test_observed_stream_error_preserves_partial_answer_only_after_finish(finish):
+    from service.core.answering.streaming import ObservedAnswerStream
+    observed = ObservedAnswerStream(model='test', session_id='s', trace_id=None, reference_count=0, messages=[])
+    raw = TrackedStream([chunk('answer', finish=finish)], error=RuntimeError('failed'))
+    observed.attach(raw)
+    if finish:
+        assert collect_answer_stream(observed).answer == 'answer'
+        assert observed.metrics['status'] == 'usage_tail_error'
+    else:
+        with pytest.raises(RuntimeError, match='failed'):
+            collect_answer_stream(observed)
+        assert observed.metrics['status'] == 'stream_error'
+    assert observed.metrics['input_tokens'] is None
+    assert raw.close_count == 1
+
+
+def test_observed_stream_early_close_and_request_failure(caplog):
+    import logging
+    from service.core.answering.streaming import ObservedAnswerStream
+    with caplog.at_level(logging.INFO):
+        failed = ObservedAnswerStream(model='test', session_id='s', trace_id=None, reference_count=0, messages=[])
+        failed.request_failed(TimeoutError('private request'))
+        raw = TrackedStream([chunk('text')])
+        early = ObservedAnswerStream(model='test', session_id='s', trace_id=None, reference_count=0, messages=[]).attach(raw)
+        next(early)
+        early.close()
+    assert failed.metrics['status'] == 'request_error'
+    assert failed.metrics['first_event_ms'] is None
+    assert early.metrics['status'] == 'closed_early'
+    assert raw.close_count == 1
+    assert 'private request' not in caplog.text

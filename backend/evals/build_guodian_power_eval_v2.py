@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """构建扩充后的 50 题国电电力评测集。
 
-第一版文件作为历史基线保留；构建器将其中 28 个样本迁移至第二版结构，
+第一版文件保留原有题目并统一证据结构；构建器将其中 28 个样本迁移至第二版结构，
 再增加 22 个容易混淆的样本，其事实均来自同一份人工审核报告。
 """
 
@@ -16,7 +16,7 @@ from typing import Any
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
 V1_PATH = SCRIPT_DIRECTORY / "data" / "guodian_power_eval_v1.jsonl"
 OUTPUT_PATH = SCRIPT_DIRECTORY / "data" / "guodian_power_eval_v2.jsonl"
-DATASET_VERSION = "guodian-power-v2"
+DATASET_VERSION = "guodian-power-v2-requirements-v1"
 DOCUMENT_NAME = "国电电力.pdf"
 SOURCE_DATE = "2025-08-20"
 
@@ -46,7 +46,7 @@ TABLE_ROWS = {
 }
 
 
-# 每个元组保存事实文本，以及 relevant_evidence 中从 1 开始的证据下标。
+# 每个元组保存事实文本，以及 各要求首个方案中从 1 开始的证据下标。
 CLAIM_OVERRIDES: dict[str, list[tuple[str, list[int]]]] = {
     "guodian-001": [
         ("2025年上半年营业收入为776.55亿元，同比下降9.52%。", [1]),
@@ -142,25 +142,12 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def evidence_atom(evidence: dict[str, Any]) -> dict[str, Any]:
-    evidence_type = evidence.get("evidence_type", "text")
+    atom = copy.deepcopy(evidence)
+    evidence_type = atom.pop("evidence_type", "text")
+    atom["type"] = {"table": "table_row"}.get(evidence_type, evidence_type)
     if evidence_type == "table":
-        return {
-            "type": "table_row",
-            "document_name": evidence["document_name"],
-            "caption": evidence.get("locator", ""),
-            "row_cells": evidence["row_cells"],
-        }
-    if evidence_type == "figure":
-        return {
-            "type": "text",
-            "document_name": evidence["document_name"],
-            "text": evidence.get("locator") or evidence["text"],
-        }
-    return {
-        "type": "text",
-        "document_name": evidence["document_name"],
-        "text": evidence["text"],
-    }
+        atom["caption"] = evidence.get("locator", "")
+    return atom
 
 
 def requirements_for_evidence(
@@ -178,7 +165,7 @@ def requirements_for_evidence(
 def migrate_v1_sample(sample: dict[str, Any]) -> dict[str, Any]:
     migrated = copy.deepcopy(sample)
     sample_id = migrated["id"]
-    migrated["schema_version"] = "2.0"
+    migrated["schema_version"] = "2.1"
     migrated["dataset_version"] = DATASET_VERSION
     migrated["expected_behavior"] = (
         "answer" if migrated["answerable"] else "refuse"
@@ -188,9 +175,10 @@ def migrate_v1_sample(sample: dict[str, Any]) -> dict[str, Any]:
         migrated["question_type"] = "parallel_multi_evidence"
 
     evidence_ids = []
-    for index, evidence in enumerate(migrated["relevant_evidence"], start=1):
+    evidence_atoms = [atom for requirement in migrated["evidence_requirements"]
+                      for atom in requirement["alternatives"][0]]
+    for index, evidence in enumerate(evidence_atoms, start=1):
         evidence["id"] = f"{sample_id}-e{index}"
-        evidence.setdefault("evidence_type", "text")
         if sample_id in TABLE_ROWS:
             evidence["row_cells"] = TABLE_ROWS[sample_id]
         evidence_ids.append(evidence["id"])
@@ -219,13 +207,10 @@ def migrate_v1_sample(sample: dict[str, Any]) -> dict[str, Any]:
         migrated["expected_evidence_sufficient"] = False
 
     if sample_id in PARALLEL_LEGACY_IDS:
-        migrated["evidence_requirements"] = requirements_for_evidence(
-            migrated["relevant_evidence"]
-        )
         migrated["expected_retrieval"] = {
             "mode": "parallel",
             "hop_count": 1,
-            "subquery_count": len(migrated["relevant_evidence"]),
+            "subquery_count": len(evidence_atoms),
         }
     elif sample_id == "guodian-016":
         migrated["expected_retrieval"] = {
@@ -251,8 +236,8 @@ def migrate_v1_sample(sample: dict[str, Any]) -> dict[str, Any]:
     if migrated["answerable"]:
         modalities = sorted(
             {
-                evidence.get("evidence_type", "text")
-                for evidence in migrated["relevant_evidence"]
+                ("table" if evidence["type"] == "table_row" else evidence["type"])
+                for evidence in evidence_atoms
             }
         )
         metadata["source_modality"] = "+".join(modalities)
@@ -526,7 +511,7 @@ def answerable_sample(
     evidence_requirements: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     sample = {
-        "schema_version": "2.0",
+        "schema_version": "2.1",
         "dataset_version": DATASET_VERSION,
         "id": sample_id,
         "question": question,
@@ -534,13 +519,11 @@ def answerable_sample(
         "answerable": True,
         "expected_behavior": "answer",
         "question_type": question_type,
-        "relevant_evidence": evidence,
+        "evidence_requirements": evidence_requirements or requirements_for_evidence(evidence),
         "reference_claims": reference_claims,
         "expected_retrieval": expected_retrieval,
         "metadata": sample_metadata,
     }
-    if evidence_requirements:
-        sample["evidence_requirements"] = evidence_requirements
     return sample
 
 
@@ -553,7 +536,7 @@ def unanswerable_sample(
     sample_metadata: dict[str, Any],
 ) -> dict[str, Any]:
     return {
-        "schema_version": "2.0",
+        "schema_version": "2.1",
         "dataset_version": DATASET_VERSION,
         "id": sample_id,
         "question": question,
@@ -562,7 +545,7 @@ def unanswerable_sample(
         "expected_behavior": "refuse",
         "expected_evidence_sufficient": False,
         "question_type": "unanswerable",
-        "relevant_evidence": [],
+        "evidence_requirements": [],
         "reference_claims": [],
         "expected_retrieval": expected_retrieval,
         "metadata": sample_metadata,

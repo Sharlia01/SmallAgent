@@ -16,10 +16,10 @@ _LEGAL_NAME = re.compile(
 @dataclass(frozen=True)
 class CompanyHints:
     # 名称用于排序；ID 和状态仅记录名称规范化结果，不用于过滤来源。
-    entity_ids: tuple[str, ...] = ()
-    entity_names: tuple[str, ...] = ()
-    status: str = "no_registered_company"
-    source: str = "original_question"
+    entity_ids: tuple[str, ...] = ()  # 在公司注册表中匹配到的ID
+    entity_names: tuple[str, ...] = () # 公司名称
+    status: str = "no_registered_company" # 匹配成功、未登记或有歧义等状态
+    source: str = "original_question" # 公司信息来自哪里
     registry_version: str = ""
     unresolved_quotes: tuple[str, ...] = ()
 

@@ -249,3 +249,77 @@ def test_pre_rerank_cutoff_does_not_collect_late_rows_of_admitted_table():
     fields = {r['chunk_id']: r for r in records}
     assert select_candidate_ids(list(fields), fields, limit=2) == ['t1-1', 't1-2', 'body']
     assert select_candidate_ids(list(fields), fields, limit=1) == ['t1-1']
+
+
+def test_group_view_changes_use_original_chunk_identity_and_update_version():
+    from domain.evidence import EvidenceCollection, RetrievalTrace
+    from service.core.evidence.table_retrieval_adapter import candidate_record
+    original = row(1)
+    record = candidate_record(candidates([original]).tables[original['chunk_id']])
+    first = evidence_from_record(record)
+    changed = deepcopy(record)
+    changed['content_with_weight'] += '\n新增上下文'
+    changed['table_cells_slice_obj']['rows'].append(
+        {'row_index': 2, 'headers': ['指标', '2025E'], 'cells': ['其他', '20']})
+    second = evidence_from_record(changed)
+    evidence = EvidenceCollection([first])
+    before = evidence.version
+    evidence.add(second, RetrievalTrace('补查'))
+    assert not evidence.conflicts
+    assert evidence.get(first.id) is second
+    assert evidence.version != before
+    assert set(second.source_identities) == {original['chunk_id']}
+    assert evidence_from_record(source_record(second)).source_identities == first.source_identities
+    assert not evidence.copy().conflicts
+
+
+@pytest.mark.parametrize('change', ['text', 'cells', 'location'])
+def test_original_chunk_conflicts_across_different_table_groups(change):
+    from domain.evidence import EvidenceCollection
+    from service.core.evidence.table_retrieval_adapter import candidate_record
+    original = row(1)
+    first = evidence_from_record(candidate_record(candidates([original]).tables[original['chunk_id']]))
+    changed = deepcopy(original)
+    if change == 'text':
+        changed['content_with_weight'] = '不同原文'
+    elif change == 'cells':
+        changed['table_cells_slice_obj']['rows'][0]['cells'][1] = '999'
+    else:
+        changed['page_num_int'] = [99]
+    second = evidence_from_record(candidate_record(candidates([changed, row(2)]).tables[original['chunk_id']]))
+    assert first.id != second.id
+    evidence = EvidenceCollection([first, second])
+    assert len(evidence.conflicts) == 1
+    assert evidence.conflicts[0].evidence_id == original['chunk_id']
+    assert evidence.select([first.id]).conflicts
+    assert evidence.copy().conflicts
+
+
+def test_new_group_with_overlapping_unchanged_chunks_is_not_conflict():
+    from domain.evidence import EvidenceCollection
+    from service.core.evidence.table_retrieval_adapter import candidate_record
+    records = [row(1), row(2)]
+    first = evidence_from_record(candidate_record(candidates(records[:1]).tables['t1-1']))
+    second = evidence_from_record(candidate_record(candidates(records).tables['t1-1']))
+    evidence = EvidenceCollection([first, second])
+    assert not evidence.conflicts
+    assert len(evidence) == 2
+    # 再次合组也必须保留原始身份，不能改为检查上一层 group ID。
+    regrouped = candidates([source_record(second)])
+    rebuilt = evidence_from_record(candidate_record(next(iter(regrouped.tables.values()))))
+    assert rebuilt.source_identities == second.source_identities
+
+
+def test_single_table_chunk_context_keeps_original_identity():
+    from domain.evidence import EvidenceCollection
+    from domain.table_retrieval import IndexedTableRow, TableContext
+    from service.core.evidence.table_retrieval_adapter import context_record
+    original = row(1)
+    snapshot = IndexedTableRow(original['chunk_id'], original)
+    first = evidence_from_record(original)
+    expanded = evidence_from_record(context_record(TableContext(
+        snapshot, '扩展后的表格窗口', (), {})))
+    evidence = EvidenceCollection([first, expanded])
+    assert not evidence.conflicts
+    assert evidence.get(first.id) is expanded
+    assert expanded.source_identities == first.source_identities

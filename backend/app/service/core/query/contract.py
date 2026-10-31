@@ -8,8 +8,6 @@ import re
 from dataclasses import asdict, dataclass, replace
 from datetime import date
 from typing import Any
-from service.core.query.entities import QueryEntity
-from service.core.retrieval.entities import CompanyHints
 
 from service.core.runtime.context import POLICY_VERSION, positive_setting
 from service.core.query.model_validation import validated_completion
@@ -24,16 +22,14 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class QueryGoal:
-    id: str  #用户目标的唯一编号，供任务、依赖和证据覆盖结果引用
-    text: str #目标的自然语言描述，可以对用户口语进行规范化，但必须保留原意
+    id: str  # 用户目标的唯一编号，供任务、依赖和证据覆盖结果引用
+    text: str # 目标的自然语言描述，可以对用户口语进行规范化，但必须保留原意
     # 保留模型声明的约束；目标原文依据保存在 source_spans 中，不能编造引文。
-    depends_on: tuple[str, ...] = ()  #当前目标依赖的其他目标编号
-    source_spans: tuple[str, ...] = () #支撑这个目标的用户问题原文片段
-    constraints: tuple[str, ...] = ()  #这个目标必须遵守的条件，不按规则改写
-    candidate_locators: tuple[str, ...] = () #从名称和测试用例看，用于保存候选定位线索
-    subject_refs: tuple[str, ...] = () #目标研究主体的实体引用编号，指向 QueryUnderstanding.entities中的 ref
-    publisher_refs: tuple[str, ...] = () #报告、材料发布方的实体引用编号，同样指向“entities”
-    subject_slot: str | None = None #主体尚未知，需要前置检索确定时，引用保存改主体名称的任务输出变量
+    source_spans: tuple[str, ...] = () # 支撑这个目标的用户问题原文片段
+    depends_on: tuple[str, ...] = ()  # 当前目标依赖的其他目标编号
+    constraints: tuple[str, ...] = ()  # 这个目标必须遵守的条件，不按规则改写
+    subjects: tuple[str, ...] = ()  # 本目标的完整自然语言主体，由模型理解，原文依据见 source_spans
+    subject_slot: str | None = None # 主体尚未知，需要前置检索确定时，引用保存改主体名称的任务输出变量
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -49,10 +45,6 @@ class QueryUnderstanding:
     source: str = "model"
     failure_reason: str | None = None
 
-    entities: tuple[QueryEntity, ...] = ()
-    # None 表示旧的直接构造入口；模型响应必须显式提供 entities。
-    entity_names: tuple[str, ...] | None = None
-
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
@@ -64,7 +56,7 @@ class RetrievalTask:
     query: str
     goal_ids: tuple[str, ...]
     document_ids: tuple[str, ...] = ()
-    company_hints: CompanyHints | None = None
+    subject_names: tuple[str, ...] | None = None  # 模型确定的自然语言主体，不做身份映射或过滤
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -232,6 +224,16 @@ def resolve_request(request: QueryRequest, *, client: Any | None = None) -> Quer
         return replace(request, clarification=clarification)
 
 
+def parse_subjects(value: Any, *, field: str) -> tuple[str, ...]:
+    """只检查主体文本的格式，不以词表或字面包含关系裁决语义。"""
+    if not isinstance(value, list) or len(value) > 16 or not all(
+        isinstance(subject, str) and subject.strip() and len(subject) <= 400
+        for subject in value
+    ):
+        raise QueryValidationError("invalid_subjects", "主体必须是非空文本列表", field=field)
+    return tuple(dict.fromkeys(subject.strip() for subject in value))
+
+
 def decode_goals(raw: Any) -> tuple[QueryGoal, ...]:
     """解码目标结构，不接收模型自行提供的来源证明或依赖关系。"""
     # 先判断类型和长度
@@ -285,21 +287,14 @@ def decode_goals(raw: Any) -> tuple[QueryGoal, ...]:
             for span in source_spans
         ):
             raise QueryValidationError("invalid_goal_source_spans", "invalid goal source spans", field=path + ".source_spans", goal_id=goal_id)
-        refs = {}
-        for key in ("subject_refs", "publisher_refs"):
-            values = item.get(key, [])
-            if not isinstance(values, list) or len(values) > 16 or not all(
-                isinstance(ref, str) and IDENTIFIER.fullmatch(ref) for ref in values
-            ) or len(set(values)) != len(values):
-                raise QueryValidationError("invalid_entity_refs", "实体引用必须是唯一编号列表", field=path + "." + key)
-            refs[key] = tuple(values)
+        subjects = parse_subjects(item.get("subjects", []), field=path + ".subjects")
         subject_slot = item.get("subject_slot")
         if subject_slot is not None and (not isinstance(subject_slot, str) or not IDENTIFIER.fullmatch(subject_slot)):
             raise QueryValidationError("invalid_subject_slot", "待取证主体必须引用合法变量名")
         goals.append(QueryGoal(
             id=mapping[goal_id], text=text.strip(), constraints=tuple(dict.fromkeys(constraints)),
             depends_on=tuple(dict.fromkeys(mapping[value] for value in dependencies)),
-            source_spans=tuple(dict.fromkeys(source_spans)), **refs, subject_slot=subject_slot,
+            source_spans=tuple(dict.fromkeys(source_spans)), subjects=subjects, subject_slot=subject_slot,
         ))
     return tuple(goals)
 
